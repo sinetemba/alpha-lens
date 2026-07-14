@@ -1,0 +1,213 @@
+import streamlit as st
+from sqlalchemy.orm import Session
+from app.models.portfolio import Portfolio, PortfolioHolding
+from app.models.stock import Stock, StockPrice
+from datetime import datetime
+from loguru import logger
+
+
+def show_portfolio(db: Session):
+    """Display the portfolio page."""
+    st.header("💼 Portfolio")
+    st.markdown("Track your investment portfolio and performance.")
+    
+    # Get or create portfolio
+    portfolio = db.query(Portfolio).first()
+    
+    if not portfolio:
+        portfolio = Portfolio(name="My Portfolio")
+        db.add(portfolio)
+        db.commit()
+        st.info("Created new portfolio. Add holdings below.")
+    
+    # Portfolio summary
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Value", f"R {portfolio.current_value:,.2f}")
+    
+    with col2:
+        st.metric("Total Gain/Loss", f"R {portfolio.total_gain_loss:,.2f}")
+    
+    with col3:
+        st.metric("Gain/Loss %", f"{portfolio.total_gain_loss_percentage:.2f}%")
+    
+    with col4:
+        holdings_count = db.query(PortfolioHolding).filter(
+            PortfolioHolding.portfolio_id == portfolio.id
+        ).count()
+        st.metric("Holdings", holdings_count)
+    
+    st.markdown("---")
+    
+    # Add new holding
+    with st.expander("➕ Add Holding"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            symbol = st.text_input("Symbol", placeholder="e.g., NPN").upper()
+            quantity = st.number_input("Quantity", min_value=0.0, step=1.0)
+        
+        with col2:
+            purchase_price = st.number_input("Purchase Price", min_value=0.0, step=0.01)
+            purchase_date = st.date_input("Purchase Date", value=datetime.now().date())
+        
+        if st.button("Add Holding"):
+            if symbol and quantity > 0 and purchase_price > 0:
+                _add_holding(db, portfolio.id, symbol, quantity, purchase_price, purchase_date)
+                st.success(f"Added {quantity} shares of {symbol} to portfolio!")
+                st.rerun()
+            else:
+                st.error("Please fill in all required fields.")
+    
+    st.markdown("---")
+    
+    # Holdings table
+    st.subheader("Portfolio Holdings")
+    
+    holdings = db.query(PortfolioHolding).filter(
+        PortfolioHolding.portfolio_id == portfolio.id
+    ).all()
+    
+    if not holdings:
+        st.info("No holdings in portfolio. Add holdings above.")
+        return
+    
+    data = []
+    for holding in holdings:
+        # Update current values
+        _update_holding_values(db, holding)
+        
+        data.append({
+            "Symbol": holding.symbol,
+            "Quantity": holding.quantity,
+            "Purchase Price": f"R {holding.purchase_price:.2f}",
+            "Current Price": f"R {holding.current_price:.2f}" if holding.current_price else "N/A",
+            "Current Value": f"R {holding.current_value:.2f}" if holding.current_value else "N/A",
+            "Gain/Loss": f"R {holding.gain_loss:.2f}" if holding.gain_loss else "N/A",
+            "Gain/Loss %": f"{holding.gain_loss_percentage:.2f}%" if holding.gain_loss_percentage else "N/A",
+            "Dividends": f"R {holding.total_dividends_received:.2f}",
+        })
+    
+    if data:
+        st.dataframe(data, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # Remove holding
+    st.subheader("Remove Holding")
+    holding_symbols = [h.symbol for h in holdings]
+    symbol_to_remove = st.selectbox("Select holding to remove", holding_symbols)
+    
+    if st.button("Remove Holding"):
+        _remove_holding(db, portfolio.id, symbol_to_remove)
+        st.success(f"Removed {symbol_to_remove} from portfolio.")
+        st.rerun()
+
+
+def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, purchase_price: float, purchase_date):
+    """Add a holding to the portfolio."""
+    # Check if stock exists
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    
+    if not stock:
+        stock = Stock(symbol=symbol, name=symbol)
+        db.add(stock)
+        db.flush()
+    
+    # Create holding
+    holding = PortfolioHolding(
+        portfolio_id=portfolio_id,
+        stock_id=stock.id,
+        symbol=symbol,
+        quantity=quantity,
+        purchase_price=purchase_price,
+        purchase_date=purchase_date
+    )
+    
+    db.add(holding)
+    db.commit()
+    
+    # Fetch price data for the newly added stock
+    try:
+        from app.services.data_service import DataService
+        data_service = DataService(db)
+        data_service.update_stock_prices([symbol])
+        logger.info(f"Fetched price data for {symbol}")
+    except Exception as e:
+        logger.error(f"Failed to fetch price data for {symbol}: {e}")
+
+
+def _remove_holding(db: Session, portfolio_id: int, symbol: str):
+    """Remove a holding from the portfolio."""
+    db.query(PortfolioHolding).filter(
+        PortfolioHolding.portfolio_id == portfolio_id,
+        PortfolioHolding.symbol == symbol
+    ).delete()
+    db.commit()
+
+
+def _update_holding_values(db: Session, holding: PortfolioHolding):
+    """Update current values for a holding."""
+    # Get latest price
+    latest_price = db.query(StockPrice).filter(
+        StockPrice.symbol == holding.symbol
+    ).order_by(StockPrice.timestamp.desc()).first()
+    
+    if latest_price:
+        holding.current_price = latest_price.close_price
+        holding.current_value = holding.quantity * latest_price.close_price
+        holding.gain_loss = holding.current_value - (holding.quantity * holding.purchase_price)
+        holding.gain_loss_percentage = (holding.gain_loss / (holding.quantity * holding.purchase_price)) * 100
+    
+    db.commit()
+
+
+def _get_price_movements(db: Session, symbol: str) -> tuple:
+    """Calculate daily, weekly, and monthly price movements."""
+    now = datetime.utcnow()
+    
+    # Get latest price
+    latest = db.query(StockPrice).filter(
+        StockPrice.symbol == symbol
+    ).order_by(StockPrice.timestamp.desc()).first()
+    
+    if not latest:
+        return 0.0, 0.0, 0.0
+    
+    latest_price = latest.close_price
+    
+    # Daily change (compare with previous trading day)
+    daily_prev = db.query(StockPrice).filter(
+        StockPrice.symbol == symbol,
+        StockPrice.timestamp < latest.timestamp,
+        StockPrice.timestamp >= now - timedelta(days=2)
+    ).order_by(StockPrice.timestamp.desc()).first()
+    
+    daily_change = 0.0
+    if daily_prev and daily_prev.close_price > 0:
+        daily_change = ((latest_price - daily_prev.close_price) / daily_prev.close_price) * 100
+    
+    # Weekly change (compare with price 7 days ago)
+    weekly_prev = db.query(StockPrice).filter(
+        StockPrice.symbol == symbol,
+        StockPrice.timestamp >= now - timedelta(days=8),
+        StockPrice.timestamp <= now - timedelta(days=6)
+    ).order_by(StockPrice.timestamp.asc()).first()
+    
+    weekly_change = 0.0
+    if weekly_prev and weekly_prev.close_price > 0:
+        weekly_change = ((latest_price - weekly_prev.close_price) / weekly_prev.close_price) * 100
+    
+    # Monthly change (compare with price 30 days ago)
+    monthly_prev = db.query(StockPrice).filter(
+        StockPrice.symbol == symbol,
+        StockPrice.timestamp >= now - timedelta(days=32),
+        StockPrice.timestamp <= now - timedelta(days=28)
+    ).order_by(StockPrice.timestamp.asc()).first()
+    
+    monthly_change = 0.0
+    if monthly_prev and monthly_prev.close_price > 0:
+        monthly_change = ((latest_price - monthly_prev.close_price) / monthly_prev.close_price) * 100
+    
+    return daily_change, weekly_change, monthly_change
