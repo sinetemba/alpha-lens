@@ -5,24 +5,45 @@ from app.config.settings import settings
 from loguru import logger
 
 
+# Yahoo Finance reports JSE-listed prices in South African cents (ZAc), not Rand,
+# so OHLC values for ".JO"-suffixed tickers must be divided by 100.
+JSE_PRICE_SCALE = 100
+_OHLC_COLUMNS = ["Open", "High", "Low", "Close", "Adj Close"]
+
+
 class YFinanceCollector:
     """Collector for Yahoo Finance data using yfinance library."""
-    
+
     def __init__(self):
         self.enabled = settings.yfinance_enabled
-    
+
     def get_ticker(self, symbol: str) -> Optional[yf.Ticker]:
         """Get a Ticker object for a symbol."""
         if not self.enabled:
             logger.warning("Yahoo Finance collector is disabled")
             return None
-        
+
         try:
-            ticker = yf.Ticker(symbol)
+            # JSE-listed stocks are stored without an exchange suffix, but
+            # Yahoo Finance requires the ".JO" suffix to resolve them.
+            yf_symbol = symbol if "." in symbol else f"{symbol}.JO"
+            ticker = yf.Ticker(yf_symbol)
             return ticker
         except Exception as e:
             logger.error(f"Error creating ticker for {symbol}: {e}")
             return None
+
+    @staticmethod
+    def _to_rand(hist, symbol: str):
+        """Convert JSE OHLC prices from cents to Rand in-place."""
+        if hist is None or hist.empty or "." in symbol:
+            return hist
+
+        for column in _OHLC_COLUMNS:
+            if column in hist.columns:
+                hist[column] = hist[column] / JSE_PRICE_SCALE
+
+        return hist
     
     def get_info(self, symbol: str) -> Optional[Dict]:
         """Get company information for a symbol."""
@@ -56,11 +77,11 @@ class YFinanceCollector:
         
         try:
             hist = ticker.history(period=period, interval=interval)
-            return hist
+            return self._to_rand(hist, symbol)
         except Exception as e:
             logger.error(f"Error getting history for {symbol}: {e}")
             return None
-    
+
     def get_history_date_range(
         self,
         symbol: str,
@@ -82,7 +103,7 @@ class YFinanceCollector:
         
         try:
             hist = ticker.history(start=start_date, end=end_date, interval=interval)
-            return hist
+            return self._to_rand(hist, symbol)
         except Exception as e:
             logger.error(f"Error getting history for {symbol}: {e}")
             return None

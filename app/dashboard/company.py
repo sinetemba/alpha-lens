@@ -4,6 +4,7 @@ from plotly.subplots import make_subplots
 from sqlalchemy.orm import Session
 from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
+from app.dashboard.utils import format_stock_label
 from datetime import datetime, timedelta
 from loguru import logger
 
@@ -16,12 +17,17 @@ def show_company(db: Session):
     # Symbol selection
     all_stocks = db.query(Stock).filter(Stock.is_active == True).all()
     stock_symbols = [stock.symbol for stock in all_stocks]
-    
+    stock_names = {stock.symbol: stock.name for stock in all_stocks}
+
     if not stock_symbols:
         st.warning("No stocks available in database.")
         return
-    
-    selected_symbol = st.selectbox("Select Stock", stock_symbols)
+
+    selected_symbol = st.selectbox(
+        "Select Stock",
+        stock_symbols,
+        format_func=lambda s: format_stock_label(s, stock_names.get(s))
+    )
     
     if not selected_symbol:
         return
@@ -37,8 +43,7 @@ def show_company(db: Session):
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.subheader(f"**{stock.symbol}**")
-        st.write(stock.name)
+        st.subheader(f"**{format_stock_label(stock.symbol, stock.name)}**")
         if stock.sector:
             st.write(f"Sector: {stock.sector}")
         if stock.industry:
@@ -96,7 +101,10 @@ def _render_price_chart(db: Session, symbol: str):
     
     days = days_map[period]
     start_date = datetime.utcnow() - timedelta(days=days)
-    
+
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    label = format_stock_label(symbol, stock.name if stock else None)
+
     # Get price data
     prices = db.query(StockPrice).filter(
         StockPrice.symbol == symbol,
@@ -114,7 +122,7 @@ def _render_price_chart(db: Session, symbol: str):
         shared_xaxes=True,
         vertical_spacing=0.03,
         row_heights=[0.45, 0.15, 0.2, 0.2],
-        subplot_titles=(f"{symbol} Price Chart - {period}", "Volume", "RSI", "MACD")
+        subplot_titles=(f"{label} Price Chart - {period}", "Volume", "RSI", "MACD")
     )
 
     # Row 1: Candlestick + Bollinger Bands
@@ -124,7 +132,7 @@ def _render_price_chart(db: Session, symbol: str):
         high=[p.high_price for p in prices],
         low=[p.low_price for p in prices],
         close=[p.close_price for p in prices],
-        name=symbol
+        name=label
     ), row=1, col=1)
 
     if any(p.bollinger_upper for p in prices):

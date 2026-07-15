@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from app.models.stock import Stock, StockPrice
 from app.models.watchlist import WatchlistItem
 from app.config.settings import settings
+from app.dashboard.utils import format_stock_label
 from datetime import datetime, timedelta
 from loguru import logger
 
@@ -80,7 +81,7 @@ def show_watchlist(db: Session):
             daily_change = _get_daily_change(db, item.symbol)
             
             data.append({
-                "Symbol": item.symbol,
+                "Symbol": format_stock_label(item.symbol, item.stock.name if item.stock else None),
                 "Current Price": f"R {current_price:.2f}",
                 "Daily Change": f"{daily_change:+.2f}%",
                 "Purchase Price": f"R {item.purchase_price:.2f}" if item.purchase_price else "N/A",
@@ -97,9 +98,11 @@ def show_watchlist(db: Session):
     
     # Remove from watchlist
     st.subheader("Remove from Watchlist")
+    watchlist_names = {item.symbol: item.stock.name if item.stock else None for item in watchlist_items}
     symbols_to_remove = st.multiselect(
         "Select stocks to remove",
-        [item.symbol for item in watchlist_items]
+        [item.symbol for item in watchlist_items],
+        format_func=lambda s: format_stock_label(s, watchlist_names.get(s))
     )
     
     if st.button("Remove Selected") and symbols_to_remove:
@@ -115,7 +118,8 @@ def _add_to_watchlist(db: Session, symbol: str, target_price: float, purchase_pr
     
     if not stock:
         # Create stock entry
-        stock = Stock(symbol=symbol, name=symbol)
+        from app.services.data_service import get_company_name
+        stock = Stock(symbol=symbol, name=get_company_name(symbol))
         db.add(stock)
         db.flush()
     
@@ -141,13 +145,14 @@ def _add_to_watchlist(db: Session, symbol: str, target_price: float, purchase_pr
     
     db.add(item)
     db.commit()
-    
-    # Fetch price data for the newly added stock
+
+    # Backfill historical prices and technical indicators for the newly added stock
     try:
         from app.services.data_service import DataService
-        data_service = DataService(db)
-        data_service.update_stock_prices([symbol])
-        logger.info(f"Fetched price data for {symbol}")
+        with st.spinner(f"Fetching price history for {symbol}..."):
+            data_service = DataService(db)
+            saved = data_service.update_historical_data(symbol)
+        logger.info(f"Fetched {saved} price points for {symbol}")
     except Exception as e:
         logger.error(f"Failed to fetch price data for {symbol}: {e}")
 

@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # Yahoo Finance
     yfinance_enabled: bool = Field(default=True, alias="YFINANCE_ENABLED")
 
+    # EasyEquities (unofficial client - logs in with account credentials)
+    easyequities_username: str = Field(default="", alias="EASYEQUITIES_USERNAME")
+    easyequities_password: str = Field(default="", alias="EASYEQUITIES_PASSWORD")
+
     # Financial Modeling Prep API
     fmp_api_key: str = Field(default="", alias="FMP_API_KEY")
     fmp_base_url: str = Field(default="https://financialmodelingprep.com/api/v3", alias="FMP_BASE_URL")

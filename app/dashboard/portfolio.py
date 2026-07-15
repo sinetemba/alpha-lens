@@ -2,6 +2,8 @@ import streamlit as st
 from sqlalchemy.orm import Session
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.models.stock import Stock, StockPrice
+from app.dashboard.utils import format_stock_label
+from app.collectors.easyequities import EasyEquitiesCollector
 from datetime import datetime
 from loguru import logger
 
@@ -19,24 +21,28 @@ def show_portfolio(db: Session):
         db.add(portfolio)
         db.commit()
         st.info("Created new portfolio. Add holdings below.")
-    
+
+    holdings = db.query(PortfolioHolding).filter(
+        PortfolioHolding.portfolio_id == portfolio.id
+    ).all()
+    for holding in holdings:
+        _update_holding_values(db, holding)
+    _update_portfolio_totals(db, portfolio, holdings)
+
     # Portfolio summary
     col1, col2, col3, col4 = st.columns(4)
-    
+
     with col1:
         st.metric("Total Value", f"R {portfolio.current_value:,.2f}")
-    
+
     with col2:
         st.metric("Total Gain/Loss", f"R {portfolio.total_gain_loss:,.2f}")
-    
+
     with col3:
         st.metric("Gain/Loss %", f"{portfolio.total_gain_loss_percentage:.2f}%")
-    
+
     with col4:
-        holdings_count = db.query(PortfolioHolding).filter(
-            PortfolioHolding.portfolio_id == portfolio.id
-        ).count()
-        st.metric("Holdings", holdings_count)
+        st.metric("Holdings", len(holdings))
     
     st.markdown("---")
     
@@ -61,25 +67,66 @@ def show_portfolio(db: Session):
                 st.error("Please fill in all required fields.")
     
     st.markdown("---")
-    
+
+    # Sync holdings from EasyEquities
+    with st.expander("🔄 Sync from EasyEquities"):
+        st.caption(
+            "EasyEquities has no official public API. This uses an unofficial client that "
+            "logs in with your EasyEquities credentials (configured via EASYEQUITIES_USERNAME "
+            "/ EASYEQUITIES_PASSWORD in .env) to read your real holdings."
+        )
+
+        collector = EasyEquitiesCollector()
+
+        if not collector.enabled:
+            st.info("Set EASYEQUITIES_USERNAME and EASYEQUITIES_PASSWORD in .env to enable this.")
+        else:
+            if st.button("Fetch EasyEquities Accounts"):
+                with st.spinner("Logging in to EasyEquities..."):
+                    accounts = collector.list_accounts()
+
+                if accounts:
+                    st.session_state["ee_accounts"] = accounts
+                else:
+                    st.error("Could not fetch accounts. Check your EasyEquities credentials.")
+                    st.session_state.pop("ee_accounts", None)
+
+            accounts = st.session_state.get("ee_accounts")
+            if accounts:
+                account_labels = {a["id"]: f"{a['name']} ({a['trading_currency_id']})" for a in accounts}
+                account_id = st.selectbox(
+                    "Account",
+                    list(account_labels.keys()),
+                    format_func=lambda aid: account_labels[aid]
+                )
+
+                if st.button("Sync Holdings"):
+                    with st.spinner("Fetching holdings from EasyEquities..."):
+                        ee_holdings = collector.get_holdings(account_id)
+
+                    if ee_holdings is None:
+                        st.error("Could not fetch holdings from EasyEquities.")
+                    elif not ee_holdings:
+                        st.info("No holdings found in this EasyEquities account.")
+                    else:
+                        for ee_holding in ee_holdings:
+                            _sync_holding_from_easyequities(db, portfolio.id, ee_holding)
+                        st.success(f"Synced {len(ee_holdings)} holdings from EasyEquities.")
+                        st.rerun()
+
+    st.markdown("---")
+
     # Holdings table
     st.subheader("Portfolio Holdings")
-    
-    holdings = db.query(PortfolioHolding).filter(
-        PortfolioHolding.portfolio_id == portfolio.id
-    ).all()
-    
+
     if not holdings:
         st.info("No holdings in portfolio. Add holdings above.")
         return
-    
+
     data = []
     for holding in holdings:
-        # Update current values
-        _update_holding_values(db, holding)
-        
         data.append({
-            "Symbol": holding.symbol,
+            "Symbol": format_stock_label(holding.symbol, holding.stock.name if holding.stock else None),
             "Quantity": holding.quantity,
             "Purchase Price": f"R {holding.purchase_price:.2f}",
             "Current Price": f"R {holding.current_price:.2f}" if holding.current_price else "N/A",
@@ -97,7 +144,12 @@ def show_portfolio(db: Session):
     # Remove holding
     st.subheader("Remove Holding")
     holding_symbols = [h.symbol for h in holdings]
-    symbol_to_remove = st.selectbox("Select holding to remove", holding_symbols)
+    holding_names = {h.symbol: h.stock.name if h.stock else None for h in holdings}
+    symbol_to_remove = st.selectbox(
+        "Select holding to remove",
+        holding_symbols,
+        format_func=lambda s: format_stock_label(s, holding_names.get(s))
+    )
     
     if st.button("Remove Holding"):
         _remove_holding(db, portfolio.id, symbol_to_remove)
@@ -111,7 +163,8 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
     stock = db.query(Stock).filter(Stock.symbol == symbol).first()
     
     if not stock:
-        stock = Stock(symbol=symbol, name=symbol)
+        from app.services.data_service import get_company_name
+        stock = Stock(symbol=symbol, name=get_company_name(symbol))
         db.add(stock)
         db.flush()
     
@@ -127,15 +180,60 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
     
     db.add(holding)
     db.commit()
-    
-    # Fetch price data for the newly added stock
+
+    # Backfill historical prices and technical indicators for the newly added stock
     try:
         from app.services.data_service import DataService
-        data_service = DataService(db)
-        data_service.update_stock_prices([symbol])
-        logger.info(f"Fetched price data for {symbol}")
+        with st.spinner(f"Fetching price history for {symbol}..."):
+            data_service = DataService(db)
+            saved = data_service.update_historical_data(symbol)
+        logger.info(f"Fetched {saved} price points for {symbol}")
     except Exception as e:
         logger.error(f"Failed to fetch price data for {symbol}: {e}")
+
+
+def _sync_holding_from_easyequities(db: Session, portfolio_id: int, ee_holding: dict):
+    """Create or update a holding from parsed EasyEquities data."""
+    symbol = ee_holding["symbol"]
+    if not symbol or ee_holding["shares"] <= 0:
+        return
+
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    if not stock:
+        stock = Stock(symbol=symbol, name=ee_holding.get("name") or symbol)
+        db.add(stock)
+        db.flush()
+
+    holding = db.query(PortfolioHolding).filter(
+        PortfolioHolding.portfolio_id == portfolio_id,
+        PortfolioHolding.symbol == symbol
+    ).first()
+
+    is_new = holding is None
+    if is_new:
+        holding = PortfolioHolding(
+            portfolio_id=portfolio_id,
+            stock_id=stock.id,
+            symbol=symbol,
+            purchase_date=datetime.utcnow(),
+        )
+        db.add(holding)
+
+    # EasyEquities is treated as the source of truth for quantity/cost basis on sync
+    holding.quantity = ee_holding["shares"]
+    holding.purchase_price = ee_holding["purchase_price"]
+
+    db.commit()
+
+    if is_new:
+        try:
+            from app.services.data_service import DataService
+            with st.spinner(f"Fetching price history for {symbol}..."):
+                data_service = DataService(db)
+                saved = data_service.update_historical_data(symbol)
+            logger.info(f"Fetched {saved} price points for {symbol}")
+        except Exception as e:
+            logger.error(f"Failed to fetch price data for {symbol}: {e}")
 
 
 def _remove_holding(db: Session, portfolio_id: int, symbol: str):
@@ -159,7 +257,26 @@ def _update_holding_values(db: Session, holding: PortfolioHolding):
         holding.current_value = holding.quantity * latest_price.close_price
         holding.gain_loss = holding.current_value - (holding.quantity * holding.purchase_price)
         holding.gain_loss_percentage = (holding.gain_loss / (holding.quantity * holding.purchase_price)) * 100
-    
+    else:
+        holding.current_price = None
+        holding.current_value = None
+        holding.gain_loss = None
+        holding.gain_loss_percentage = None
+
+    db.commit()
+
+
+def _update_portfolio_totals(db: Session, portfolio: Portfolio, holdings: list) -> None:
+    """Recompute portfolio-level summary metrics from its current holdings."""
+    total_value = sum(h.current_value or 0.0 for h in holdings)
+    total_cost = sum(h.quantity * h.purchase_price for h in holdings)
+
+    portfolio.current_value = total_value
+    portfolio.total_gain_loss = total_value - total_cost
+    portfolio.total_gain_loss_percentage = (
+        (portfolio.total_gain_loss / total_cost) * 100 if total_cost else 0.0
+    )
+
     db.commit()
 
 

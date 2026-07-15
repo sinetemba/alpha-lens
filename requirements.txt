@@ -32,7 +32,8 @@ lxml==5.3.0
 feedparser==6.0.11
 
 # Finance APIs
-yfinance==0.2.50
+yfinance==1.5.1
+easy-equities-client==1.2.0
 
 # Notifications
 apprise==1.9.0

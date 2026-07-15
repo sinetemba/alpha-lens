@@ -5,9 +5,12 @@ from app.config.settings import settings
 from loguru import logger
 
 
+JSE_MIC_CODE = "XJSE"
+
+
 class TwelveDataCollector:
     """Collector for Twelve Data API."""
-    
+
     def __init__(self):
         self.api_key = settings.twelve_data_api_key
         self.base_url = settings.twelve_data_base_url
@@ -54,6 +57,17 @@ class TwelveDataCollector:
             "symbol": symbol
         }
         data = self._make_request("quote", params)
+
+        if data and data.get("mic_code") != JSE_MIC_CODE:
+            # Twelve Data's free plan doesn't support exchange-scoped queries, so a
+            # bare symbol (e.g. "RNG") can silently resolve to an unrelated company
+            # on another exchange (e.g. RingCentral on NYSE) instead of the JSE stock.
+            logger.warning(
+                f"Twelve Data quote for '{symbol}' resolved to {data.get('exchange')} "
+                f"({data.get('mic_code')}), not JSE - discarding."
+            )
+            return None
+
         return data
     
     def get_exchange_rate(self, from_currency: str, to_currency: str) -> Optional[Dict]:
@@ -93,10 +107,17 @@ class TwelveDataCollector:
             params["end_date"] = end_date
         
         data = self._make_request("time_series", params)
-        
+
         if data and "values" in data:
+            mic_code = data.get("meta", {}).get("mic_code")
+            if mic_code != JSE_MIC_CODE:
+                logger.warning(
+                    f"Twelve Data historical data for '{symbol}' resolved to "
+                    f"{data.get('meta', {}).get('exchange')} ({mic_code}), not JSE - discarding."
+                )
+                return None
             return data["values"]
-        
+
         return None
     
     def get_technical_indicators(

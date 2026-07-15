@@ -18,6 +18,27 @@ INDICATOR_COLUMNS = [
 ]
 
 
+def get_company_name(symbol: str) -> str:
+    """Fetch a company's display name from external data sources, falling back to the symbol."""
+    try:
+        info = TwelveDataCollector().get_company_info(symbol)
+        if info and info.get("name"):
+            return info["name"]
+    except Exception as e:
+        logger.error(f"Error fetching company name for {symbol} from Twelve Data: {e}")
+
+    try:
+        info = YFinanceCollector().get_info(symbol)
+        if info:
+            name = info.get("longName") or info.get("shortName")
+            if name:
+                return name
+    except Exception as e:
+        logger.error(f"Error fetching company name for {symbol} from Yahoo Finance: {e}")
+
+    return symbol
+
+
 class DataService:
     """Service for collecting and storing market data."""
     
@@ -90,7 +111,7 @@ class DataService:
             stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
             if not stock:
                 # Create basic stock entry
-                stock = Stock(symbol=symbol, name=symbol)
+                stock = Stock(symbol=symbol, name=get_company_name(symbol))
                 self.db.add(stock)
                 self.db.flush()
             
@@ -132,10 +153,10 @@ class DataService:
             # Get or create stock
             stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
             if not stock:
-                stock = Stock(symbol=symbol, name=symbol)
+                stock = Stock(symbol=symbol, name=get_company_name(symbol))
                 self.db.add(stock)
                 self.db.flush()
-            
+
             price = StockPrice(
                 stock_id=stock.id,
                 symbol=symbol,
@@ -235,10 +256,10 @@ class DataService:
                 if not existing:
                     stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
                     if not stock:
-                        stock = Stock(symbol=symbol, name=symbol)
+                        stock = Stock(symbol=symbol, name=get_company_name(symbol))
                         self.db.add(stock)
                         self.db.flush()
-                    
+
                     price = StockPrice(
                         stock_id=stock.id,
                         symbol=symbol,
@@ -269,10 +290,12 @@ class DataService:
         for point in data:
             try:
                 timestamp_str = point.get("datetime")
-                if timestamp_str:
-                    timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-                else:
+                if not timestamp_str:
                     continue
+                # Daily/weekly/monthly intervals return "YYYY-MM-DD" with no time
+                # component, while intraday intervals include "HH:MM:SS".
+                date_format = "%Y-%m-%d" if len(timestamp_str) == 10 else "%Y-%m-%d %H:%M:%S"
+                timestamp = datetime.strptime(timestamp_str, date_format)
                 
                 # Check if already exists
                 existing = self.db.query(StockPrice).filter(
@@ -286,7 +309,7 @@ class DataService:
                 # Get or create stock
                 stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
                 if not stock:
-                    stock = Stock(symbol=symbol, name=symbol)
+                    stock = Stock(symbol=symbol, name=get_company_name(symbol))
                     self.db.add(stock)
                     self.db.flush()
                 

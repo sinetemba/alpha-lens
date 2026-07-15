@@ -8,6 +8,7 @@ from app.models.news import NewsArticle
 from app.models.watchlist import WatchlistItem
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.config.settings import settings
+from app.dashboard.utils import format_stock_label
 from loguru import logger
 
 
@@ -183,7 +184,7 @@ def _render_watchlist_summary(db: Session):
                 change = 0.0
             
             data.append({
-                "Symbol": item.symbol,
+                "Symbol": format_stock_label(item.symbol, item.stock.name if item.stock else None),
                 "Price": f"R {latest_price.close_price:.2f}",
                 "Change": f"{change:+.2f}%",
                 "Volume": f"{latest_price.volume:,}" if latest_price.volume else "N/A"
@@ -234,7 +235,7 @@ def _render_performance_chart(db: Session):
             fig.add_trace(go.Scatter(
                 x=[p.timestamp for p in prices],
                 y=[p.close_price for p in prices],
-                name=item.symbol,
+                name=format_stock_label(item.symbol, item.stock.name if item.stock else None),
                 mode='lines'
             ))
     
