@@ -2,7 +2,7 @@ import streamlit as st
 from sqlalchemy.orm import Session
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_stock_label
+from app.dashboard.utils import format_stock_label, render_market_data_refresh_control
 from app.collectors.easyequities import EasyEquitiesCollector
 from datetime import datetime
 from loguru import logger
@@ -25,6 +25,11 @@ def show_portfolio(db: Session):
     holdings = db.query(PortfolioHolding).filter(
         PortfolioHolding.portfolio_id == portfolio.id
     ).all()
+    render_market_data_refresh_control(
+        db,
+        key="portfolio_market_data_refresh",
+        symbols=[holding.symbol for holding in holdings],
+    )
     for holding in holdings:
         _update_holding_values(db, holding)
     _update_portfolio_totals(db, portfolio, holdings)

@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from app.models.stock import Stock, StockPrice
 from app.models.watchlist import WatchlistItem
 from app.config.settings import settings
-from app.dashboard.utils import format_stock_label
+from app.dashboard.utils import format_stock_label, render_market_data_refresh_control
 from datetime import datetime, timedelta
 from loguru import logger
 
@@ -12,6 +12,11 @@ def show_watchlist(db: Session):
     """Display the watchlist page."""
     st.header("📋 Watchlist")
     st.markdown("Manage your stock watchlist and track performance.")
+
+    active_symbols = [
+        item.symbol for item in db.query(WatchlistItem).filter(WatchlistItem.is_active == True).all()
+    ]
+    render_market_data_refresh_control(db, key="watchlist_market_data_refresh", symbols=active_symbols)
     
     # Add new stock to watchlist
     with st.expander("➕ Add Stock to Watchlist"):

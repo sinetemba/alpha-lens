@@ -8,7 +8,7 @@ from app.models.news import NewsArticle
 from app.models.watchlist import WatchlistItem
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.config.settings import settings
-from app.dashboard.utils import format_stock_label
+from app.dashboard.utils import format_stock_label, render_market_data_refresh_control
 from loguru import logger
 
 
@@ -31,7 +31,7 @@ def show_home():
         # Sidebar navigation
         page = st.sidebar.radio(
             "Navigate",
-            ["Home", "Watchlist", "Portfolio", "Company View"],
+            ["Home", "Watchlist", "Portfolio", "Company View", "Commodities", "Krugerrands"],
             index=0
         )
         
@@ -46,6 +46,12 @@ def show_home():
         elif page == "Company View":
             from .company import show_company
             show_company(db)
+        elif page == "Commodities":
+            from .commodities import show_commodities
+            show_commodities(db)
+        elif page == "Krugerrands":
+            from .krugerrands import show_krugerrands
+            show_krugerrands(db)
     
     finally:
         db.close()
@@ -53,6 +59,7 @@ def show_home():
 
 def _render_home(db: Session):
     """Render the home page content."""
+    render_market_data_refresh_control(db, key="home_market_data_refresh", include_news=True)
     # Get latest market data
     col1, col2, col3, col4 = st.columns(4)
     

@@ -30,6 +30,16 @@ class Settings(BaseSettings):
     fmp_api_key: str = Field(default="", alias="FMP_API_KEY")
     fmp_base_url: str = Field(default="https://financialmodelingprep.com/api/v3", alias="FMP_BASE_URL")
 
+    # CommodityPriceAPI
+    commodity_price_api_key: str = Field(default="", alias="COMMODITY_PRICE_API_KEY")
+    commodity_price_api_base_url: str = Field(default="https://api.commoditypriceapi.com/v2", alias="COMMODITY_PRICE_API_BASE_URL")
+    metals_dev_api_key: str = Field(default="", alias="METALS_DEV_API_KEY")
+    metals_dev_base_url: str = Field(default="https://api.metals.dev/v1/latest", alias="METALS_DEV_BASE_URL")
+    metals_dev_currency: str = Field(default="ZAR", alias="METALS_DEV_CURRENCY")
+    metals_dev_unit: str = Field(default="g", alias="METALS_DEV_UNIT")
+    alpha_vantage_api_key: str = Field(default="", alias="ALPHA_VANTAGE_API_KEY")
+    alpha_vantage_base_url: str = Field(default="https://www.alphavantage.co/query", alias="ALPHA_VANTAGE_BASE_URL")
+
     # Exchange Rate API
     exchange_rate_api_key: str = Field(default="", alias="EXCHANGE_RATE_API_KEY")
     exchange_rate_base_url: str = Field(default="https://v6.exchangerate-api.com/v6", alias="EXCHANGE_RATE_BASE_URL")
