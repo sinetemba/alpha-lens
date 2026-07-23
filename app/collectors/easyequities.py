@@ -67,6 +67,21 @@ class EasyEquitiesCollector:
             logger.error(f"Error fetching EasyEquities holdings for account {account_id}: {e}")
             return None
 
+    def get_all_holdings(self) -> Optional[List[Dict]]:
+        client = self._get_client()
+        if not client:
+            return None
+
+        try:
+            parsed_holdings = []
+            for account in client.accounts.list():
+                holdings = client.accounts.holdings(account.id, include_shares=True)
+                parsed_holdings.extend(self._parse_holding(holding) for holding in holdings)
+            return parsed_holdings
+        except Exception as e:
+            logger.error(f"Error fetching EasyEquities holdings: {e}")
+            return None
+
     @staticmethod
     def _parse_holding(holding: Dict) -> Dict:
         """Convert a raw holding dict (string amounts, image-derived contract code) into numeric fields."""
