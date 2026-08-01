@@ -9,6 +9,7 @@ from app.models.watchlist import WatchlistItem
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.config.settings import settings
 from app.dashboard.utils import format_stock_label, render_market_data_refresh_control
+from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 from loguru import logger
 
 # Yahoo Finance symbol for the JSE All Share Index (J203)
@@ -167,24 +168,40 @@ def _get_jse_change(db: Session) -> str:
 
 
 def _get_portfolio_value(db: Session) -> float:
-    """Get total portfolio value."""
+    """Get total portfolio value, excluding demo account types."""
     portfolio = db.query(Portfolio).first()
-    if portfolio:
-        return portfolio.current_value or 0.0
-    return 0.0
+    if not portfolio:
+        return 0.0
+    holdings = db.query(PortfolioHolding).filter(
+        PortfolioHolding.portfolio_id == portfolio.id,
+        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
+    ).all()
+    return sum(h.current_value or 0.0 for h in holdings)
 
 
 def _get_portfolio_change(db: Session) -> str:
-    """Get portfolio change."""
+    """Get portfolio gain/loss percentage, excluding demo account types."""
     portfolio = db.query(Portfolio).first()
-    if portfolio and portfolio.total_gain_loss_percentage:
-        return f"{portfolio.total_gain_loss_percentage:.2f}%"
-    return "0.0%"
+    if not portfolio:
+        return "0.0%"
+    holdings = db.query(PortfolioHolding).filter(
+        PortfolioHolding.portfolio_id == portfolio.id,
+        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
+    ).all()
+    total_value = sum(h.current_value or 0.0 for h in holdings)
+    total_cost = sum(h.quantity * h.purchase_price for h in holdings)
+    pct = (
+        ((total_value - total_cost) / total_cost) * 100
+        if total_cost else 0.0
+    )
+    return f"{pct:.2f}%"
 
 
 def _get_daily_gain(db: Session) -> float:
     """Get daily portfolio gain/loss by comparing current prices to previous day's close."""
-    holdings = db.query(PortfolioHolding).all()
+    holdings = db.query(PortfolioHolding).filter(
+        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
+    ).all()
     daily_gain = 0.0
 
     for h in holdings:

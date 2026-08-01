@@ -5,11 +5,12 @@ from app.models.portfolio import Portfolio, PortfolioHolding
 from app.models.stock import Stock, StockPrice
 from app.dashboard.utils import format_stock_label
 from app.collectors.easyequities import EasyEquitiesCollector
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from loguru import logger
 
 
 EXCLUDED_PORTFOLIO_SYMBOLS = {"SZK"}
+EXCLUDED_ACCOUNT_TYPES = {"Demo ZAR"}
 
 
 def show_portfolio(db: Session):
@@ -30,6 +31,7 @@ def show_portfolio(db: Session):
     holdings = db.query(PortfolioHolding).filter(
         PortfolioHolding.portfolio_id == portfolio.id,
         ~PortfolioHolding.symbol.in_(EXCLUDED_PORTFOLIO_SYMBOLS),
+        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
     ).order_by(PortfolioHolding.purchase_date.asc()).all()
     refresh_requested, sync_caption = _render_easyequities_refresh_control(collector, holdings)
     synced_holdings = None
@@ -38,7 +40,8 @@ def show_portfolio(db: Session):
         with st.spinner(spinner_message):
             synced_holdings = _sync_portfolio_from_easyequities(db, portfolio.id, collector)
         if synced_holdings is None:
-            st.warning("EasyEquities sync failed. Showing the most recent database values.")
+            error_detail = f" Error: {collector.last_error}" if collector.last_error else ""
+            st.warning(f"EasyEquities sync failed. Showing the most recent database values.{error_detail}")
         elif refresh_requested:
             st.success(f"Synced {synced_holdings} holding{'s' if synced_holdings != 1 else ''} from EasyEquities.")
     else:
@@ -47,6 +50,7 @@ def show_portfolio(db: Session):
     holdings = db.query(PortfolioHolding).filter(
         PortfolioHolding.portfolio_id == portfolio.id,
         ~PortfolioHolding.symbol.in_(EXCLUDED_PORTFOLIO_SYMBOLS),
+        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
     ).order_by(PortfolioHolding.purchase_date.asc()).all()
     _update_easyequities_sync_caption(sync_caption, holdings)
     if synced_holdings is None:
@@ -117,7 +121,10 @@ def show_portfolio(db: Session):
                 if accounts:
                     st.session_state["ee_accounts"] = accounts
                 else:
-                    st.error("Could not fetch accounts. Check your EasyEquities credentials.")
+                    error_msg = "Could not fetch accounts. Check your EasyEquities credentials."
+                    if collector.last_error:
+                        error_msg += f"\n\nError: {collector.last_error}"
+                    st.error(error_msg)
                     st.session_state.pop("ee_accounts", None)
 
             accounts = st.session_state.get("ee_accounts")
@@ -145,69 +152,19 @@ def show_portfolio(db: Session):
 
     st.markdown("---")
 
-    # Holdings table
-    st.subheader("Portfolio Holdings")
-
+    # Holdings tables — one per account type
     if not holdings:
         st.info("No holdings in portfolio. Add holdings above.")
         return
 
-    winning_holdings = sum(holding.gain_loss is not None and holding.gain_loss > 0 for holding in holdings)
-    losing_holdings = sum(holding.gain_loss is not None and holding.gain_loss < 0 for holding in holdings)
-    unchanged_holdings = len(holdings) - winning_holdings - losing_holdings
-    summary = f"🟢 {winning_holdings} winning | 🔴 {losing_holdings} losing"
-    if unchanged_holdings:
-        summary += f" | 🟡 {unchanged_holdings} unchanged"
-    st.caption(summary)
+    # Group holdings by account type
+    account_groups: dict[str, list] = {}
+    for h in holdings:
+        account_groups.setdefault(h.account_type or "ZAR", []).append(h)
 
-    data = []
-    for holding in holdings:
-        data.append({
-            "Symbol": format_stock_label(holding.symbol, holding.stock.name if holding.stock else None),
-            "Quantity": holding.quantity,
-            "Purchase Price": f"R {holding.purchase_price:.2f}",
-            "Current Price": f"R {holding.current_price:.2f}" if holding.current_price else "N/A",
-            "Total Purchase Value": f"R {holding.quantity * holding.purchase_price:.2f}",
-            "Current Value": f"R {holding.current_value:.2f}" if holding.current_value else "N/A",
-            "Gain/Loss": f"R {holding.gain_loss:.2f}" if holding.gain_loss else "N/A",
-            "Gain/Loss %": f"{holding.gain_loss_percentage:.2f}%" if holding.gain_loss_percentage else "N/A",
-            "Dividends": f"R {holding.total_dividends_received:.2f}",
-            "_gain_loss": holding.gain_loss,
-        })
-    
-    if data:
-        holdings_table = pd.DataFrame(data)
-        available_columns = [column for column in holdings_table.columns if column != "_gain_loss"]
-        selected_columns = st.multiselect(
-            "Columns to display",
-            available_columns,
-            default=available_columns,
-            key="portfolio_holding_columns",
-        )
-        if selected_columns:
-            visible_columns = [column for column in available_columns if column in selected_columns]
-            visible_table = holdings_table[visible_columns + ["_gain_loss"]]
-            styled_table = visible_table.style.apply(_style_holding_gain_loss, axis=1).hide(
-                axis="columns", subset=["_gain_loss"]
-            )
-            st.dataframe(
-                styled_table,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
-                    "Quantity": st.column_config.NumberColumn("Quantity", help="Number of shares currently held."),
-                    "Purchase Price": st.column_config.TextColumn("Purchase Price", help="Average price paid per share."),
-                    "Current Price": st.column_config.TextColumn("Current Price", help="Latest market price per share from EasyEquities."),
-                    "Total Purchase Value": st.column_config.TextColumn("Total Purchase Value", help="Quantity multiplied by the average purchase price."),
-                    "Current Value": st.column_config.TextColumn("Current Value", help="Current market value of the holding."),
-                    "Gain/Loss": st.column_config.TextColumn("Gain/Loss", help="Current value less total purchase value."),
-                    "Gain/Loss %": st.column_config.TextColumn("Gain/Loss %", help="Gain or loss as a percentage of total purchase value."),
-                    "Dividends": st.column_config.TextColumn("Dividends", help="Total dividends recorded for this holding."),
-                },
-            )
-        else:
-            st.info("Select at least one column to display the holdings table.")
+    # Render a table for each account type
+    for account_type, group_holdings in account_groups.items():
+        _render_holdings_table(account_type, group_holdings)
     
     st.markdown("---")
     
@@ -238,6 +195,89 @@ def _style_holding_gain_loss(row: pd.Series) -> list[str]:
     else:
         color = "#fef3c7"
     return [f"background-color: {color}"] * len(row)
+
+
+def _render_holdings_table(account_type: str, holdings: list) -> None:
+    """Render a single holdings table section for the given account type."""
+    st.subheader(f"{account_type} Holdings")
+
+    winning = sum(h.gain_loss is not None and h.gain_loss > 0 for h in holdings)
+    losing = sum(h.gain_loss is not None and h.gain_loss < 0 for h in holdings)
+    unchanged = len(holdings) - winning - losing
+    total_value = sum(h.current_value or 0.0 for h in holdings)
+    total_cost = sum(h.quantity * h.purchase_price for h in holdings)
+    total_gl = total_value - total_cost
+    total_gl_pct = (total_gl / total_cost * 100) if total_cost else 0.0
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Value", f"R {total_value:,.2f}")
+    with col2:
+        st.metric("Cost", f"R {total_cost:,.2f}")
+    with col3:
+        st.metric("Gain/Loss", f"R {total_gl:,.2f}")
+    with col4:
+        st.metric("Gain/Loss %", f"{total_gl_pct:+.2f}%")
+
+    summary = f"\U0001f7e2 {winning} winning | \U0001f534 {losing} losing"
+    if unchanged:
+        summary += f" | \U0001f7e1 {unchanged} unchanged"
+    st.caption(summary)
+
+    data = []
+    for holding in holdings:
+        data.append({
+            "Symbol": format_stock_label(holding.symbol, holding.stock.name if holding.stock else None),
+            "Quantity": holding.quantity,
+            "Purchase Price": f"R {holding.purchase_price:.2f}",
+            "Current Price": f"R {holding.current_price:.2f}" if holding.current_price else "N/A",
+            "Total Purchase Value": f"R {holding.quantity * holding.purchase_price:.2f}",
+            "Current Value": f"R {holding.current_value:.2f}" if holding.current_value else "N/A",
+            "Gain/Loss": f"R {holding.gain_loss:.2f}" if holding.gain_loss else "N/A",
+            "Gain/Loss %": f"{holding.gain_loss_percentage:.2f}%" if holding.gain_loss_percentage else "N/A",
+            "Dividends": f"R {holding.total_dividends_received:.2f}",
+            "_gain_loss": holding.gain_loss,
+        })
+
+    if not data:
+        st.info(f"No holdings in {account_type} account.")
+        return
+
+    holdings_table = pd.DataFrame(data)
+    available_columns = [c for c in holdings_table.columns if c != "_gain_loss"]
+    table_key = f"portfolio_{account_type}_columns"
+    selected_columns = st.multiselect(
+        "Columns to display",
+        available_columns,
+        default=available_columns,
+        key=table_key,
+    )
+    if selected_columns:
+        visible_columns = [c for c in available_columns if c in selected_columns]
+        visible_table = holdings_table[visible_columns + ["_gain_loss"]]
+        styled_table = visible_table.style.apply(_style_holding_gain_loss, axis=1).hide(
+            axis="columns", subset=["_gain_loss"]
+        )
+        st.dataframe(
+            styled_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
+                "Quantity": st.column_config.NumberColumn("Quantity", help="Number of shares currently held."),
+                "Purchase Price": st.column_config.TextColumn("Purchase Price", help="Average price paid per share."),
+                "Current Price": st.column_config.TextColumn("Current Price", help="Latest market price per share from EasyEquities."),
+                "Total Purchase Value": st.column_config.TextColumn("Total Purchase Value", help="Quantity multiplied by the average purchase price."),
+                "Current Value": st.column_config.TextColumn("Current Value", help="Current market value of the holding."),
+                "Gain/Loss": st.column_config.TextColumn("Gain/Loss", help="Current value less total purchase value."),
+                "Gain/Loss %": st.column_config.TextColumn("Gain/Loss %", help="Gain or loss as a percentage of total purchase value."),
+                "Dividends": st.column_config.TextColumn("Dividends", help="Total dividends recorded for this holding."),
+            },
+        )
+    else:
+        st.info("Select at least one column to display the holdings table.")
+
+    st.markdown("---")
 
 
 def _render_easyequities_refresh_control(
@@ -273,11 +313,14 @@ def _sync_portfolio_from_easyequities(
     aggregated_holdings = {}
     for ee_holding in ee_holdings:
         symbol = ee_holding["symbol"]
+        account_name = ee_holding.get("account_name", "ZAR")
         if not symbol or symbol in EXCLUDED_PORTFOLIO_SYMBOLS or ee_holding["shares"] <= 0:
             continue
-        current = aggregated_holdings.setdefault(symbol, {
+        key = (symbol, account_name)
+        current = aggregated_holdings.setdefault(key, {
             "symbol": symbol,
             "name": ee_holding.get("name") or symbol,
+            "account_name": account_name,
             "shares": 0.0,
             "purchase_value": 0.0,
             "current_value": 0.0,
@@ -344,9 +387,11 @@ def _sync_holding_from_easyequities(db: Session, portfolio_id: int, ee_holding: 
         db.add(stock)
         db.flush()
 
+    account_type = ee_holding.get("account_name", "ZAR")
     holding = db.query(PortfolioHolding).filter(
         PortfolioHolding.portfolio_id == portfolio_id,
-        PortfolioHolding.symbol == symbol
+        PortfolioHolding.symbol == symbol,
+        PortfolioHolding.account_type == account_type,
     ).first()
 
     is_new = holding is None
@@ -355,7 +400,8 @@ def _sync_holding_from_easyequities(db: Session, portfolio_id: int, ee_holding: 
             portfolio_id=portfolio_id,
             stock_id=stock.id,
             symbol=symbol,
-            purchase_date=datetime.utcnow(),
+            account_type=account_type,
+            purchase_date=datetime.now(timezone.utc),
         )
         db.add(holding)
 
@@ -369,6 +415,9 @@ def _sync_holding_from_easyequities(db: Session, portfolio_id: int, ee_holding: 
         (holding.gain_loss / (holding.quantity * holding.purchase_price)) * 100
         if holding.purchase_price else 0.0
     )
+    # Always update the timestamp so the UI reflects the latest sync time,
+    # even when EasyEquities returns identical values.
+    holding.updated_at = datetime.now(timezone.utc)
 
     db.commit()
 
@@ -417,51 +466,3 @@ def _update_portfolio_totals(db: Session, portfolio: Portfolio, holdings: list) 
     db.commit()
 
 
-def _get_price_movements(db: Session, symbol: str) -> tuple:
-    """Calculate daily, weekly, and monthly price movements."""
-    now = datetime.utcnow()
-    
-    # Get latest price
-    latest = db.query(StockPrice).filter(
-        StockPrice.symbol == symbol
-    ).order_by(StockPrice.timestamp.desc()).first()
-    
-    if not latest:
-        return 0.0, 0.0, 0.0
-    
-    latest_price = latest.close_price
-    
-    # Daily change (compare with previous trading day)
-    daily_prev = db.query(StockPrice).filter(
-        StockPrice.symbol == symbol,
-        StockPrice.timestamp < latest.timestamp,
-        StockPrice.timestamp >= now - timedelta(days=2)
-    ).order_by(StockPrice.timestamp.desc()).first()
-    
-    daily_change = 0.0
-    if daily_prev and daily_prev.close_price > 0:
-        daily_change = ((latest_price - daily_prev.close_price) / daily_prev.close_price) * 100
-    
-    # Weekly change (compare with price 7 days ago)
-    weekly_prev = db.query(StockPrice).filter(
-        StockPrice.symbol == symbol,
-        StockPrice.timestamp >= now - timedelta(days=8),
-        StockPrice.timestamp <= now - timedelta(days=6)
-    ).order_by(StockPrice.timestamp.asc()).first()
-    
-    weekly_change = 0.0
-    if weekly_prev and weekly_prev.close_price > 0:
-        weekly_change = ((latest_price - weekly_prev.close_price) / weekly_prev.close_price) * 100
-    
-    # Monthly change (compare with price 30 days ago)
-    monthly_prev = db.query(StockPrice).filter(
-        StockPrice.symbol == symbol,
-        StockPrice.timestamp >= now - timedelta(days=32),
-        StockPrice.timestamp <= now - timedelta(days=28)
-    ).order_by(StockPrice.timestamp.asc()).first()
-    
-    monthly_change = 0.0
-    if monthly_prev and monthly_prev.close_price > 0:
-        monthly_change = ((latest_price - monthly_prev.close_price) / monthly_prev.close_price) * 100
-    
-    return daily_change, weekly_change, monthly_change

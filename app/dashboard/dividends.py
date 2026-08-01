@@ -8,6 +8,7 @@ from app.models.portfolio import PortfolioHolding
 from app.models.stock import Stock
 from app.services.data_service import DataService
 from app.dashboard.utils import format_stock_label
+from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 
 
 def show_dividends(db: Session):
@@ -19,7 +20,9 @@ def show_dividends(db: Session):
     total_dividends = db.query(Dividend).count()
     total_amount = db.query(func.sum(Dividend.amount)).scalar() or 0.0
 
-    holdings = db.query(PortfolioHolding).all()
+    holdings = db.query(PortfolioHolding).filter(
+        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
+    ).all()
     total_income = 0.0
     for h in holdings:
         per_share = (
