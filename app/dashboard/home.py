@@ -47,27 +47,28 @@ def show_home():
             ["Home", "Watchlist", "Portfolio", "Dividends", "Company View", "Commodities", "Krugerrands"],
             index=0
         )
-        
-        if page == "Home":
-            _render_home(db)
-        elif page == "Watchlist":
-            from .watchlist import show_watchlist
-            show_watchlist(db)
-        elif page == "Portfolio":
-            from .portfolio import show_portfolio
-            show_portfolio(db)
-        elif page == "Dividends":
-            from .dividends import show_dividends
-            show_dividends(db)
-        elif page == "Company View":
-            from .company import show_company
-            show_company(db)
-        elif page == "Commodities":
-            from .commodities import show_commodities
-            show_commodities(db)
-        elif page == "Krugerrands":
-            from .krugerrands import show_krugerrands
-            show_krugerrands(db)
+
+        with st.spinner("Loading page..."):
+            if page == "Home":
+                _render_home(db)
+            elif page == "Watchlist":
+                from .watchlist import show_watchlist
+                show_watchlist(db)
+            elif page == "Portfolio":
+                from .portfolio import show_portfolio
+                show_portfolio(db)
+            elif page == "Dividends":
+                from .dividends import show_dividends
+                show_dividends(db)
+            elif page == "Company View":
+                from .company import show_company
+                show_company(db)
+            elif page == "Commodities":
+                from .commodities import show_commodities
+                show_commodities(db)
+            elif page == "Krugerrands":
+                from .krugerrands import show_krugerrands
+                show_krugerrands(db)
     
     finally:
         db.close()

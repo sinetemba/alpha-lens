@@ -210,10 +210,23 @@ def show_portfolio(db: Session):
         format_func=lambda s: format_stock_label(s, holding_names.get(s))
     )
     
+    remove_key = "remove_pending_symbol"
     if st.button("Remove Holding"):
-        _remove_holding(db, portfolio.id, symbol_to_remove)
-        st.success(f"Removed {symbol_to_remove} from portfolio.")
-        st.rerun()
+        st.session_state[remove_key] = symbol_to_remove
+
+    if st.session_state.get(remove_key) == symbol_to_remove:
+        st.warning(f"Are you sure you want to remove {symbol_to_remove}?")
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button("Yes, remove"):
+                _remove_holding(db, portfolio.id, symbol_to_remove)
+                st.session_state[remove_key] = None
+                st.success(f"Removed {symbol_to_remove} from portfolio.")
+                st.rerun()
+        with cancel_col:
+            if st.button("Cancel"):
+                st.session_state[remove_key] = None
+                st.rerun()
 
 
 def _style_holding_gain_loss(row: pd.Series) -> list[str]:
@@ -278,10 +291,11 @@ def _render_holdings_table(account_type: str, holdings: list) -> None:
     holdings_table = pd.DataFrame(data)
     available_columns = [c for c in holdings_table.columns if c != "_gain_loss"]
     table_key = f"portfolio_{account_type}_columns"
+    if table_key not in st.session_state:
+        st.session_state[table_key] = available_columns
     selected_columns = st.multiselect(
         "Columns to display",
         available_columns,
-        default=available_columns,
         key=table_key,
     )
     if selected_columns:

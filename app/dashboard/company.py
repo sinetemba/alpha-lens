@@ -1,11 +1,12 @@
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
 from app.dashboard.utils import format_stock_label
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from loguru import logger
 
 
@@ -100,7 +101,7 @@ def _render_price_chart(db: Session, symbol: str):
     }
     
     days = days_map[period]
-    start_date = datetime.utcnow() - timedelta(days=days)
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     stock = db.query(Stock).filter(Stock.symbol == symbol).first()
     label = format_stock_label(symbol, stock.name if stock else None)
@@ -214,18 +215,24 @@ def _render_price_chart(db: Session, symbol: str):
 
 
 def _render_historical_data(db: Session, symbol: str):
-    """Render historical data table."""
+    """Render historical data table with pagination."""
     st.subheader("Historical Price Data")
-    
-    # Get recent price data
-    prices = db.query(StockPrice).filter(
-        StockPrice.symbol == symbol
-    ).order_by(StockPrice.timestamp.desc()).limit(100).all()
-    
-    if not prices:
+
+    page_size = 50
+    total = db.query(func.count(StockPrice.id)).filter(StockPrice.symbol == symbol).scalar() or 0
+
+    if total == 0:
         st.warning(f"No historical data available for {symbol}.")
         return
-    
+
+    total_pages = (total + page_size - 1) // page_size
+    page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1, key=f"hist_page_{symbol}")
+    offset = (page - 1) * page_size
+
+    prices = db.query(StockPrice).filter(
+        StockPrice.symbol == symbol
+    ).order_by(StockPrice.timestamp.desc()).offset(offset).limit(page_size).all()
+
     data = []
     for price in prices:
         data.append({
@@ -236,7 +243,8 @@ def _render_historical_data(db: Session, symbol: str):
             "Close": f"R {price.close_price:.2f}",
             "Volume": f"{price.volume:,}" if price.volume else "N/A",
         })
-    
+
+    st.caption(f"Page {page} of {total_pages} ({total} rows, {page_size} per page)")
     st.dataframe(data, use_container_width=True)
 
 
