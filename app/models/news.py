@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text, Float, ForeignKey, Index
 from sqlalchemy.orm import relationship
-from datetime import datetime
+from datetime import datetime, timezone
 from .base import Base
 
 
@@ -14,7 +14,7 @@ class NewsArticle(Base):
     summary = Column(Text)
     url = Column(String(1000), unique=True, nullable=False)
     source = Column(String(100), nullable=False)
-    published_at = Column(DateTime, nullable=False, index=True)
+    published_at = Column(DateTime, nullable=False)
     
     # Sentiment analysis
     sentiment = Column(String(20))  # positive, neutral, negative
@@ -23,7 +23,7 @@ class NewsArticle(Base):
     # Stock association (if article is about specific stock)
     stock_symbol = Column(String(10), index=True)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     # Composite index for efficient queries
     __table_args__ = (
