@@ -80,10 +80,10 @@ def show_dividends(db: Session):
     else:
         st.info("No dividend records found yet. Fetch from Yahoo Finance or add one manually below.")
 
-    # Portfolio income by holding
+    # All holdings with dividend income
     if holdings:
-        st.subheader("Dividend Income by Holding")
-        income_data = []
+        st.subheader("All Holdings")
+        holdings_data = []
         for h in holdings:
             per_share = (
                 db.query(func.sum(Dividend.amount))
@@ -92,18 +92,17 @@ def show_dividends(db: Session):
                 or 0.0
             )
             income = (h.quantity or 0.0) * per_share
-            if per_share > 0:
-                income_data.append({
-                    "Symbol": format_stock_label(h.symbol, h.stock.name if h.stock else None),
-                    "Quantity": h.quantity,
-                    "Dividends per Share": f"R {per_share:,.4f}",
-                    "Estimated Income": f"R {income:,.2f}",
-                })
+            holdings_data.append({
+                "Symbol": format_stock_label(h.symbol, h.stock.name if h.stock else None),
+                "Account": h.account_type or "ZAR",
+                "Quantity": h.quantity,
+                "Dividends per Share": f"R {per_share:,.4f}",
+                "Estimated Income": f"R {income:,.2f}",
+            })
 
-        if income_data:
-            st.dataframe(income_data, use_container_width=True)
-        else:
-            st.info("No dividend income data for current holdings.")
+        st.dataframe(holdings_data, use_container_width=True)
+    else:
+        st.info("No holdings found. Add holdings on the Portfolio page first.")
 
     # Manual entry
     st.markdown("---")
