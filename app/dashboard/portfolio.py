@@ -157,9 +157,41 @@ def show_portfolio(db: Session):
         st.info("No holdings in portfolio. Add holdings above.")
         return
 
+    # Filters
+    st.subheader("Filter Holdings")
+    f_col1, f_col2, f_col3 = st.columns(3)
+    with f_col1:
+        search = st.text_input("Search by symbol or name", value="").strip().lower()
+    with f_col2:
+        account_options = sorted(set(h.account_type or "ZAR" for h in holdings))
+        selected_accounts = st.multiselect("Account types", options=account_options, default=account_options)
+    with f_col3:
+        gain_choice = st.selectbox("Gain/Loss", options=["All", "Winning", "Losing"], index=0)
+
+    gain_checks = {
+        "All": lambda g: True,
+        "Winning": lambda g: (g or 0) > 0,
+        "Losing": lambda g: (g or 0) < 0,
+    }
+
+    def _matches(h: PortfolioHolding) -> bool:
+        if selected_accounts and (h.account_type or "ZAR") not in selected_accounts:
+            return False
+        if search:
+            name = h.stock.name if h.stock else ""
+            if search not in h.symbol.lower() and (not name or search not in name.lower()):
+                return False
+        return gain_checks[gain_choice](h.gain_loss)
+
+    display_holdings = [h for h in holdings if _matches(h)]
+
+    if not display_holdings:
+        st.info("No holdings match the selected filters.")
+        return
+
     # Group holdings by account type
     account_groups: dict[str, list] = {}
-    for h in holdings:
+    for h in display_holdings:
         account_groups.setdefault(h.account_type or "ZAR", []).append(h)
 
     # Render a table for each account type
