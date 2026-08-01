@@ -1,6 +1,7 @@
 import streamlit as st
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from datetime import datetime, timezone
 
 from app.models.dividend import Dividend
 from app.models.portfolio import PortfolioHolding
@@ -45,30 +46,36 @@ def show_dividends(db: Session):
             try:
                 data_service = DataService(db)
                 saved = data_service.update_dividends()
-                st.success(f"Saved {saved} new dividend records.")
+                if saved > 0:
+                    st.success(f"Saved {saved} new dividend records.")
+                else:
+                    st.warning(
+                        "No new dividend records found. This can happen if Yahoo Finance "
+                        "has no data for the active symbols, rate-limits the request, or "
+                        "if no stocks are marked active. Try adding a dividend manually below."
+                    )
             except Exception as e:
                 st.error(f"Error fetching dividends: {e}")
         st.rerun()
 
     # All dividends table
     dividends = db.query(Dividend).order_by(Dividend.ex_dividend_date.desc()).all()
-    if not dividends:
-        st.info("No dividend records found. Click 'Fetch Latest Dividends' to populate.")
-        return
+    if dividends:
+        data = []
+        for d in dividends:
+            data.append({
+                "Symbol": format_stock_label(d.symbol, d.stock.name if d.stock else None),
+                "Amount (per share)": f"R {d.amount:,.4f}",
+                "Ex-Dividend Date": d.ex_dividend_date.strftime("%Y-%m-%d") if d.ex_dividend_date else "N/A",
+                "Payment Date": d.payment_date.strftime("%Y-%m-%d") if d.payment_date else "N/A",
+                "Frequency": d.frequency or "N/A",
+                "Currency": d.currency or "ZAR",
+            })
 
-    data = []
-    for d in dividends:
-        data.append({
-            "Symbol": format_stock_label(d.symbol, d.stock.name if d.stock else None),
-            "Amount (per share)": f"R {d.amount:,.4f}",
-            "Ex-Dividend Date": d.ex_dividend_date.strftime("%Y-%m-%d") if d.ex_dividend_date else "N/A",
-            "Payment Date": d.payment_date.strftime("%Y-%m-%d") if d.payment_date else "N/A",
-            "Frequency": d.frequency or "N/A",
-            "Currency": d.currency or "ZAR",
-        })
-
-    st.subheader("All Dividends")
-    st.dataframe(data, use_container_width=True)
+        st.subheader("All Dividends")
+        st.dataframe(data, use_container_width=True)
+    else:
+        st.info("No dividend records found yet. Fetch from Yahoo Finance or add one manually below.")
 
     # Portfolio income by holding
     if holdings:
@@ -94,3 +101,44 @@ def show_dividends(db: Session):
             st.dataframe(income_data, use_container_width=True)
         else:
             st.info("No dividend income data for current holdings.")
+
+    # Manual entry
+    st.markdown("---")
+    with st.expander("➕ Add Dividend Manually"):
+        col1, col2 = st.columns(2)
+        with col1:
+            symbol = st.text_input("Symbol", placeholder="e.g. NPN").upper().strip()
+            amount = st.number_input("Amount per Share", min_value=0.0, step=0.01)
+            currency = st.text_input("Currency", value="ZAR").upper().strip()
+        with col2:
+            ex_date = st.date_input("Ex-Dividend Date", value=datetime.now(timezone.utc).date())
+            payment_date = st.date_input("Payment Date (optional)", value=None)
+            frequency = st.selectbox(
+                "Frequency",
+                [None, "monthly", "quarterly", "semi-annual", "annual"],
+                format_func=lambda x: "Select..." if x is None else x,
+            )
+
+        if st.button("Add Dividend"):
+            if not symbol or amount <= 0 or not ex_date:
+                st.error("Symbol, amount and ex-dividend date are required.")
+            else:
+                stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+                if not stock:
+                    stock = Stock(symbol=symbol, name=symbol)
+                    db.add(stock)
+                    db.flush()
+
+                dividend = Dividend(
+                    stock_id=stock.id,
+                    symbol=symbol,
+                    amount=amount,
+                    currency=currency or "ZAR",
+                    ex_dividend_date=datetime.combine(ex_date, datetime.min.time()),
+                    payment_date=datetime.combine(payment_date, datetime.min.time()) if payment_date else None,
+                    frequency=frequency,
+                )
+                db.add(dividend)
+                db.commit()
+                st.success(f"Added {symbol} dividend of R {amount:.4f} per share.")
+                st.rerun()
