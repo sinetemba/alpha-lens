@@ -10,7 +10,7 @@ from loguru import logger
 
 
 EXCLUDED_PORTFOLIO_SYMBOLS = {"SZK"}
-EXCLUDED_ACCOUNT_TYPES = {"Demo ZAR"}
+EXCLUDED_ACCOUNT_TYPES = set()
 
 
 def show_portfolio(db: Session):
