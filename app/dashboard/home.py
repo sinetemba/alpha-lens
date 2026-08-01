@@ -24,7 +24,16 @@ def show_home():
         initial_sidebar_state="expanded"
     )
     
-    st.title("📈 JSE Stock Analysis Platform")
+    header_col, source_col = st.columns([4, 1])
+    with header_col:
+        st.title("JSE Stock Analysis Platform")
+    with source_col:
+        st.markdown(
+            "<p style='text-align: right; font-size: small; color: #888; margin: 0;'>"
+            "Data: Yahoo Finance, Twelve Data, EasyEquities, JSE"
+            "</p>",
+            unsafe_allow_html=True,
+        )
     st.markdown("---")
     
     # Initialize database session
