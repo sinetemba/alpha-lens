@@ -1,6 +1,7 @@
 import pandas as pd
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from app.models.dividend import Dividend
 from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
 from app.collectors.twelve_data import TwelveDataCollector
@@ -96,7 +97,7 @@ class DataService:
             if timestamp_str:
                 timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
             else:
-                timestamp = datetime.utcnow()
+                timestamp = datetime.now(timezone.utc)
             
             # Check if we already have data for this timestamp
             existing = self.db.query(StockPrice).filter(
@@ -203,6 +204,51 @@ class DataService:
         except Exception as e:
             logger.error(f"Error updating technical indicators for {symbol}: {e}")
 
+    def update_dividends(self, symbols: Optional[List[str]] = None) -> int:
+        """Fetch and store dividend history for active stocks."""
+        if symbols is None:
+            stocks = self.db.query(Stock).filter(Stock.is_active == True).all()
+            symbols = [stock.symbol for stock in stocks]
+
+        saved = 0
+        for symbol in symbols:
+            try:
+                dividends = self.yfinance.get_dividends(symbol)
+                if dividends is None or dividends.empty:
+                    continue
+
+                stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
+                if not stock:
+                    stock = Stock(symbol=symbol, name=get_company_name(symbol))
+                    self.db.add(stock)
+                    self.db.flush()
+
+                for date, amount in dividends.items():
+                    ex_date = date.to_pydatetime() if hasattr(date, "to_pydatetime") else date
+                    existing = self.db.query(Dividend).filter(
+                        Dividend.symbol == symbol,
+                        Dividend.ex_dividend_date == ex_date,
+                    ).first()
+                    if existing:
+                        continue
+
+                    dividend = Dividend(
+                        stock_id=stock.id,
+                        symbol=symbol,
+                        amount=float(amount),
+                        currency="ZAR",
+                        ex_dividend_date=ex_date,
+                    )
+                    self.db.add(dividend)
+                    saved += 1
+
+            except Exception as e:
+                logger.error(f"Error updating dividends for {symbol}: {e}")
+
+        self.db.commit()
+        logger.info(f"Saved {saved} new dividend records")
+        return saved
+
     def collect_news(self) -> int:
         """Collect news from all sources."""
         logger.info("Starting news collection")
@@ -218,7 +264,7 @@ class DataService:
         logger.info(f"Updating historical data for {symbol}")
         
         # Calculate date range
-        end_date = datetime.utcnow()
+        end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=days)
         
         # Try Twelve Data first

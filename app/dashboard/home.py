@@ -1,6 +1,6 @@
 import streamlit as st
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from app.models.base import SessionLocal
 from app.models.stock import Stock, StockPrice
@@ -10,6 +10,9 @@ from app.models.portfolio import Portfolio, PortfolioHolding
 from app.config.settings import settings
 from app.dashboard.utils import format_stock_label, render_market_data_refresh_control
 from loguru import logger
+
+# Yahoo Finance symbol for the JSE All Share Index (J203)
+JSE_INDEX_YF_SYMBOL = "^J203.JO"
 
 
 def show_home():
@@ -31,7 +34,7 @@ def show_home():
         # Sidebar navigation
         page = st.sidebar.radio(
             "Navigate",
-            ["Home", "Watchlist", "Portfolio", "Company View", "Commodities", "Krugerrands"],
+            ["Home", "Watchlist", "Portfolio", "Dividends", "Company View", "Commodities", "Krugerrands"],
             index=0
         )
         
@@ -43,6 +46,9 @@ def show_home():
         elif page == "Portfolio":
             from .portfolio import show_portfolio
             show_portfolio(db)
+        elif page == "Dividends":
+            from .dividends import show_dividends
+            show_dividends(db)
         elif page == "Company View":
             from .company import show_company
             show_company(db)
@@ -59,6 +65,11 @@ def show_home():
 
 def _render_home(db: Session):
     """Render the home page content."""
+    # Ensure JSE index symbol exists in the database
+    if not db.query(Stock).filter(Stock.symbol == JSE_INDEX_YF_SYMBOL).first():
+        db.add(Stock(symbol=JSE_INDEX_YF_SYMBOL, name="JSE All Share Index"))
+        db.commit()
+
     render_market_data_refresh_control(db, key="home_market_data_refresh", include_news=True)
     # Get latest market data
     col1, col2, col3, col4 = st.columns(4)
@@ -116,15 +127,34 @@ def _render_home(db: Session):
 
 
 def _get_jse_index(db: Session) -> str:
-    """Get current JSE index value."""
-    # This would typically fetch the actual JSE index
-    # For now, return a placeholder
-    return "78,450"
+    """Get current JSE index value from the database."""
+    latest = db.query(StockPrice).filter(
+        StockPrice.symbol == JSE_INDEX_YF_SYMBOL
+    ).order_by(StockPrice.timestamp.desc()).first()
+
+    if latest and latest.close_price:
+        return f"{latest.close_price:,.0f}"
+    return "N/A"
 
 
 def _get_jse_change(db: Session) -> str:
-    """Get JSE index change."""
-    return "+1.2%"
+    """Get JSE index daily percentage change."""
+    latest = db.query(StockPrice).filter(
+        StockPrice.symbol == JSE_INDEX_YF_SYMBOL
+    ).order_by(StockPrice.timestamp.desc()).first()
+
+    if not latest:
+        return "N/A"
+
+    prev = db.query(StockPrice).filter(
+        StockPrice.symbol == JSE_INDEX_YF_SYMBOL,
+        StockPrice.timestamp < latest.timestamp
+    ).order_by(StockPrice.timestamp.desc()).first()
+
+    if prev and prev.close_price and prev.close_price > 0:
+        change_pct = ((latest.close_price - prev.close_price) / prev.close_price) * 100
+        return f"{change_pct:+.2f}%"
+    return "N/A"
 
 
 def _get_portfolio_value(db: Session) -> float:
@@ -144,20 +174,39 @@ def _get_portfolio_change(db: Session) -> str:
 
 
 def _get_daily_gain(db: Session) -> float:
-    """Get daily gain/loss."""
-    # Calculate based on portfolio holdings
+    """Get daily portfolio gain/loss by comparing current prices to previous day's close."""
     holdings = db.query(PortfolioHolding).all()
-    total_gain = sum(h.gain_loss or 0 for h in holdings)
-    return total_gain
+    daily_gain = 0.0
+
+    for h in holdings:
+        if not h.current_price or not h.quantity:
+            continue
+        # Get the previous trading day's close for this symbol
+        latest = db.query(StockPrice).filter(
+            StockPrice.symbol == h.symbol
+        ).order_by(StockPrice.timestamp.desc()).first()
+
+        if not latest:
+            continue
+
+        prev = db.query(StockPrice).filter(
+            StockPrice.symbol == h.symbol,
+            StockPrice.timestamp < latest.timestamp
+        ).order_by(StockPrice.timestamp.desc()).first()
+
+        if prev and prev.close_price:
+            daily_gain += (latest.close_price - prev.close_price) * h.quantity
+
+    return daily_gain
 
 
 def _get_daily_gain_percentage(db: Session) -> str:
-    """Get daily gain percentage."""
+    """Get daily gain as a percentage of portfolio value."""
     portfolio = db.query(Portfolio).first()
     if portfolio and portfolio.current_value and portfolio.current_value > 0:
         daily_gain = _get_daily_gain(db)
         pct = (daily_gain / portfolio.current_value) * 100
-        return f"{pct:.2f}%"
+        return f"{pct:+.2f}%"
     return "0.0%"
 
 
@@ -235,7 +284,7 @@ def _render_performance_chart(db: Session):
     for item in watchlist_items:
         prices = db.query(StockPrice).filter(
             StockPrice.symbol == item.symbol,
-            StockPrice.timestamp >= datetime.utcnow() - timedelta(days=30)
+            StockPrice.timestamp >= datetime.now(timezone.utc) - timedelta(days=30)
         ).order_by(StockPrice.timestamp.asc()).all()
         
         if prices:
