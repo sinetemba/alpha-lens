@@ -1,6 +1,7 @@
 import streamlit as st
 import plotly.graph_objects as go
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from sqlalchemy.orm import Session
 from app.models.base import SessionLocal
 from app.models.stock import Stock, StockPrice
@@ -81,7 +82,9 @@ def _render_home(db: Session):
         db.add(Stock(symbol=JSE_INDEX_YF_SYMBOL, name="JSE All Share Index"))
         db.commit()
 
-    render_market_data_refresh_control(db, key="home_market_data_refresh", include_news=True)
+    render_market_data_refresh_control(
+        db, key="home_market_data_refresh", include_news=True, auto_refresh=True
+    )
     # Get latest market data
     col1, col2, col3, col4 = st.columns(4)
     
@@ -119,17 +122,23 @@ def _render_home(db: Session):
     
     st.markdown("---")
     
+    # Top movers for the day
+    st.subheader("🚀 Top Movers Today")
+    _render_top_movers(db)
+
+    st.markdown("---")
+
     # Two-column layout
     col_left, col_right = st.columns([2, 1])
-    
+
     with col_left:
         st.subheader("📊 Watchlist Summary")
         _render_watchlist_summary(db)
-    
+
     with col_right:
         st.subheader("📰 Market News")
         _render_news_feed(db)
-    
+
     st.markdown("---")
     
     # Recent performance chart
@@ -157,10 +166,7 @@ def _get_jse_change(db: Session) -> str:
     if not latest:
         return "N/A"
 
-    prev = db.query(StockPrice).filter(
-        StockPrice.symbol == JSE_INDEX_YF_SYMBOL,
-        StockPrice.timestamp < latest.timestamp
-    ).order_by(StockPrice.timestamp.desc()).first()
+    prev = _get_previous_day_price(db, JSE_INDEX_YF_SYMBOL, latest.timestamp)
 
     if prev and prev.close_price and prev.close_price > 0:
         change_pct = ((latest.close_price - prev.close_price) / prev.close_price) * 100
@@ -216,10 +222,7 @@ def _get_daily_gain(db: Session) -> float:
         if not latest:
             continue
 
-        prev = db.query(StockPrice).filter(
-            StockPrice.symbol == h.symbol,
-            StockPrice.timestamp < latest.timestamp
-        ).order_by(StockPrice.timestamp.desc()).first()
+        prev = _get_previous_day_price(db, h.symbol, latest.timestamp)
 
         if prev and prev.close_price:
             daily_gain += (latest.close_price - prev.close_price) * h.quantity
@@ -255,12 +258,8 @@ def _render_watchlist_summary(db: Session):
         ).order_by(StockPrice.timestamp.desc()).first()
         
         if latest_price:
-            # Calculate daily change (simplified)
-            prev_price = db.query(StockPrice).filter(
-                StockPrice.symbol == item.symbol,
-                StockPrice.timestamp < latest_price.timestamp
-            ).order_by(StockPrice.timestamp.desc()).first()
-            
+            prev_price = _get_previous_day_price(db, item.symbol, latest_price.timestamp)
+
             if prev_price:
                 change = ((latest_price.close_price - prev_price.close_price) / prev_price.close_price) * 100
             else:
@@ -277,6 +276,92 @@ def _render_watchlist_summary(db: Session):
         st.dataframe(data, use_container_width=True)
     else:
         st.warning("No price data available for watchlist items.")
+
+
+def _get_previous_day_price(db: Session, symbol: str, latest_timestamp: datetime) -> Optional[StockPrice]:
+    """Get the most recent price for a symbol from a calendar day before `latest_timestamp`.
+
+    Auto-refresh can store multiple price points for the same symbol on the
+    same day (e.g. hourly), so comparing against "whatever the second-most-recent
+    row is" would understate/overstate moves as an intraday change rather than
+    a true day-over-day one. This looks back to the last *prior* calendar day instead.
+    """
+    latest_day_start = latest_timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+    return db.query(StockPrice).filter(
+        StockPrice.symbol == symbol,
+        StockPrice.timestamp < latest_day_start
+    ).order_by(StockPrice.timestamp.desc()).first()
+
+
+def _get_daily_movers(db: Session, limit: int = 5) -> tuple[list, list]:
+    """Compute the top daily winners and losers across all tracked JSE stocks.
+
+    This considers every active stock in the database (default seeded stocks,
+    watchlist additions, and portfolio holdings alike) — not just the ones on
+    the user's current watchlist or in their portfolio.
+    """
+    stocks = db.query(Stock).filter(
+        Stock.is_active == True,
+        Stock.symbol != JSE_INDEX_YF_SYMBOL,
+    ).all()
+
+    movers = []
+    for stock in stocks:
+        latest = db.query(StockPrice).filter(
+            StockPrice.symbol == stock.symbol
+        ).order_by(StockPrice.timestamp.desc()).first()
+
+        if not latest:
+            continue
+
+        prev = _get_previous_day_price(db, stock.symbol, latest.timestamp)
+
+        if not prev or not prev.close_price:
+            continue
+
+        change_pct = ((latest.close_price - prev.close_price) / prev.close_price) * 100
+        movers.append({
+            "Symbol": format_stock_label(stock.symbol, stock.name),
+            "Price": f"R {latest.close_price:.2f}",
+            "Change": f"{change_pct:+.2f}%",
+            "_change_pct": change_pct,
+        })
+
+    movers.sort(key=lambda m: m["_change_pct"], reverse=True)
+    winners = [m for m in movers if m["_change_pct"] > 0][:limit]
+    losers = sorted(
+        [m for m in movers if m["_change_pct"] < 0], key=lambda m: m["_change_pct"]
+    )[:limit]
+    return winners, losers
+
+
+def _render_top_movers(db: Session):
+    """Render the top 5 winners and losers of the day side by side."""
+    winners, losers = _get_daily_movers(db)
+
+    col_winners, col_losers = st.columns(2)
+
+    with col_winners:
+        st.markdown("**🟢 Top 5 Winners**")
+        if winners:
+            st.dataframe(
+                [{"Symbol": m["Symbol"], "Price": m["Price"], "Change": m["Change"]} for m in winners],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No winners found. Try refreshing market data.")
+
+    with col_losers:
+        st.markdown("**🔴 Top 5 Losers**")
+        if losers:
+            st.dataframe(
+                [{"Symbol": m["Symbol"], "Price": m["Price"], "Change": m["Change"]} for m in losers],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No losers found. Try refreshing market data.")
 
 
 def _render_news_feed(db: Session):
