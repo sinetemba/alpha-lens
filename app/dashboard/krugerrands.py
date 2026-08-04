@@ -262,7 +262,7 @@ def _get_historical_year_end_prices(gold_api: GoldAPICollector) -> list[dict]:
         # GoldAPI returns price per troy ounce of fine gold. Krugerrand sizes are
         # denominated in troy ounces of pure gold (1, 0.5, 0.25, 0.1), so the
         # size value is a simple fraction of the 1 oz price.
-        row = {"Year": year}
+        row = {"Year": str(year)}
         for size, grams in KRUGERRAND_SIZES.items():
             pure_oz = grams / 33.930  # exact fraction of a full Krugerrand
             row[size] = f"R {price * pure_oz:,.2f}"
