@@ -1,9 +1,10 @@
+from collections import Counter
 import pandas as pd
 import streamlit as st
 from sqlalchemy.orm import Session
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_stock_label, style_gain_loss_row, is_market_data_stale
+from app.dashboard.utils import format_stock_label, style_gain_loss_row, is_market_data_stale, _to_display_tz
 from app.collectors.easyequities import EasyEquitiesCollector
 from datetime import datetime, timedelta, timezone
 from loguru import logger
@@ -101,6 +102,9 @@ def show_portfolio(db: Session):
 
     with col5:
         st.metric("Holdings", len(holdings))
+    
+    st.markdown("---")
+    _render_instrument_type_counts(st.session_state.get("ee_last_raw_holdings"))
     
     st.markdown("---")
     
@@ -220,6 +224,9 @@ def show_portfolio(db: Session):
     # Render a table for each account type
     for account_type, group_holdings in account_groups.items():
         _render_holdings_table(account_type, group_holdings)
+    
+    st.markdown("---")
+    _render_easyequities_debug(collector, portfolio, holdings)
     
     st.markdown("---")
     
@@ -354,15 +361,113 @@ def _render_easyequities_refresh_control(
 def _update_easyequities_sync_caption(sync_caption, portfolio: Portfolio) -> None:
     latest_update = portfolio.last_easyequities_sync
     if latest_update:
-        sync_caption.caption(f"Last EasyEquities sync: {latest_update.strftime('%d %b %Y %H:%M')}")
+        display_update = _to_display_tz(latest_update)
+        sync_caption.caption(f"Last EasyEquities sync: {display_update.strftime('%d %b %Y %H:%M')}")
     else:
         sync_caption.caption("No EasyEquities sync recorded yet.")
+
+
+def _render_easyequities_debug(
+    collector: EasyEquitiesCollector, portfolio: Portfolio, holdings: list
+) -> None:
+    """Show raw EasyEquities holdings and why each one is included/excluded."""
+    if not collector.enabled:
+        return
+
+    with st.expander("Debug EasyEquities sync"):
+        raw = st.session_state.get("ee_last_raw_holdings")
+        if not raw:
+            if st.button("Load raw EasyEquities data"):
+                with st.spinner("Fetching raw data..."):
+                    raw = collector.get_all_holdings()
+                    st.session_state["ee_last_raw_holdings"] = raw or []
+                st.rerun()
+            return
+
+        rows = []
+        raw_total = 0.0
+        filtered_total = 0.0
+        filtered_count = 0
+        for h in raw:
+            current_value = h.get("current_value") or 0.0
+            raw_total += current_value
+            symbol = h.get("symbol", "")
+            account = h.get("account_name", "ZAR")
+            shares = h.get("shares", 0)
+            reasons = []
+
+            if account in EXCLUDED_ACCOUNT_TYPES:
+                reasons.append(f"excluded account '{account}'")
+            if symbol in EXCLUDED_PORTFOLIO_SYMBOLS:
+                reasons.append(f"excluded symbol '{symbol}'")
+            if shares <= 0:
+                reasons.append("shares <= 0")
+
+            if not reasons:
+                filtered_total += current_value
+                filtered_count += 1
+
+            rows.append({
+                "Symbol": symbol or "N/A",
+                "Name": h.get("name", ""),
+                "Account": account,
+                "Shares": f"{shares:,.4f}" if shares else "0",
+                "Current Value (raw)": f"R {current_value:,.2f}",
+                "Included?": "No" if reasons else "Yes",
+                "Reason if excluded": "; ".join(reasons),
+            })
+
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Raw EasyEquities total", f"R {raw_total:,.2f}")
+        c2.metric("Filtered total (included)", f"R {filtered_total:,.2f}")
+        c3.metric("App portfolio value", f"R {portfolio.current_value:,.2f}")
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Raw holdings count", len(raw))
+        c5.metric("Filtered holdings count", filtered_count)
+        c6.metric("App holdings count", len(holdings))
+
+        if st.button("Clear debug data"):
+            st.session_state.pop("ee_last_raw_holdings", None)
+            st.rerun()
+
+
+def _render_instrument_type_counts(raw_holdings: list | None) -> None:
+    """Show how many included holdings fall into each instrument type (Equity, ETF, etc.)."""
+    if not raw_holdings:
+        return
+
+    type_counts = Counter()
+    for h in raw_holdings:
+        symbol = h.get("symbol", "")
+        account = h.get("account_name", "ZAR")
+        shares = h.get("shares", 0)
+
+        if account in EXCLUDED_ACCOUNT_TYPES:
+            continue
+        if symbol in EXCLUDED_PORTFOLIO_SYMBOLS:
+            continue
+        if shares <= 0:
+            continue
+
+        type_counts[h.get("instrument_type", "Unknown")] += 1
+
+    if not type_counts:
+        return
+
+    st.subheader("Holdings by Type")
+    cols = st.columns(len(type_counts))
+    for col, (instrument_type, count) in zip(cols, sorted(type_counts.items())):
+        col.metric(instrument_type, count)
 
 
 def _sync_portfolio_from_easyequities(
     db: Session, portfolio_id: int, collector: EasyEquitiesCollector
 ) -> int | None:
     ee_holdings = collector.get_all_holdings()
+    st.session_state["ee_last_raw_holdings"] = ee_holdings if ee_holdings is not None else []
     if ee_holdings is None:
         return None
 

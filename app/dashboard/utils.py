@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
+from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 from sqlalchemy.orm import Session
@@ -53,6 +54,15 @@ def _ensure_aware(timestamp: datetime) -> datetime:
     return timestamp
 
 
+def _to_display_tz(timestamp: datetime) -> datetime:
+    """Convert an aware UTC timestamp to the configured display timezone."""
+    timestamp = _ensure_aware(timestamp)
+    try:
+        return timestamp.astimezone(ZoneInfo(settings.scheduler_timezone))
+    except Exception:
+        return timestamp
+
+
 def is_market_data_stale(timestamp: Optional[datetime]) -> bool:
     if timestamp is None:
         return True
@@ -65,6 +75,7 @@ def format_market_data_age(timestamp: Optional[datetime]) -> str:
         return "No market data has been synced yet."
 
     timestamp = _ensure_aware(timestamp)
+    display_timestamp = _to_display_tz(timestamp)
     age = max(datetime.now(timezone.utc) - timestamp, timedelta(0))
     if age.days:
         age_label = f"{age.days} day{'s' if age.days != 1 else ''} ago"
@@ -75,7 +86,7 @@ def format_market_data_age(timestamp: Optional[datetime]) -> str:
         minutes = age.seconds // 60
         age_label = f"{minutes} minute{'s' if minutes != 1 else ''} ago"
 
-    return f"Last market data: {timestamp.strftime('%d %b %Y %H:%M')} ({age_label})"
+    return f"Last market data: {display_timestamp.strftime('%d %b %Y %H:%M')} ({age_label})"
 
 
 def render_market_data_refresh_control(
@@ -108,7 +119,10 @@ def render_market_data_refresh_control(
                 updated_prices = data_service.update_stock_prices(symbol_list)
                 new_articles = data_service.collect_news() if include_news else 0
             if data_service.quota_message:
-                st.warning(data_service.quota_message)
+                st.warning(
+                    f"{data_service.quota_message} "
+                    f"{format_market_data_age(latest_timestamp)}"
+                )
             if manual_refresh:
                 status = f"Updated prices for {updated_prices} symbol{'s' if updated_prices != 1 else ''}."
                 if include_news:

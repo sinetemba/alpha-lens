@@ -39,7 +39,8 @@ stock-analyzer/
 │   └── services/           # Business logic (scheduler, data service)
 ├── alembic/                # Database migrations
 ├── data/                   # Data directory (database, cache, logs)
-├── docker/                 # Docker configuration
+├── Dockerfile              # Docker image
+├── docker-compose.yml      # Docker Compose configuration
 ├── tests/                  # Test files
 ├── main.py                 # Main application entry point
 ├── requirements.txt        # Python dependencies
@@ -132,12 +133,15 @@ See the Docker section below for containerized deployment.
 
 ### Dashboard Navigation
 
-The application has four main sections:
+The application has seven main sections:
 
 1. **Home**: Overview of market data, portfolio summary, and recent news
 2. **Watchlist**: Manage your stock watchlist with price alerts
 3. **Portfolio**: Track your holdings and performance
-4. **Company View**: Detailed information about specific stocks
+4. **Dividends**: Track dividend history and payments
+5. **Company View**: Detailed information about specific stocks
+6. **Commodities**: Track commodity prices
+7. **Krugerrands**: Track Krugerrand prices
 
 ### Adding Stocks to Watchlist
 
@@ -287,6 +291,8 @@ Run with coverage:
 pytest tests/ --cov=app --cov-report=html
 ```
 
+A GitHub Actions workflow in `.github/workflows/ci.yml` runs the test suite on pushes and pull requests.
+
 ## Troubleshooting
 
 ### Database Locked Error
@@ -326,27 +332,21 @@ This project follows PEP 8 guidelines. Consider using:
 ### Version 1 (Current)
 - ✅ Stock dashboard
 - ✅ Watchlist
+- ✅ Portfolio tracking
 - ✅ Historical prices
+- ✅ Technical indicators
 - ✅ Hourly updates
 - ✅ News aggregation
+- ✅ Dividend tracking
+- ✅ Notifications
+- ✅ Commodity and Krugerrand tracking
 
 ### Version 2 (Planned)
-- Portfolio tracking
-- Technical indicators
-- Notifications
-- Dividend tracking
-
-### Version 3 (Future)
 - AI summaries
-- Local LLM integration
 - Sentiment analysis
 - Strategy backtesting
-
-### Version 4 (Future)
-- Stock screening
-- Risk analysis
-- Portfolio optimization
-- Monte Carlo simulations
+- Stock screening and risk analysis
+- Portfolio optimization and Monte Carlo simulations
 
 ## Contributing
 

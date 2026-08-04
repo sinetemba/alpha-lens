@@ -35,6 +35,8 @@ class TwelveDataCollector:
     _daily_count = 0
     _daily_count_date = None
     _quota_exhausted_logged = False
+    _last_rate_limit_message: Optional[str] = None
+    _last_rate_limit_at: Optional[float] = None
 
     def __init__(self):
         self.api_key = settings.twelve_data_api_key
@@ -93,6 +95,15 @@ class TwelveDataCollector:
             return True
 
     @classmethod
+    def last_rate_limit_message(cls) -> Optional[str]:
+        """Short-lived user-facing message for the most recent 429 response."""
+        with cls._lock:
+            if cls._last_rate_limit_message and cls._last_rate_limit_at:
+                if time.monotonic() - cls._last_rate_limit_at < 300:
+                    return cls._last_rate_limit_message
+            return None
+
+    @classmethod
     def _handle_rate_limited(cls, response: requests.Response) -> None:
         """Called on an HTTP 429 despite our own throttling - this means the shared
         key's quota was already consumed elsewhere (a prior process run today, or
@@ -110,8 +121,23 @@ class TwelveDataCollector:
                 match = _MINUTE_LIMIT_RE.search(message)
                 if match:
                     cls._minute_limit = int(match.group(1))
+                cls._last_rate_limit_message = (
+                    f"Twelve Data per-minute limit reached ({cls._minute_limit}/min). "
+                    "Falling back to Yahoo Finance for now."
+                )
+                cls._last_rate_limit_at = time.monotonic()
             elif "day" in message_lower:
                 cls._daily_count = cls._daily_limit
+                cls._last_rate_limit_message = (
+                    "Twelve Data daily limit reached. Using Yahoo Finance until it resets tomorrow."
+                )
+                cls._last_rate_limit_at = time.monotonic()
+            else:
+                cls._last_rate_limit_message = (
+                    f"Twelve Data rate limit hit: {message or 'HTTP 429'}. "
+                    "Showing last fetched data."
+                )
+                cls._last_rate_limit_at = time.monotonic()
 
         logger.warning(f"Twelve Data rate limit hit: {message or 'HTTP 429'}")
 

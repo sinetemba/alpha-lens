@@ -55,6 +55,33 @@ def _migrate_schema():
             print("Migration: added 'last_easyequities_sync' column to portfolios.")
 
 
+def _backfill_stock_names():
+    """Apply known display-name overrides to existing Stock rows.
+
+    External APIs sometimes fail to resolve JSE symbols (e.g. PHP), leaving
+    the database with symbol-only names. This backfills any known overrides
+    so all pages show "SYMBOL - Company Name" consistently.
+    """
+    from app.services.data_service import COMPANY_NAME_OVERRIDES
+
+    db = SessionLocal()
+    try:
+        updated = 0
+        for symbol, name in COMPANY_NAME_OVERRIDES.items():
+            stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+            if stock:
+                stock.name = name
+                updated += 1
+        if updated:
+            db.commit()
+            print(f"Backfilled {updated} stock name(s).")
+    except Exception as e:
+        db.rollback()
+        print(f"Error backfilling stock names: {e}")
+    finally:
+        db.close()
+
+
 def _cleanup_excluded_holdings():
     """Remove previously-synced holdings from excluded EasyEquities accounts (e.g. Demo ZAR)."""
     db = SessionLocal()
@@ -78,6 +105,7 @@ def init_database():
     create_tables()
     _migrate_schema()
     _cleanup_excluded_holdings()
+    _backfill_stock_names()
     
     # Add seed data if needed
     # For example, add default JSE stocks

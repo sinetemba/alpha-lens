@@ -18,9 +18,18 @@ INDICATOR_COLUMNS = [
     "atr", "obv",
 ]
 
+# Local overrides for JSE symbols that external APIs consistently fail to
+# resolve, so the UI shows "SYMBOL - Company Name" like the rest.
+COMPANY_NAME_OVERRIDES = {
+    "PHP": "Primary Health Properties PLC",
+}
+
 
 def get_company_name(symbol: str) -> str:
     """Fetch a company's display name from external data sources, falling back to the symbol."""
+    if symbol in COMPANY_NAME_OVERRIDES:
+        return COMPANY_NAME_OVERRIDES[symbol]
+
     try:
         info = TwelveDataCollector().get_company_info(symbol)
         if info and info.get("name"):
@@ -37,7 +46,7 @@ def get_company_name(symbol: str) -> str:
     except Exception as e:
         logger.error(f"Error fetching company name for {symbol} from Yahoo Finance: {e}")
 
-    return symbol
+    return COMPANY_NAME_OVERRIDES.get(symbol, symbol)
 
 
 class DataService:
@@ -89,7 +98,7 @@ class DataService:
         self.db.commit()
         logger.info(f"Updated prices for {updated_count} symbols")
 
-        self.quota_message = self.twelve_data.quota_exceeded_message()
+        self.quota_message = self.twelve_data.last_rate_limit_message() or self.twelve_data.quota_exceeded_message()
 
         return updated_count
     
