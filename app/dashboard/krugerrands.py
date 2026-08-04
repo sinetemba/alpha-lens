@@ -252,6 +252,7 @@ def _get_historical_year_end_prices(gold_api: GoldAPICollector) -> list[dict]:
 
     current_year = datetime.now(timezone.utc).year
     rows = []
+    prev_price: float | None = None
     for year in range(current_year - 10, current_year):
         date = f"{year}1231"
         data = gold_api.get_historical_price("XAU", "ZAR", date)
@@ -266,7 +267,14 @@ def _get_historical_year_end_prices(gold_api: GoldAPICollector) -> list[dict]:
         for size, grams in KRUGERRAND_SIZES.items():
             pure_oz = grams / 33.930  # exact fraction of a full Krugerrand
             row[size] = f"R {price * pure_oz:,.2f}"
+
+        if prev_price is not None:
+            growth = ((price - prev_price) / prev_price) * 100
+            row["YoY Growth (1 oz)"] = f"{growth:+.2f}%"
+        else:
+            row["YoY Growth (1 oz)"] = "-"
         rows.append(row)
+        prev_price = price
     return rows
 
 
