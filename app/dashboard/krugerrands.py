@@ -71,6 +71,9 @@ def show_krugerrands(db: Session):
     with col_right:
         _render_krugerrand_chart(db)
 
+    st.markdown("---")
+    _render_historical_grid()
+
 
 def _ensure_gold_symbols(db: Session) -> None:
     """Ensure gold and USD/ZAR Yahoo Finance symbols exist as Stock records."""
@@ -240,6 +243,51 @@ def _render_krugerrand_calculator(gram_22k: float):
 
     st.metric(f"Value per {coin_size} Krugerrand", f"R {per_coin:,.2f}")
     st.metric(f"Total Value ({quantity} × {coin_size})", f"R {total:,.2f}")
+
+
+def _get_historical_year_end_prices(gold_api: GoldAPICollector) -> list[dict]:
+    """Fetch year-end XAU/ZAR prices for the last 10 years."""
+    if not gold_api.enabled:
+        return []
+
+    current_year = datetime.now(timezone.utc).year
+    rows = []
+    for year in range(current_year - 10, current_year):
+        date = f"{year}1231"
+        data = gold_api.get_historical_price("XAU", "ZAR", date)
+        if not data or "price" not in data:
+            continue
+
+        price = float(data["price"])
+        # GoldAPI returns price per troy ounce of fine gold. Krugerrand sizes are
+        # denominated in troy ounces of pure gold (1, 0.5, 0.25, 0.1), so the
+        # size value is a simple fraction of the 1 oz price.
+        row = {"Year": year}
+        for size, grams in KRUGERRAND_SIZES.items():
+            pure_oz = grams / 33.930  # exact fraction of a full Krugerrand
+            row[size] = f"R {price * pure_oz:,.2f}"
+        rows.append(row)
+    return rows
+
+
+@st.cache_data(ttl=2592000)
+def _get_cached_historical_grid() -> list[dict]:
+    """Cache the 10-year year-end grid for 30 days to stay within the free tier."""
+    return _get_historical_year_end_prices(GoldAPICollector())
+
+
+def _render_historical_grid():
+    """Render a 10-year grid of Krugerrand year-end values."""
+    st.subheader("Historical Year-End Krugerrand Values (ZAR)")
+
+    with st.spinner("Loading 10-year historical values..."):
+        rows = _get_cached_historical_grid()
+
+    if not rows:
+        st.info("No historical data available. Add a GoldAPI key to enable.")
+        return
+
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 def _render_krugerrand_chart(db: Session):

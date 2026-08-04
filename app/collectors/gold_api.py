@@ -11,6 +11,22 @@ class GoldAPICollector:
         self.base_url = settings.gold_api_base_url.rstrip("/")
         self.enabled = bool(self.api_key)
 
+    def get_historical_price(self, metal: str, currency: str, date: str) -> dict | None:
+        """Fetch the spot price for a specific date (YYYYMMDD) from GoldAPI."""
+        if not self.enabled:
+            return None
+
+        url = f"{self.base_url}/api/{metal}/{currency}/{date}"
+        headers = {"x-access-token": self.api_key}
+
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"GoldAPI historical request failed for {metal}/{currency}/{date}: {e}")
+            return None
+
     def get_live_price(self, metal: str = "XAU", currency: str = "ZAR") -> dict | None:
         """Fetch the latest spot price for a metal/currency pair.
 
