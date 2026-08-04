@@ -223,7 +223,7 @@ def show_portfolio(db: Session):
 
     # Render a table for each account type
     for account_type, group_holdings in account_groups.items():
-        _render_holdings_table(account_type, group_holdings)
+        _render_holdings_table(db, account_type, group_holdings)
     
     st.markdown("---")
     _render_easyequities_debug(collector, portfolio, holdings)
@@ -259,7 +259,31 @@ def show_portfolio(db: Session):
                 st.rerun()
 
 
-def _render_holdings_table(account_type: str, holdings: list) -> None:
+def _get_group_latest_and_previous_prices(
+    db: Session, symbols: list[str]
+) -> dict[str, tuple[StockPrice | None, StockPrice | None]]:
+    """Batch-fetch each symbol's latest price and its most recent prior-day price."""
+    if not symbols:
+        return {}
+
+    rows = db.query(StockPrice).filter(
+        StockPrice.symbol.in_(symbols)
+    ).order_by(StockPrice.timestamp.desc()).all()
+
+    by_symbol: dict[str, list[StockPrice]] = {}
+    for row in rows:
+        by_symbol.setdefault(row.symbol, []).append(row)
+
+    result: dict[str, tuple[StockPrice | None, StockPrice | None]] = {}
+    for symbol, prices in by_symbol.items():
+        latest = prices[0]
+        latest_day_start = latest.timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+        prev = next((p for p in prices if p.timestamp < latest_day_start), None)
+        result[symbol] = (latest, prev)
+    return result
+
+
+def _render_holdings_table(db: Session, account_type: str, holdings: list) -> None:
     """Render a single holdings table section for the given account type."""
     st.subheader(f"{account_type} Holdings")
 
@@ -339,6 +363,24 @@ def _render_holdings_table(account_type: str, holdings: list) -> None:
         )
     else:
         st.info("Select at least one column to display the holdings table.")
+
+    # Today's movement for this account group
+    symbols = [h.symbol for h in holdings if h.symbol]
+    prices = _get_group_latest_and_previous_prices(db, symbols)
+    today_gain = 0.0
+    yesterday_value = 0.0
+    for h in holdings:
+        latest, prev = prices.get(h.symbol, (None, None))
+        if latest and prev and prev.close_price is not None and h.quantity:
+            today_gain += (latest.close_price - prev.close_price) * h.quantity
+            yesterday_value += prev.close_price * h.quantity
+
+    today_pct = (today_gain / yesterday_value * 100) if yesterday_value else 0.0
+    st.markdown(
+        f"<small><strong>Today's Gain/Loss = R {today_gain:,.2f} | "
+        f"Today's Gain/Loss % = {today_pct:+.2f}%</strong></small>",
+        unsafe_allow_html=True,
+    )
 
     st.markdown("---")
 
