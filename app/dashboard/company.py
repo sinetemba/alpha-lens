@@ -3,11 +3,23 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from app.models.base import SessionLocal
 from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
 from app.dashboard.utils import format_stock_label
 from datetime import datetime, timedelta, timezone
 from loguru import logger
+
+
+@st.cache_data(ttl=300)
+def _get_active_stocks():
+    """Cached list of active stocks for the selectbox (refresh every 5 minutes)."""
+    db = SessionLocal()
+    try:
+        stocks = db.query(Stock).filter(Stock.is_active == True).all()
+        return [(stock.symbol, stock.name) for stock in stocks]
+    finally:
+        db.close()
 
 
 def show_company(db: Session):
@@ -16,9 +28,9 @@ def show_company(db: Session):
     st.markdown("View detailed information about a specific company.")
     
     # Symbol selection
-    all_stocks = db.query(Stock).filter(Stock.is_active == True).all()
-    stock_symbols = [stock.symbol for stock in all_stocks]
-    stock_names = {stock.symbol: stock.name for stock in all_stocks}
+    all_stocks = _get_active_stocks()
+    stock_symbols = [s[0] for s in all_stocks]
+    stock_names = {s[0]: s[1] for s in all_stocks}
 
     if not stock_symbols:
         st.warning("No stocks available in database.")

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from app.models.notification import Notification
 from app.models.stock import StockPrice
 from app.models.watchlist import WatchlistItem
+from app.dashboard.home import _get_latest_and_previous_prices
 from app.config.settings import settings
 from loguru import logger
 import json
@@ -127,16 +128,19 @@ class NotificationService:
         watchlist_items = self.db.query(WatchlistItem).filter(
             WatchlistItem.is_active == True
         ).all()
-        
+
+        if not watchlist_items:
+            return
+
+        symbols = [item.symbol for item in watchlist_items]
+        prices = _get_latest_and_previous_prices(self.db, symbols)
+
         for item in watchlist_items:
-            latest_price = self.db.query(StockPrice).filter(
-                StockPrice.symbol == item.symbol
-            ).order_by(StockPrice.timestamp.desc()).first()
-            
-            if not latest_price:
+            latest, prev = prices.get(item.symbol, (None, None))
+            if not latest:
                 continue
             
-            current_price = latest_price.close_price
+            current_price = latest.close_price
             
             # Check target price
             if item.target_price and current_price >= item.target_price:
@@ -159,32 +163,26 @@ class NotificationService:
                 )
             
             # Check price change threshold
-            if item.notify_price_increase or item.notify_price_decrease:
-                prev_price = self.db.query(StockPrice).filter(
-                    StockPrice.symbol == item.symbol,
-                    StockPrice.timestamp < latest_price.timestamp
-                ).order_by(StockPrice.timestamp.desc()).first()
+            if (item.notify_price_increase or item.notify_price_decrease) and prev and prev.close_price:
+                change_pct = ((current_price - prev.close_price) / prev.close_price) * 100
                 
-                if prev_price:
-                    change_pct = ((current_price - prev_price.close_price) / prev_price.close_price) * 100
-                    
-                    if item.notify_price_increase and change_pct >= item.price_change_threshold:
-                        self.create_notification(
-                            notification_type="price",
-                            title=f"Price Increase Alert: {item.symbol}",
-                            message=f"{item.symbol} has increased by {change_pct:.2f}%. Previous: R {prev_price.close_price:.2f}, Current: R {current_price:.2f}",
-                            stock_symbol=item.symbol,
-                            metadata={"change_percentage": change_pct}
-                        )
-                    
-                    if item.notify_price_decrease and change_pct <= -item.price_change_threshold:
-                        self.create_notification(
-                            notification_type="price",
-                            title=f"Price Decrease Alert: {item.symbol}",
-                            message=f"{item.symbol} has decreased by {abs(change_pct):.2f}%. Previous: R {prev_price.close_price:.2f}, Current: R {current_price:.2f}",
-                            stock_symbol=item.symbol,
-                            metadata={"change_percentage": change_pct}
-                        )
+                if item.notify_price_increase and change_pct >= item.price_change_threshold:
+                    self.create_notification(
+                        notification_type="price",
+                        title=f"Price Increase Alert: {item.symbol}",
+                        message=f"{item.symbol} has increased by {change_pct:.2f}%. Previous: R {prev.close_price:.2f}, Current: R {current_price:.2f}",
+                        stock_symbol=item.symbol,
+                        metadata={"change_percentage": change_pct}
+                    )
+                
+                if item.notify_price_decrease and change_pct <= -item.price_change_threshold:
+                    self.create_notification(
+                        notification_type="price",
+                        title=f"Price Decrease Alert: {item.symbol}",
+                        message=f"{item.symbol} has decreased by {abs(change_pct):.2f}%. Previous: R {prev.close_price:.2f}, Current: R {current_price:.2f}",
+                        stock_symbol=item.symbol,
+                        metadata={"change_percentage": change_pct}
+                    )
     
     def check_technical_alerts(self):
         """Check for technical indicator alerts."""
@@ -194,60 +192,57 @@ class NotificationService:
         watchlist_items = self.db.query(WatchlistItem).filter(
             WatchlistItem.is_active == True
         ).all()
-        
+
+        if not watchlist_items:
+            return
+
+        symbols = [item.symbol for item in watchlist_items]
+        prices = _get_latest_and_previous_prices(self.db, symbols)
+
         for item in watchlist_items:
-            latest_price = self.db.query(StockPrice).filter(
-                StockPrice.symbol == item.symbol
-            ).order_by(StockPrice.timestamp.desc()).first()
-            
-            if not latest_price:
+            latest, prev = prices.get(item.symbol, (None, None))
+            if not latest:
                 continue
             
             # RSI overbought/oversold
-            if latest_price.rsi:
-                if latest_price.rsi > 70:
+            if latest.rsi:
+                if latest.rsi > 70:
                     self.create_notification(
                         notification_type="technical",
                         title=f"RSI Overbought: {item.symbol}",
-                        message=f"{item.symbol} RSI is {latest_price.rsi:.2f}, indicating overbought conditions.",
+                        message=f"{item.symbol} RSI is {latest.rsi:.2f}, indicating overbought conditions.",
                         stock_symbol=item.symbol,
-                        metadata={"indicator": "RSI", "value": latest_price.rsi}
+                        metadata={"indicator": "RSI", "value": latest.rsi}
                     )
-                elif latest_price.rsi < 30:
+                elif latest.rsi < 30:
                     self.create_notification(
                         notification_type="technical",
                         title=f"RSI Oversold: {item.symbol}",
-                        message=f"{item.symbol} RSI is {latest_price.rsi:.2f}, indicating oversold conditions.",
+                        message=f"{item.symbol} RSI is {latest.rsi:.2f}, indicating oversold conditions.",
                         stock_symbol=item.symbol,
-                        metadata={"indicator": "RSI", "value": latest_price.rsi}
+                        metadata={"indicator": "RSI", "value": latest.rsi}
                     )
             
             # MACD crossover
-            if latest_price.macd and latest_price.macd_signal:
-                prev_price = self.db.query(StockPrice).filter(
-                    StockPrice.symbol == item.symbol,
-                    StockPrice.timestamp < latest_price.timestamp
-                ).order_by(StockPrice.timestamp.desc()).first()
-                
-                if prev_price and prev_price.macd and prev_price.macd_signal:
-                    # Bullish crossover
-                    if prev_price.macd <= prev_price.macd_signal and latest_price.macd > latest_price.macd_signal:
-                        self.create_notification(
-                            notification_type="technical",
-                            title=f"MACD Bullish Crossover: {item.symbol}",
-                            message=f"{item.symbol} MACD has crossed above the signal line, potential bullish signal.",
-                            stock_symbol=item.symbol,
-                            metadata={"indicator": "MACD", "signal": "bullish_crossover"}
-                        )
-                    # Bearish crossover
-                    elif prev_price.macd >= prev_price.macd_signal and latest_price.macd < latest_price.macd_signal:
-                        self.create_notification(
-                            notification_type="technical",
-                            title=f"MACD Bearish Crossover: {item.symbol}",
-                            message=f"{item.symbol} MACD has crossed below the signal line, potential bearish signal.",
-                            stock_symbol=item.symbol,
-                            metadata={"indicator": "MACD", "signal": "bearish_crossover"}
-                        )
+            if latest.macd and latest.macd_signal and prev and prev.macd and prev.macd_signal:
+                # Bullish crossover
+                if prev.macd <= prev.macd_signal and latest.macd > latest.macd_signal:
+                    self.create_notification(
+                        notification_type="technical",
+                        title=f"MACD Bullish Crossover: {item.symbol}",
+                        message=f"{item.symbol} MACD has crossed above the signal line, potential bullish signal.",
+                        stock_symbol=item.symbol,
+                        metadata={"indicator": "MACD", "signal": "bullish_crossover"}
+                    )
+                # Bearish crossover
+                elif prev.macd >= prev.macd_signal and latest.macd < latest.macd_signal:
+                    self.create_notification(
+                        notification_type="technical",
+                        title=f"MACD Bearish Crossover: {item.symbol}",
+                        message=f"{item.symbol} MACD has crossed below the signal line, potential bearish signal.",
+                        stock_symbol=item.symbol,
+                        metadata={"indicator": "MACD", "signal": "bearish_crossover"}
+                    )
     
     def send_pending_notifications(self):
         """Send all pending notifications."""

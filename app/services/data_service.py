@@ -190,6 +190,54 @@ class DataService:
         except Exception as e:
             logger.error(f"Error saving price from history: {e}")
     
+    def _ensure_stock(self, symbol: str) -> Stock:
+        """Get or create a Stock row for a symbol, returning the (possibly new) instance."""
+        stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
+        if not stock:
+            stock = Stock(symbol=symbol, name=get_company_name(symbol))
+            self.db.add(stock)
+            self.db.flush()
+        return stock
+
+    def _bulk_save_stock_prices(self, symbol: str, records: List[Dict]) -> int:
+        """Batch-save historical prices. Existing timestamps for the symbol are skipped."""
+        if not records:
+            return 0
+
+        stock = self._ensure_stock(symbol)
+
+        # One query to fetch all existing timestamps for this symbol.
+        existing = {
+            t[0] for t in
+            self.db.query(StockPrice.timestamp).filter(StockPrice.symbol == symbol).all()
+        }
+
+        new_prices = []
+        for record in records:
+            timestamp = record.get("timestamp")
+            if not timestamp or timestamp in existing:
+                continue
+
+            close = float(record.get("close", 0) or 0)
+            price = StockPrice(
+                stock_id=stock.id,
+                symbol=symbol,
+                timestamp=timestamp,
+                open_price=float(record.get("open", 0) or 0),
+                high_price=float(record.get("high", 0) or 0),
+                low_price=float(record.get("low", 0) or 0),
+                close_price=close,
+                adjusted_close=float(record.get("adjusted_close") or close),
+                volume=int(record.get("volume", 0) or 0),
+            )
+            new_prices.append(price)
+
+        if new_prices:
+            self.db.add_all(new_prices)
+            self.db.commit()
+
+        return len(new_prices)
+
     def _update_technical_indicators(self, symbol: str, full: bool = False) -> None:
         """Recalculate and persist technical indicators for a symbol's price history.
 
@@ -375,40 +423,22 @@ class DataService:
         )
         
         if hist is not None and not hist.empty:
-            saved = 0
+            records = []
             for index, row in hist.iterrows():
                 timestamp = index.to_pydatetime()
                 if timestamp.tzinfo is None:
                     timestamp = timestamp.replace(tzinfo=timezone.utc)
-                
-                existing = self.db.query(StockPrice).filter(
-                    StockPrice.symbol == symbol,
-                    StockPrice.timestamp == timestamp
-                ).first()
-                
-                if not existing:
-                    stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
-                    if not stock:
-                        stock = Stock(symbol=symbol, name=get_company_name(symbol))
-                        self.db.add(stock)
-                        self.db.flush()
+                records.append({
+                    "timestamp": timestamp,
+                    "open": row.get("Open", 0),
+                    "high": row.get("High", 0),
+                    "low": row.get("Low", 0),
+                    "close": row.get("Close", 0),
+                    "adjusted_close": row.get("Adj Close", 0),
+                    "volume": row.get("Volume", 0),
+                })
 
-                    price = StockPrice(
-                        stock_id=stock.id,
-                        symbol=symbol,
-                        timestamp=timestamp,
-                        open_price=float(row.get("Open", 0)),
-                        high_price=float(row.get("High", 0)),
-                        low_price=float(row.get("Low", 0)),
-                        close_price=float(row.get("Close", 0)),
-                        adjusted_close=float(row.get("Adj Close", 0)),
-                        volume=int(row.get("Volume", 0)),
-                    )
-                    
-                    self.db.add(price)
-                    saved += 1
-            
-            self.db.commit()
+            saved = self._bulk_save_stock_prices(symbol, records)
             logger.info(f"Saved {saved} historical data points for {symbol} from Yahoo Finance")
             self._update_technical_indicators(symbol, full=True)
             return saved
@@ -417,9 +447,8 @@ class DataService:
         return 0
     
     def _save_historical_data(self, symbol: str, data: List[Dict]) -> int:
-        """Save historical data points."""
-        saved = 0
-        
+        """Save historical data points from Twelve Data in bulk."""
+        records = []
         for point in data:
             try:
                 timestamp_str = point.get("datetime")
@@ -429,39 +458,15 @@ class DataService:
                 # component, while intraday intervals include "HH:MM:SS".
                 date_format = "%Y-%m-%d" if len(timestamp_str) == 10 else "%Y-%m-%d %H:%M:%S"
                 timestamp = datetime.strptime(timestamp_str, date_format).replace(tzinfo=timezone.utc)
-                
-                # Check if already exists
-                existing = self.db.query(StockPrice).filter(
-                    StockPrice.symbol == symbol,
-                    StockPrice.timestamp == timestamp
-                ).first()
-                
-                if existing:
-                    continue
-                
-                # Get or create stock
-                stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
-                if not stock:
-                    stock = Stock(symbol=symbol, name=get_company_name(symbol))
-                    self.db.add(stock)
-                    self.db.flush()
-                
-                price = StockPrice(
-                    stock_id=stock.id,
-                    symbol=symbol,
-                    timestamp=timestamp,
-                    open_price=float(point.get("open", 0)),
-                    high_price=float(point.get("high", 0)),
-                    low_price=float(point.get("low", 0)),
-                    close_price=float(point.get("close", 0)),
-                    volume=int(point.get("volume", 0)),
-                )
-                
-                self.db.add(price)
-                saved += 1
-            
+                records.append({
+                    "timestamp": timestamp,
+                    "open": point.get("open", 0),
+                    "high": point.get("high", 0),
+                    "low": point.get("low", 0),
+                    "close": point.get("close", 0),
+                    "volume": point.get("volume", 0),
+                })
             except Exception as e:
-                logger.error(f"Error saving historical data point: {e}")
-        
-        self.db.commit()
-        return saved
+                logger.error(f"Error parsing historical data point: {e}")
+
+        return self._bulk_save_stock_prices(symbol, records)

@@ -1,6 +1,6 @@
 import pandas as pd
 import streamlit as st
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
 from app.dashboard.utils import format_stock_label, render_market_data_refresh_control, style_gain_loss_row
@@ -42,8 +42,10 @@ def show_watchlist(db: Session):
     
     st.markdown("---")
     
-    # Display watchlist
-    watchlist_items = db.query(WatchlistItem).filter(
+    # Display watchlist (eager-load stock to avoid N+1 name lookups)
+    watchlist_items = db.query(WatchlistItem).options(
+        joinedload(WatchlistItem.stock)
+    ).filter(
         WatchlistItem.is_active == True
     ).all()
     
