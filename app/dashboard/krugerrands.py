@@ -279,8 +279,12 @@ def _get_historical_year_end_prices(gold_api: GoldAPICollector) -> list[dict]:
 
 
 @st.cache_data(ttl=2592000)
-def _get_cached_historical_grid() -> list[dict]:
-    """Cache the 10-year year-end grid for 30 days to stay within the free tier."""
+def _get_cached_historical_grid(version: int = 2) -> list[dict]:
+    """Cache the 10-year year-end grid for 30 days to stay within the free tier.
+
+    The ``version`` argument is a cache-buster: bump it when the grid schema
+    changes so existing cached results are ignored.
+    """
     return _get_historical_year_end_prices(GoldAPICollector())
 
 
@@ -289,7 +293,7 @@ def _render_historical_grid():
     st.subheader("Historical Year-End Krugerrand Values (ZAR)")
 
     with st.spinner("Loading 10-year historical values..."):
-        rows = _get_cached_historical_grid()
+        rows = _get_cached_historical_grid(version=2)
 
     if not rows:
         st.info("No historical data available. Add a GoldAPI key to enable.")
