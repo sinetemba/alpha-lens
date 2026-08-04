@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     fmp_api_key: str = Field(default="", alias="FMP_API_KEY")
     fmp_base_url: str = Field(default="https://financialmodelingprep.com/api/v3", alias="FMP_BASE_URL")
 
+    # GoldAPI.io
+    gold_api_key: str = Field(default="", alias="GOLD_API_KEY")
+    gold_api_base_url: str = Field(default="https://www.goldapi.io", alias="GOLD_API_BASE_URL")
+
     # CommodityPriceAPI
     commodity_price_api_key: str = Field(default="", alias="COMMODITY_PRICE_API_KEY")
     commodity_price_api_base_url: str = Field(default="https://api.commoditypriceapi.com/v2", alias="COMMODITY_PRICE_API_BASE_URL")

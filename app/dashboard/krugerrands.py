@@ -3,21 +3,18 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
 from app.models.stock import Stock, StockPrice
 from app.services.data_service import DataService
-from app.collectors.commodity_price_api import CommodityPriceAPICollector
+from app.collectors.gold_api import GoldAPICollector
 from app.dashboard.utils import get_latest_market_data_timestamp, is_market_data_stale
 from loguru import logger
 
 
-# CommodityPriceAPI symbol for gold spot.
-GOLD_API_SYMBOL = "XAU"
+# GoldAPI live symbols.
+GOLD_USD_LIVE_SYMBOL = "XAU_USD"
+GOLD_LIVE_SYMBOL = "XAU_ZAR"
 # Yahoo Finance symbol used for historical gold chart data.
 GOLD_YF_SYMBOL = "GC=F"
 # USD/ZAR exchange rate symbol via Yahoo Finance.
 USDZAR_SYMBOL = "ZAR=X"
-# Symbol used to persist CommodityPriceAPI's live gold spot snapshot, kept
-# separate from GOLD_YF_SYMBOL (Yahoo Finance historical chart data) since
-# they come from different sources/units.
-GOLD_LIVE_SYMBOL = "XAU_SPOT"
 
 
 def show_krugerrands(db: Session):
@@ -27,23 +24,23 @@ def show_krugerrands(db: Session):
 
     _ensure_gold_symbols(db)
 
-    api_collector = CommodityPriceAPICollector()
-    if not api_collector.enabled:
+    gold_api = GoldAPICollector()
+    if not gold_api.enabled:
         st.warning(
-            "CommodityPriceAPI key is not configured. Set COMMODITY_PRICE_API_KEY in .env "
+            "GoldAPI key is not configured. Set GOLD_API_KEY in .env "
             "to enable live gold prices."
         )
 
     if st.button("🔄 Refresh Gold & FX Prices"):
         with st.spinner("Fetching gold and USD/ZAR data..."):
-            _refresh_gold_prices(db, api_collector)
+            _refresh_gold_prices(db, gold_api)
         st.success("Prices refreshed.")
         st.rerun()
 
     col1, col2, col3 = st.columns(3)
 
-    gold_usd = _get_or_refresh_gold_price(db, api_collector)
-    usd_zar, _ = _get_latest_price(db, USDZAR_SYMBOL)
+    gold_usd, gold_zar = _get_or_refresh_gold_prices(db, gold_api)
+    usd_zar = (gold_zar / gold_usd) if gold_usd and gold_usd > 0 else 0.0
 
     with col1:
         st.metric("Gold Spot (USD/oz)", f"$ {gold_usd:,.2f}" if gold_usd else "N/A")
@@ -54,7 +51,7 @@ def show_krugerrands(db: Session):
     with col3:
         st.metric(
             "Gold Spot (ZAR/oz)",
-            f"R {gold_usd * usd_zar:,.2f}" if gold_usd and usd_zar else "N/A"
+            f"R {gold_zar:,.2f}" if gold_zar else "N/A"
         )
 
     st.markdown("---")
@@ -73,7 +70,8 @@ def _ensure_gold_symbols(db: Session) -> None:
     symbols = {
         GOLD_YF_SYMBOL: "Gold Futures",
         USDZAR_SYMBOL: "USD/ZAR",
-        GOLD_LIVE_SYMBOL: "Gold Spot (Live)",
+        GOLD_USD_LIVE_SYMBOL: "Gold Spot USD (Live)",
+        GOLD_LIVE_SYMBOL: "Gold Spot ZAR (Live)",
     }
     for symbol, name in symbols.items():
         stock = db.query(Stock).filter(Stock.symbol == symbol).first()
@@ -83,73 +81,73 @@ def _ensure_gold_symbols(db: Session) -> None:
     db.commit()
 
 
-def _get_api_gold_price(api_collector: CommodityPriceAPICollector) -> float:
-    """Return the latest gold spot price in USD from CommodityPriceAPI."""
-    if not api_collector.enabled:
-        return 0.0
+def _get_api_gold_prices(gold_api: GoldAPICollector) -> tuple[float, float]:
+    """Return the latest gold spot prices in USD and ZAR from GoldAPI."""
+    if not gold_api.enabled:
+        return 0.0, 0.0
 
-    rates = api_collector.get_latest_rates([GOLD_API_SYMBOL])
-    if rates and GOLD_API_SYMBOL in rates:
-        return float(rates[GOLD_API_SYMBOL])
+    usd_data = gold_api.get_live_price(metal="XAU", currency="USD")
+    zar_data = gold_api.get_live_price(metal="XAU", currency="ZAR")
 
-    logger.warning("Failed to fetch gold price from CommodityPriceAPI")
-    return 0.0
+    gold_usd = float(usd_data["price"]) if usd_data and "price" in usd_data else 0.0
+    gold_zar = float(zar_data["price"]) if zar_data and "price" in zar_data else 0.0
+
+    if not gold_usd or not gold_zar:
+        logger.warning("Failed to fetch gold prices from GoldAPI")
+
+    return gold_usd, gold_zar
 
 
-def _save_gold_spot_price(db: Session, price: float) -> None:
-    """Persist today's live gold spot snapshot so it can be reused without refetching."""
-    stock = db.query(Stock).filter(Stock.symbol == GOLD_LIVE_SYMBOL).first()
-    if not stock:
-        stock = Stock(symbol=GOLD_LIVE_SYMBOL, name="Gold Spot (Live)")
-        db.add(stock)
-        db.flush()
-
+def _save_gold_prices(db: Session, gold_usd: float, gold_zar: float) -> None:
+    """Persist today's live gold spot snapshots so they can be reused without refetching."""
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    existing_today = db.query(StockPrice).filter(
-        StockPrice.symbol == GOLD_LIVE_SYMBOL,
-        StockPrice.timestamp >= today_start,
-    ).order_by(StockPrice.timestamp.desc()).first()
-    if existing_today:
-        existing_today.close_price = price
-        existing_today.timestamp = now
-    else:
-        db.add(StockPrice(stock_id=stock.id, symbol=GOLD_LIVE_SYMBOL, timestamp=now, close_price=price))
+
+    for symbol, price in ((GOLD_USD_LIVE_SYMBOL, gold_usd), (GOLD_LIVE_SYMBOL, gold_zar)):
+        stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+        if not stock:
+            stock = Stock(symbol=symbol, name=f"Gold Spot {symbol.split('_')[-1]} (Live)")
+            db.add(stock)
+            db.flush()
+
+        existing_today = db.query(StockPrice).filter(
+            StockPrice.symbol == symbol,
+            StockPrice.timestamp >= today_start,
+        ).order_by(StockPrice.timestamp.desc()).first()
+        if existing_today:
+            existing_today.close_price = price
+            existing_today.timestamp = now
+        else:
+            db.add(StockPrice(stock_id=stock.id, symbol=symbol, timestamp=now, close_price=price))
     db.commit()
 
 
-def _get_or_refresh_gold_price(
-    db: Session, api_collector: CommodityPriceAPICollector, force: bool = False
-) -> float:
-    """Return the gold spot price, hitting CommodityPriceAPI only when stale/forced.
-
-    Without this gate, every page navigation/rerun hit CommodityPriceAPI live,
-    even when nothing needed refreshing.
-    """
-    if not api_collector.enabled:
-        return 0.0
+def _get_or_refresh_gold_prices(
+    db: Session, gold_api: GoldAPICollector, force: bool = False
+) -> tuple[float, float]:
+    """Return live gold prices in USD and ZAR, hitting GoldAPI only when stale/forced."""
+    if not gold_api.enabled:
+        return _get_latest_price(db, GOLD_USD_LIVE_SYMBOL)[0], _get_latest_price(db, GOLD_LIVE_SYMBOL)[0]
 
     latest_timestamp = get_latest_market_data_timestamp(db, [GOLD_LIVE_SYMBOL])
     if not force and not is_market_data_stale(latest_timestamp):
-        cached_price, _ = _get_latest_price(db, GOLD_LIVE_SYMBOL)
-        return cached_price
+        return _get_latest_price(db, GOLD_USD_LIVE_SYMBOL)[0], _get_latest_price(db, GOLD_LIVE_SYMBOL)[0]
 
-    price = _get_api_gold_price(api_collector)
-    if price:
-        _save_gold_spot_price(db, price)
-        return price
+    gold_usd, gold_zar = _get_api_gold_prices(gold_api)
+    if gold_usd and gold_zar:
+        _save_gold_prices(db, gold_usd, gold_zar)
+        return gold_usd, gold_zar
 
-    cached_price, _ = _get_latest_price(db, GOLD_LIVE_SYMBOL)
-    return cached_price
+    return _get_latest_price(db, GOLD_USD_LIVE_SYMBOL)[0], _get_latest_price(db, GOLD_LIVE_SYMBOL)[0]
 
 
-def _refresh_gold_prices(db: Session, api_collector: CommodityPriceAPICollector) -> None:
-    """Fetch gold spot from CommodityPriceAPI and historical data from Yahoo Finance."""
-    if api_collector.enabled:
+def _refresh_gold_prices(db: Session, gold_api: GoldAPICollector) -> None:
+    """Fetch gold spot from GoldAPI and historical data from Yahoo Finance."""
+    if gold_api.enabled:
         try:
-            _get_or_refresh_gold_price(db, api_collector, force=True)
+            _get_or_refresh_gold_prices(db, gold_api, force=True)
         except Exception as e:
-            logger.error(f"Failed to refresh gold price from CommodityPriceAPI: {e}")
+            logger.error(f"Failed to refresh gold prices from GoldAPI: {e}")
 
     data_service = DataService(db)
     for symbol in (GOLD_YF_SYMBOL, USDZAR_SYMBOL):
