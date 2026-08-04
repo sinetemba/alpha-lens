@@ -15,6 +15,13 @@ GOLD_LIVE_SYMBOL = "XAU_ZAR"
 GOLD_YF_SYMBOL = "GC=F"
 # USD/ZAR exchange rate symbol via Yahoo Finance.
 USDZAR_SYMBOL = "ZAR=X"
+# Krugerrand coin sizes (label -> total grams of 22k coin).
+KRUGERRAND_SIZES = {
+    "1 oz": 33.930,
+    "1/2 oz": 16.965,
+    "1/4 oz": 8.482,
+    "1/10 oz": 3.393,
+}
 
 
 def show_krugerrands(db: Session):
@@ -39,7 +46,7 @@ def show_krugerrands(db: Session):
 
     col1, col2, col3 = st.columns(3)
 
-    gold_usd, gold_zar = _get_or_refresh_gold_prices(db, gold_api)
+    gold_usd, gold_zar, gram_22k = _get_or_refresh_gold_prices(db, gold_api)
     usd_zar = (gold_zar / gold_usd) if gold_usd and gold_usd > 0 else 0.0
 
     with col1:
@@ -59,7 +66,7 @@ def show_krugerrands(db: Session):
     col_left, col_right = st.columns([1, 2])
 
     with col_left:
-        _render_krugerrand_calculator(gold_usd, usd_zar)
+        _render_krugerrand_calculator(gram_22k)
 
     with col_right:
         _render_krugerrand_chart(db)
@@ -81,21 +88,22 @@ def _ensure_gold_symbols(db: Session) -> None:
     db.commit()
 
 
-def _get_api_gold_prices(gold_api: GoldAPICollector) -> tuple[float, float]:
-    """Return the latest gold spot prices in USD and ZAR from GoldAPI."""
+def _get_api_gold_prices(gold_api: GoldAPICollector) -> tuple[float, float, float]:
+    """Return the latest gold spot prices (USD, ZAR) and ZAR per gram of 22k from GoldAPI."""
     if not gold_api.enabled:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     usd_data = gold_api.get_live_price(metal="XAU", currency="USD")
     zar_data = gold_api.get_live_price(metal="XAU", currency="ZAR")
 
     gold_usd = float(usd_data["price"]) if usd_data and "price" in usd_data else 0.0
     gold_zar = float(zar_data["price"]) if zar_data and "price" in zar_data else 0.0
+    gram_22k = float(zar_data["price_gram_22k"]) if zar_data and "price_gram_22k" in zar_data else 0.0
 
     if not gold_usd or not gold_zar:
         logger.warning("Failed to fetch gold prices from GoldAPI")
 
-    return gold_usd, gold_zar
+    return gold_usd, gold_zar, gram_22k
 
 
 def _save_gold_prices(db: Session, gold_usd: float, gold_zar: float) -> None:
@@ -124,21 +132,30 @@ def _save_gold_prices(db: Session, gold_usd: float, gold_zar: float) -> None:
 
 def _get_or_refresh_gold_prices(
     db: Session, gold_api: GoldAPICollector, force: bool = False
-) -> tuple[float, float]:
-    """Return live gold prices in USD and ZAR, hitting GoldAPI only when stale/forced."""
+) -> tuple[float, float, float]:
+    """Return live gold prices in USD and ZAR plus 22k per-gram ZAR, hitting GoldAPI only when stale/forced."""
     if not gold_api.enabled:
-        return _get_latest_price(db, GOLD_USD_LIVE_SYMBOL)[0], _get_latest_price(db, GOLD_LIVE_SYMBOL)[0]
+        gold_usd = _get_latest_price(db, GOLD_USD_LIVE_SYMBOL)[0]
+        gold_zar = _get_latest_price(db, GOLD_LIVE_SYMBOL)[0]
+        gram_22k = gold_zar / 33.93 if gold_zar else 0.0
+        return gold_usd, gold_zar, gram_22k
 
     latest_timestamp = get_latest_market_data_timestamp(db, [GOLD_LIVE_SYMBOL])
     if not force and not is_market_data_stale(latest_timestamp):
-        return _get_latest_price(db, GOLD_USD_LIVE_SYMBOL)[0], _get_latest_price(db, GOLD_LIVE_SYMBOL)[0]
+        gold_usd = _get_latest_price(db, GOLD_USD_LIVE_SYMBOL)[0]
+        gold_zar = _get_latest_price(db, GOLD_LIVE_SYMBOL)[0]
+        gram_22k = gold_zar / 33.93 if gold_zar else 0.0
+        return gold_usd, gold_zar, gram_22k
 
-    gold_usd, gold_zar = _get_api_gold_prices(gold_api)
+    gold_usd, gold_zar, gram_22k = _get_api_gold_prices(gold_api)
     if gold_usd and gold_zar:
         _save_gold_prices(db, gold_usd, gold_zar)
-        return gold_usd, gold_zar
+        return gold_usd, gold_zar, gram_22k
 
-    return _get_latest_price(db, GOLD_USD_LIVE_SYMBOL)[0], _get_latest_price(db, GOLD_LIVE_SYMBOL)[0]
+    gold_usd = _get_latest_price(db, GOLD_USD_LIVE_SYMBOL)[0]
+    gold_zar = _get_latest_price(db, GOLD_LIVE_SYMBOL)[0]
+    gram_22k = gold_zar / 33.93 if gold_zar else 0.0
+    return gold_usd, gold_zar, gram_22k
 
 
 def _refresh_gold_prices(db: Session, gold_api: GoldAPICollector) -> None:
@@ -168,8 +185,8 @@ def _get_latest_price(db: Session, symbol: str) -> tuple:
     return 0.0, None
 
 
-def _render_krugerrand_calculator(gold_usd: float, usd_zar: float):
-    """Render a calculator for individual Krugerrand value."""
+def _render_krugerrand_calculator(gram_22k: float):
+    """Render a calculator for Krugerrand values across sizes."""
     st.subheader("Krugerrand Calculator")
 
     premium = st.number_input(
@@ -181,6 +198,8 @@ def _render_krugerrand_calculator(gold_usd: float, usd_zar: float):
         help="Typical retail premium above the gold spot price."
     )
 
+    coin_size = st.selectbox("Coin size", list(KRUGERRAND_SIZES.keys()), index=0)
+
     quantity = st.number_input(
         "Number of Krugerrands",
         min_value=0,
@@ -188,17 +207,39 @@ def _render_krugerrand_calculator(gold_usd: float, usd_zar: float):
         step=1
     )
 
-    if gold_usd <= 0 or usd_zar <= 0:
+    if gram_22k <= 0:
         st.info("Click Refresh Gold & FX Prices above to enable the calculator.")
         return
 
-    base_zar = gold_usd * usd_zar
     premium_factor = 1 + (premium / 100)
+
+    # Live values for every Krugerrand size, using the 22k per-gram spot from GoldAPI.
+    size_data = []
+    for size, grams in KRUGERRAND_SIZES.items():
+        spot_value = gram_22k * grams
+        retail_value = spot_value * premium_factor
+        size_data.append({
+            "Size": size,
+            "Spot value": f"R {spot_value:,.2f}",
+            f"Retail value ({premium:.0f}% premium)": f"R {retail_value:,.2f}",
+            "_spot_value": spot_value,
+        })
+
+    st.markdown("**Value by size (live)**")
+    st.dataframe(
+        [{"Size": d["Size"], "Spot value": d["Spot value"], "Retail value": d[f"Retail value ({premium:.0f}% premium)"]} for d in size_data],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Selected size totals
+    selected_grams = KRUGERRAND_SIZES[coin_size]
+    base_zar = gram_22k * selected_grams
     per_coin = base_zar * premium_factor
     total = per_coin * quantity
 
-    st.metric("Value per Krugerrand", f"R {per_coin:,.2f}")
-    st.metric(f"Total Value ({quantity} coin{'s' if quantity != 1 else ''})", f"R {total:,.2f}")
+    st.metric(f"Value per {coin_size} Krugerrand", f"R {per_coin:,.2f}")
+    st.metric(f"Total Value ({quantity} × {coin_size})", f"R {total:,.2f}")
 
 
 def _render_krugerrand_chart(db: Session):
