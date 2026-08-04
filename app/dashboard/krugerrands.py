@@ -1,8 +1,7 @@
 import streamlit as st
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from app.models.stock import Stock, StockPrice
-from app.services.data_service import DataService
 from app.collectors.gold_api import GoldAPICollector
 from app.dashboard.utils import get_latest_market_data_timestamp, is_market_data_stale
 from loguru import logger
@@ -11,10 +10,6 @@ from loguru import logger
 # GoldAPI live symbols.
 GOLD_USD_LIVE_SYMBOL = "XAU_USD"
 GOLD_LIVE_SYMBOL = "XAU_ZAR"
-# Yahoo Finance symbol used for historical gold chart data.
-GOLD_YF_SYMBOL = "GC=F"
-# USD/ZAR exchange rate symbol via Yahoo Finance.
-USDZAR_SYMBOL = "ZAR=X"
 # Krugerrand coin sizes (label -> total grams of 22k coin).
 KRUGERRAND_SIZES = {
     "1 oz": 33.930,
@@ -62,24 +57,15 @@ def show_krugerrands(db: Session):
         )
 
     st.markdown("---")
-
-    col_left, col_right = st.columns([1, 2])
-
-    with col_left:
-        _render_krugerrand_calculator(gram_22k)
-
-    with col_right:
-        _render_krugerrand_chart(db)
+    _render_krugerrand_calculator(gram_22k)
 
     st.markdown("---")
     _render_historical_grid()
 
 
 def _ensure_gold_symbols(db: Session) -> None:
-    """Ensure gold and USD/ZAR Yahoo Finance symbols exist as Stock records."""
+    """Ensure live gold spot symbols exist as Stock records."""
     symbols = {
-        GOLD_YF_SYMBOL: "Gold Futures",
-        USDZAR_SYMBOL: "USD/ZAR",
         GOLD_USD_LIVE_SYMBOL: "Gold Spot USD (Live)",
         GOLD_LIVE_SYMBOL: "Gold Spot ZAR (Live)",
     }
@@ -162,19 +148,12 @@ def _get_or_refresh_gold_prices(
 
 
 def _refresh_gold_prices(db: Session, gold_api: GoldAPICollector) -> None:
-    """Fetch gold spot from GoldAPI and historical data from Yahoo Finance."""
+    """Force a live refresh of gold spot from GoldAPI."""
     if gold_api.enabled:
         try:
             _get_or_refresh_gold_prices(db, gold_api, force=True)
         except Exception as e:
             logger.error(f"Failed to refresh gold prices from GoldAPI: {e}")
-
-    data_service = DataService(db)
-    for symbol in (GOLD_YF_SYMBOL, USDZAR_SYMBOL):
-        try:
-            data_service.update_historical_data(symbol, days=180)
-        except Exception as e:
-            logger.error(f"Failed to refresh {symbol}: {e}")
 
 
 def _get_latest_price(db: Session, symbol: str) -> tuple:
@@ -302,58 +281,4 @@ def _render_historical_grid():
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
-def _render_krugerrand_chart(db: Session):
-    """Render a 90-day gold price chart in ZAR."""
-    st.subheader("Gold Price Trend (ZAR)")
 
-    import plotly.graph_objects as go
-
-    gold_prices = db.query(StockPrice).filter(
-        StockPrice.symbol == GOLD_YF_SYMBOL,
-        StockPrice.timestamp >= datetime.now(timezone.utc) - timedelta(days=90)
-    ).order_by(StockPrice.timestamp.asc()).all()
-
-    fx_prices = {
-        p.timestamp.date(): p.close_price
-        for p in db.query(StockPrice).filter(
-            StockPrice.symbol == USDZAR_SYMBOL,
-            StockPrice.timestamp >= datetime.now(timezone.utc) - timedelta(days=90)
-        ).all()
-    }
-
-    if not gold_prices or not fx_prices:
-        st.info("No gold or FX data available. Click Refresh Gold & FX Prices to fetch data.")
-        return
-
-    x_vals = []
-    y_vals = []
-    for gp in gold_prices:
-        fx_rate = fx_prices.get(gp.timestamp.date())
-        if not fx_rate:
-            # Find nearest available FX rate
-            nearest = min(
-                fx_prices.items(),
-                key=lambda item: abs((item[0] - gp.timestamp.date()).days)
-            )
-            fx_rate = nearest[1]
-        x_vals.append(gp.timestamp)
-        y_vals.append(gp.close_price * fx_rate)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=x_vals,
-        y=y_vals,
-        name="Gold Spot in ZAR",
-        mode="lines",
-        line=dict(color="#FFD700")
-    ))
-
-    fig.update_layout(
-        title="90-Day Gold Spot Price (ZAR per ounce)",
-        xaxis_title="Date",
-        yaxis_title="ZAR / oz",
-        hovermode="x unified",
-        height=450
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
