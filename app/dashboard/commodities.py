@@ -1,8 +1,9 @@
 import streamlit as st
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_stock_label
+from app.dashboard.utils import format_stock_label, get_latest_market_data_timestamp, is_market_data_stale
 from app.collectors.alpha_vantage import AlphaVantageCollector
 from app.collectors.metals_dev import MetalsDevCollector
 from loguru import logger
@@ -51,6 +52,52 @@ def show_commodities(db: Session):
     _render_commodity_charts(db)
 
 
+def _save_latest_rates(db: Session, latest_rates: dict[str, float]) -> None:
+    """Persist Metals.dev's latest snapshot so day-over-day change can be computed.
+
+    Metals.dev only returns a live spot rate with no history, so without
+    storing each fetch there is nothing to diff against for a daily change.
+    """
+    if not latest_rates:
+        return
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    for api_symbol, rate in latest_rates.items():
+        if api_symbol not in COMMODITY_SYMBOLS:
+            continue
+        name, yf_symbol = COMMODITY_SYMBOLS[api_symbol]
+
+        stock = db.query(Stock).filter(Stock.symbol == yf_symbol).first()
+        if not stock:
+            stock = Stock(symbol=yf_symbol, name=name)
+            db.add(stock)
+            db.flush()
+
+        existing_today = db.query(StockPrice).filter(
+            StockPrice.symbol == yf_symbol,
+            StockPrice.timestamp >= today_start,
+        ).order_by(StockPrice.timestamp.desc()).first()
+
+        if existing_today:
+            existing_today.close_price = rate
+            existing_today.timestamp = now
+        else:
+            db.add(StockPrice(stock_id=stock.id, symbol=yf_symbol, timestamp=now, close_price=rate))
+
+    db.commit()
+
+
+def _get_previous_day_price(db: Session, symbol: str, latest_timestamp: datetime) -> Optional[StockPrice]:
+    """Get the most recent price for a symbol from a calendar day before `latest_timestamp`."""
+    latest_day_start = latest_timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+    return db.query(StockPrice).filter(
+        StockPrice.symbol == symbol,
+        StockPrice.timestamp < latest_day_start,
+    ).order_by(StockPrice.timestamp.desc()).first()
+
+
 def _ensure_commodity_stocks(db: Session) -> None:
     """Ensure Yahoo Finance fallback symbols exist as Stock records."""
     for api_symbol, (name, yf_symbol) in COMMODITY_SYMBOLS.items():
@@ -67,7 +114,8 @@ def _refresh_commodity_prices(db: Session) -> None:
 
     if api_collector.enabled:
         try:
-            api_collector.get_latest_rates()
+            latest_rates = api_collector.get_latest_rates()
+            _save_latest_rates(db, latest_rates)
         except Exception as e:
             logger.error(f"Failed to fetch latest commodity rates: {e}")
 
@@ -76,7 +124,7 @@ def _refresh_commodity_prices(db: Session) -> None:
         try:
             historical_prices = historical_collector.get_commodity_history(api_symbol)
             if historical_prices:
-                cutoff = datetime.utcnow() - timedelta(days=365)
+                cutoff = datetime.now(timezone.utc) - timedelta(days=365)
                 _save_historical_prices(
                     db,
                     api_symbol,
@@ -114,13 +162,34 @@ def _save_historical_prices(db: Session, api_symbol: str, historical_prices: lis
     return saved
 
 
+def _load_cached_rates(db: Session) -> dict[str, float]:
+    """Reload the most recently persisted rate for each commodity from StockPrice."""
+    rates = {}
+    for api_symbol, (_, yf_symbol) in COMMODITY_SYMBOLS.items():
+        latest = db.query(StockPrice).filter(
+            StockPrice.symbol == yf_symbol
+        ).order_by(StockPrice.timestamp.desc()).first()
+        if latest:
+            rates[api_symbol] = latest.close_price
+    return rates
+
+
 def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
     """Render a summary table of current commodity prices."""
     st.subheader("Current Prices")
 
     latest_rates = {}
     if api_collector.enabled:
-        latest_rates = api_collector.get_latest_rates() or {}
+        yf_symbols = [yf_symbol for _, yf_symbol in COMMODITY_SYMBOLS.values()]
+        latest_timestamp = get_latest_market_data_timestamp(db, yf_symbols)
+        if is_market_data_stale(latest_timestamp):
+            latest_rates = api_collector.get_latest_rates() or {}
+            if latest_rates:
+                _save_latest_rates(db, latest_rates)
+        else:
+            # Reuse today's already-persisted snapshot instead of hitting the
+            # live API again on every page visit/navigation.
+            latest_rates = _load_cached_rates(db)
 
     latest_prices = []
     for api_symbol, (name, yf_symbol) in COMMODITY_SYMBOLS.items():
@@ -129,19 +198,17 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
             StockPrice.symbol == yf_symbol
         ).order_by(StockPrice.timestamp.desc()).first()
 
-        prev_db = None
-        if latest_db:
-            prev_db = db.query(StockPrice).filter(
-                StockPrice.symbol == yf_symbol,
-                StockPrice.timestamp < latest_db.timestamp
-            ).order_by(StockPrice.timestamp.desc()).first()
-
         price = api_rate if api_rate is not None else (latest_db.close_price if latest_db else None)
         if price is None:
             continue
 
+        # Compare against the last prior calendar day's stored price, whether
+        # today's price came from the live Metals.dev rate or the DB fallback.
+        reference_timestamp = latest_db.timestamp if latest_db else datetime.now(timezone.utc)
+        prev_db = _get_previous_day_price(db, yf_symbol, reference_timestamp)
+
         change_pct = None
-        if api_rate is None and prev_db and prev_db.close_price and prev_db.close_price > 0:
+        if prev_db and prev_db.close_price and prev_db.close_price > 0:
             change_pct = ((price - prev_db.close_price) / prev_db.close_price) * 100
 
         latest_prices.append({
@@ -178,7 +245,7 @@ def _render_commodity_charts(db: Session):
         return
 
     fig = go.Figure()
-    start_date = datetime.utcnow() - timedelta(days=90)
+    start_date = datetime.now(timezone.utc) - timedelta(days=90)
 
     for api_symbol in selected:
         database_symbol = database_symbols[api_symbol]

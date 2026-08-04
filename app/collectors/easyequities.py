@@ -16,6 +16,7 @@ class EasyEquitiesCollector:
         self.username = settings.easyequities_username
         self.password = settings.easyequities_password
         self.enabled = bool(self.username and self.password)
+        self.last_error: str | None = None
 
     def _get_client(self):
         if not self.enabled:
@@ -35,6 +36,7 @@ class EasyEquitiesCollector:
             client.login(username=self.username, password=self.password)
             return client
         except Exception as e:
+            self.last_error = str(e)
             logger.error(f"Error logging into EasyEquities: {e}")
             return None
 
@@ -75,8 +77,12 @@ class EasyEquitiesCollector:
         try:
             parsed_holdings = []
             for account in client.accounts.list():
+                account_name = account.name or ""
                 holdings = client.accounts.holdings(account.id, include_shares=True)
-                parsed_holdings.extend(self._parse_holding(holding) for holding in holdings)
+                for holding in holdings:
+                    parsed = self._parse_holding(holding)
+                    parsed["account_name"] = account_name
+                    parsed_holdings.append(parsed)
             return parsed_holdings
         except Exception as e:
             logger.error(f"Error fetching EasyEquities holdings: {e}")

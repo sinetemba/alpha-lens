@@ -3,14 +3,14 @@ import streamlit as st
 from sqlalchemy.orm import Session
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_stock_label
+from app.dashboard.utils import format_stock_label, style_gain_loss_row, is_market_data_stale
 from app.collectors.easyequities import EasyEquitiesCollector
 from datetime import datetime, timedelta, timezone
 from loguru import logger
 
 
 EXCLUDED_PORTFOLIO_SYMBOLS = {"SZK"}
-EXCLUDED_ACCOUNT_TYPES = set()
+EXCLUDED_ACCOUNT_TYPES = {"Demo ZAR"}
 
 
 def show_portfolio(db: Session):
@@ -33,17 +33,34 @@ def show_portfolio(db: Session):
         ~PortfolioHolding.symbol.in_(EXCLUDED_PORTFOLIO_SYMBOLS),
         ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
     ).order_by(PortfolioHolding.purchase_date.asc()).all()
-    refresh_requested, sync_caption = _render_easyequities_refresh_control(collector, holdings)
+    refresh_requested, sync_caption = _render_easyequities_refresh_control(collector, portfolio)
+
+    # Track EasyEquities sync recency via a persistent DB column (rather than
+    # holdings.updated_at, which is also bumped by unrelated writes like
+    # manual "Add Holding" or the local price fallback, and rather than
+    # session_state, which resets on every app restart / new browser session).
+    should_sync = collector.enabled and (
+        refresh_requested or not holdings or is_market_data_stale(portfolio.last_easyequities_sync)
+    )
+
     synced_holdings = None
     if collector.enabled:
-        spinner_message = "Refreshing portfolio from EasyEquities..." if refresh_requested else "Syncing portfolio from EasyEquities..."
-        with st.spinner(spinner_message):
-            synced_holdings = _sync_portfolio_from_easyequities(db, portfolio.id, collector)
-        if synced_holdings is None:
-            error_detail = f" Error: {collector.last_error}" if collector.last_error else ""
-            st.warning(f"EasyEquities sync failed. Showing the most recent database values.{error_detail}")
-        elif refresh_requested:
-            st.success(f"Synced {synced_holdings} holding{'s' if synced_holdings != 1 else ''} from EasyEquities.")
+        if should_sync:
+            spinner_message = "Refreshing portfolio from EasyEquities..." if refresh_requested else "Syncing portfolio from EasyEquities..."
+            with st.spinner(spinner_message):
+                synced_holdings = _sync_portfolio_from_easyequities(db, portfolio.id, collector)
+            if synced_holdings is None:
+                error_detail = f" Error: {collector.last_error}" if collector.last_error else ""
+                st.warning(f"EasyEquities sync failed. Showing the most recent database values.{error_detail}")
+            else:
+                portfolio.last_easyequities_sync = datetime.now(timezone.utc)
+                db.commit()
+                if refresh_requested:
+                    st.success(f"Synced {synced_holdings} holding{'s' if synced_holdings != 1 else ''} from EasyEquities.")
+        else:
+            # Data is still fresh (synced within cache_ttl_seconds) — skip the network
+            # round-trip to EasyEquities on this rerun and keep the last synced values.
+            synced_holdings = 0
     else:
         st.info("Set EASYEQUITIES_USERNAME and EASYEQUITIES_PASSWORD in .env to enable live portfolio sync.")
 
@@ -52,10 +69,18 @@ def show_portfolio(db: Session):
         ~PortfolioHolding.symbol.in_(EXCLUDED_PORTFOLIO_SYMBOLS),
         ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
     ).order_by(PortfolioHolding.purchase_date.asc()).all()
-    _update_easyequities_sync_caption(sync_caption, holdings)
+    _update_easyequities_sync_caption(sync_caption, portfolio)
     if synced_holdings is None:
         for holding in holdings:
             _update_holding_values(db, holding)
+    else:
+        # EasyEquities sync only touches symbols it actually reports. Manually
+        # added holdings (not held on EasyEquities) never get current_price
+        # set otherwise, so fill those gaps from local price data without
+        # touching holdings EasyEquities already priced.
+        for holding in holdings:
+            if holding.current_price is None:
+                _update_holding_values(db, holding)
     _update_portfolio_totals(db, portfolio, holdings)
 
     # Portfolio summary
@@ -108,8 +133,6 @@ def show_portfolio(db: Session):
             "logs in with your EasyEquities credentials (configured via EASYEQUITIES_USERNAME "
             "/ EASYEQUITIES_PASSWORD in .env) to read your real holdings."
         )
-
-        collector = EasyEquitiesCollector()
 
         if not collector.enabled:
             st.info("Set EASYEQUITIES_USERNAME and EASYEQUITIES_PASSWORD in .env to enable this.")
@@ -229,19 +252,6 @@ def show_portfolio(db: Session):
                 st.rerun()
 
 
-def _style_holding_gain_loss(row: pd.Series) -> list[str]:
-    gain_loss = row["_gain_loss"]
-    if gain_loss is None:
-        color = "#fef3c7"
-    elif gain_loss > 0:
-        color = "#dcfce7"
-    elif gain_loss < 0:
-        color = "#fee2e2"
-    else:
-        color = "#fef3c7"
-    return [f"background-color: {color}"] * len(row)
-
-
 def _render_holdings_table(account_type: str, holdings: list) -> None:
     """Render a single holdings table section for the given account type."""
     st.subheader(f"{account_type} Holdings")
@@ -301,7 +311,7 @@ def _render_holdings_table(account_type: str, holdings: list) -> None:
     if selected_columns:
         visible_columns = [c for c in available_columns if c in selected_columns]
         visible_table = holdings_table[visible_columns + ["_gain_loss"]]
-        styled_table = visible_table.style.apply(_style_holding_gain_loss, axis=1).hide(
+        styled_table = visible_table.style.apply(style_gain_loss_row, axis=1).hide(
             axis="columns", subset=["_gain_loss"]
         )
         st.dataframe(
@@ -327,7 +337,7 @@ def _render_holdings_table(account_type: str, holdings: list) -> None:
 
 
 def _render_easyequities_refresh_control(
-    collector: EasyEquitiesCollector, holdings: list[PortfolioHolding]
+    collector: EasyEquitiesCollector, portfolio: Portfolio
 ) -> tuple[bool, object]:
     _, refresh_column = st.columns([3, 1])
     with refresh_column:
@@ -337,12 +347,12 @@ def _render_easyequities_refresh_control(
             disabled=not collector.enabled,
         )
         sync_caption = st.empty()
-        _update_easyequities_sync_caption(sync_caption, holdings)
+        _update_easyequities_sync_caption(sync_caption, portfolio)
     return refresh_requested, sync_caption
 
 
-def _update_easyequities_sync_caption(sync_caption, holdings: list[PortfolioHolding]) -> None:
-    latest_update = max((holding.updated_at for holding in holdings if holding.updated_at), default=None)
+def _update_easyequities_sync_caption(sync_caption, portfolio: Portfolio) -> None:
+    latest_update = portfolio.last_easyequities_sync
     if latest_update:
         sync_caption.caption(f"Last EasyEquities sync: {latest_update.strftime('%d %b %Y %H:%M')}")
     else:
@@ -357,10 +367,18 @@ def _sync_portfolio_from_easyequities(
         return None
 
     aggregated_holdings = {}
+    seen_account_types = set()
     for ee_holding in ee_holdings:
         symbol = ee_holding["symbol"]
         account_name = ee_holding.get("account_name", "ZAR")
-        if not symbol or symbol in EXCLUDED_PORTFOLIO_SYMBOLS or ee_holding["shares"] <= 0:
+        if account_name not in EXCLUDED_ACCOUNT_TYPES:
+            seen_account_types.add(account_name)
+        if (
+            not symbol
+            or symbol in EXCLUDED_PORTFOLIO_SYMBOLS
+            or account_name in EXCLUDED_ACCOUNT_TYPES
+            or ee_holding["shares"] <= 0
+        ):
             continue
         key = (symbol, account_name)
         current = aggregated_holdings.setdefault(key, {
@@ -379,6 +397,24 @@ def _sync_portfolio_from_easyequities(
         ee_holding["purchase_price"] = ee_holding["purchase_value"] / ee_holding["shares"]
         ee_holding["current_price"] = ee_holding["current_value"] / ee_holding["shares"]
         _sync_holding_from_easyequities(db, portfolio_id, ee_holding)
+
+    # EasyEquities is the source of truth: remove holdings under the account
+    # types we just synced that it no longer reports (fully sold/delisted
+    # positions). Otherwise they linger in the DB forever and get retried on
+    # every price refresh, which is slow for delisted/wrong-exchange tickers.
+    if seen_account_types:
+        stale_holdings = db.query(PortfolioHolding).filter(
+            PortfolioHolding.portfolio_id == portfolio_id,
+            PortfolioHolding.account_type.in_(seen_account_types),
+        ).all()
+        removed = 0
+        for holding in stale_holdings:
+            if (holding.symbol, holding.account_type) not in aggregated_holdings:
+                db.delete(holding)
+                removed += 1
+        if removed:
+            db.commit()
+            logger.info(f"Removed {removed} stale holding(s) no longer reported by EasyEquities")
 
     return len(aggregated_holdings)
 
@@ -424,7 +460,13 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
 def _sync_holding_from_easyequities(db: Session, portfolio_id: int, ee_holding: dict):
     """Create or update a holding from parsed EasyEquities data."""
     symbol = ee_holding["symbol"]
-    if not symbol or symbol in EXCLUDED_PORTFOLIO_SYMBOLS or ee_holding["shares"] <= 0:
+    account_type = ee_holding.get("account_name", "ZAR")
+    if (
+        not symbol
+        or symbol in EXCLUDED_PORTFOLIO_SYMBOLS
+        or account_type in EXCLUDED_ACCOUNT_TYPES
+        or ee_holding["shares"] <= 0
+    ):
         return
 
     stock = db.query(Stock).filter(Stock.symbol == symbol).first()
@@ -433,7 +475,6 @@ def _sync_holding_from_easyequities(db: Session, portfolio_id: int, ee_holding: 
         db.add(stock)
         db.flush()
 
-    account_type = ee_holding.get("account_name", "ZAR")
     holding = db.query(PortfolioHolding).filter(
         PortfolioHolding.portfolio_id == portfolio_id,
         PortfolioHolding.symbol == symbol,
@@ -457,9 +498,10 @@ def _sync_holding_from_easyequities(db: Session, portfolio_id: int, ee_holding: 
     holding.current_price = ee_holding["current_price"]
     holding.current_value = ee_holding["current_value"]
     holding.gain_loss = holding.current_value - (holding.quantity * holding.purchase_price)
+    cost_basis = holding.quantity * holding.purchase_price
     holding.gain_loss_percentage = (
-        (holding.gain_loss / (holding.quantity * holding.purchase_price)) * 100
-        if holding.purchase_price else 0.0
+        (holding.gain_loss / cost_basis) * 100
+        if cost_basis else 0.0
     )
     # Always update the timestamp so the UI reflects the latest sync time,
     # even when EasyEquities returns identical values.
@@ -487,8 +529,13 @@ def _update_holding_values(db: Session, holding: PortfolioHolding):
     if latest_price:
         holding.current_price = latest_price.close_price
         holding.current_value = holding.quantity * latest_price.close_price
-        holding.gain_loss = holding.current_value - (holding.quantity * holding.purchase_price)
-        holding.gain_loss_percentage = (holding.gain_loss / (holding.quantity * holding.purchase_price)) * 100
+        cost_basis = holding.quantity * holding.purchase_price
+        if cost_basis:
+            holding.gain_loss = holding.current_value - cost_basis
+            holding.gain_loss_percentage = (holding.gain_loss / cost_basis) * 100
+        else:
+            holding.gain_loss = holding.current_value
+            holding.gain_loss_percentage = 0.0
     else:
         holding.current_price = None
         holding.current_value = None

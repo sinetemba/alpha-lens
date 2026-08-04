@@ -47,7 +47,8 @@ class DataService:
         self.db = db
         self.twelve_data = TwelveDataCollector()
         self.yfinance = YFinanceCollector()
-    
+        self.quota_message: Optional[str] = None
+
     def update_stock_prices(self, symbols: Optional[List[str]] = None) -> int:
         """Update stock prices for given symbols or all active stocks."""
         logger.info("Starting stock price update")
@@ -87,6 +88,9 @@ class DataService:
         
         self.db.commit()
         logger.info(f"Updated prices for {updated_count} symbols")
+
+        self.quota_message = self.twelve_data.quota_exceeded_message()
+
         return updated_count
     
     def _save_price_from_quote(self, symbol: str, quote: Dict) -> None:
@@ -95,7 +99,7 @@ class DataService:
             # Parse timestamp
             timestamp_str = quote.get("timestamp")
             if timestamp_str:
-                timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             else:
                 timestamp = datetime.now(timezone.utc)
             
@@ -141,6 +145,8 @@ class DataService:
             
             latest = hist.iloc[-1]
             timestamp = latest.name.to_pydatetime()
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
             
             # Check if we already have data for this timestamp
             existing = self.db.query(StockPrice).filter(
@@ -175,11 +181,24 @@ class DataService:
         except Exception as e:
             logger.error(f"Error saving price from history: {e}")
     
-    def _update_technical_indicators(self, symbol: str) -> None:
-        """Recalculate and persist technical indicators for a symbol's price history."""
-        prices = self.db.query(StockPrice).filter(
-            StockPrice.symbol == symbol
-        ).order_by(StockPrice.timestamp.asc()).all()
+    def _update_technical_indicators(self, symbol: str, full: bool = False) -> None:
+        """Recalculate and persist technical indicators for a symbol's price history.
+
+        By default, only the newest price row is updated using the last 250
+        rows of history (enough for SMA-200). This keeps incremental updates
+        O(1) per symbol instead of O(total history). Set ``full=True`` to
+        recalculate and persist the entire available history.
+        """
+        if full:
+            prices = self.db.query(StockPrice).filter(
+                StockPrice.symbol == symbol
+            ).order_by(StockPrice.timestamp.asc()).all()
+        else:
+            prices = list(reversed(
+                self.db.query(StockPrice).filter(
+                    StockPrice.symbol == symbol
+                ).order_by(StockPrice.timestamp.desc()).limit(250).all()
+            ))
 
         if len(prices) < 2:
             return
@@ -195,7 +214,10 @@ class DataService:
 
             result_df = TechnicalIndicators.calculate_all_indicators(df)
 
-            for price, (_, row) in zip(prices, result_df.iterrows()):
+            rows_to_update = prices if full else prices[-1:]
+            result_rows = result_df.tail(len(rows_to_update)).iterrows()
+
+            for price, (_, row) in zip(rows_to_update, result_rows):
                 for column in INDICATOR_COLUMNS:
                     value = row.get(column)
                     setattr(price, column, None if pd.isna(value) else float(value))
@@ -213,6 +235,60 @@ class DataService:
         saved = 0
         for symbol in symbols:
             try:
+                td_dividends = self.twelve_data.get_dividends(symbol)
+
+                if td_dividends:
+                    stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
+                    if not stock:
+                        stock = Stock(symbol=symbol, name=get_company_name(symbol))
+                        self.db.add(stock)
+                        self.db.flush()
+
+                    for record in td_dividends:
+                        ex_date_str = record.get("ex_date")
+                        amount = record.get("amount")
+                        if not ex_date_str or amount is None:
+                            continue
+
+                        ex_date = datetime.strptime(ex_date_str, "%Y-%m-%d")
+
+                        def _parse_date(key: str) -> Optional[datetime]:
+                            value = record.get(key)
+                            return datetime.strptime(value, "%Y-%m-%d") if value else None
+
+                        payment_date = _parse_date("payment_date")
+                        record_date = _parse_date("record_date")
+                        declaration_date = _parse_date("declaration_date")
+
+                        existing = self.db.query(Dividend).filter(
+                            Dividend.symbol == symbol,
+                            Dividend.ex_dividend_date == ex_date,
+                        ).first()
+                        if existing:
+                            if payment_date and not existing.payment_date:
+                                existing.payment_date = payment_date
+                            if record_date and not existing.record_date:
+                                existing.record_date = record_date
+                            if declaration_date and not existing.declaration_date:
+                                existing.declaration_date = declaration_date
+                            continue
+
+                        dividend = Dividend(
+                            stock_id=stock.id,
+                            symbol=symbol,
+                            amount=float(amount),
+                            currency="ZAR",
+                            ex_dividend_date=ex_date,
+                            payment_date=payment_date,
+                            record_date=record_date,
+                            declaration_date=declaration_date,
+                        )
+                        self.db.add(dividend)
+                        saved += 1
+
+                    continue
+
+                # Fallback: Yahoo Finance has ex-dividend dates but no payment dates.
                 dividends = self.yfinance.get_dividends(symbol)
                 if dividends is None or dividends.empty:
                     continue
@@ -278,7 +354,7 @@ class DataService:
         if historical:
             saved = self._save_historical_data(symbol, historical)
             logger.info(f"Saved {saved} historical data points for {symbol} from Twelve Data")
-            self._update_technical_indicators(symbol)
+            self._update_technical_indicators(symbol, full=True)
             return saved
         
         # Fallback to Yahoo Finance
@@ -293,6 +369,8 @@ class DataService:
             saved = 0
             for index, row in hist.iterrows():
                 timestamp = index.to_pydatetime()
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
                 
                 existing = self.db.query(StockPrice).filter(
                     StockPrice.symbol == symbol,
@@ -323,7 +401,7 @@ class DataService:
             
             self.db.commit()
             logger.info(f"Saved {saved} historical data points for {symbol} from Yahoo Finance")
-            self._update_technical_indicators(symbol)
+            self._update_technical_indicators(symbol, full=True)
             return saved
         
         logger.error(f"Failed to get historical data for {symbol}")
@@ -341,7 +419,7 @@ class DataService:
                 # Daily/weekly/monthly intervals return "YYYY-MM-DD" with no time
                 # component, while intraday intervals include "HH:MM:SS".
                 date_format = "%Y-%m-%d" if len(timestamp_str) == 10 else "%Y-%m-%d %H:%M:%S"
-                timestamp = datetime.strptime(timestamp_str, date_format)
+                timestamp = datetime.strptime(timestamp_str, date_format).replace(tzinfo=timezone.utc)
                 
                 # Check if already exists
                 existing = self.db.query(StockPrice).filter(

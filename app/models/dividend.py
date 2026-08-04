@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Index
 from sqlalchemy.orm import relationship
-from datetime import datetime
+from datetime import datetime, timezone
 from .base import Base
 
 
@@ -22,7 +22,7 @@ class Dividend(Base):
     payment_date = Column(DateTime)
     frequency = Column(String(20))  # monthly, quarterly, semi-annual, annual
     
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     # Relationships
     stock = relationship("Stock", back_populates="dividends")

@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from app.models.notification import Notification
 from app.models.stock import StockPrice
 from app.models.watchlist import WatchlistItem
@@ -106,7 +106,7 @@ class NotificationService:
             
             if success:
                 notification.is_sent = True
-                notification.sent_at = datetime.utcnow()
+                notification.sent_at = datetime.now(timezone.utc)
                 notification.delivery_channel = channel or "all"
                 self.db.commit()
                 logger.info(f"Notification sent: {notification.title}")
@@ -275,7 +275,7 @@ class NotificationService:
         
         if notification:
             notification.is_read = True
-            notification.read_at = datetime.utcnow()
+            notification.read_at = datetime.now(timezone.utc)
             self.db.commit()
     
     def mark_all_as_read(self):
@@ -284,6 +284,6 @@ class NotificationService:
             Notification.is_read == False
         ).update({
             "is_read": True,
-            "read_at": datetime.utcnow()
+            "read_at": datetime.now(timezone.utc)
         })
         self.db.commit()

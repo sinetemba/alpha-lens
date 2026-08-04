@@ -1,9 +1,10 @@
 import streamlit as st
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.models.stock import Stock, StockPrice
 from app.services.data_service import DataService
 from app.collectors.commodity_price_api import CommodityPriceAPICollector
+from app.dashboard.utils import get_latest_market_data_timestamp, is_market_data_stale
 from loguru import logger
 
 
@@ -13,6 +14,10 @@ GOLD_API_SYMBOL = "XAU"
 GOLD_YF_SYMBOL = "GC=F"
 # USD/ZAR exchange rate symbol via Yahoo Finance.
 USDZAR_SYMBOL = "ZAR=X"
+# Symbol used to persist CommodityPriceAPI's live gold spot snapshot, kept
+# separate from GOLD_YF_SYMBOL (Yahoo Finance historical chart data) since
+# they come from different sources/units.
+GOLD_LIVE_SYMBOL = "XAU_SPOT"
 
 
 def show_krugerrands(db: Session):
@@ -37,7 +42,7 @@ def show_krugerrands(db: Session):
 
     col1, col2, col3 = st.columns(3)
 
-    gold_usd = _get_api_gold_price(api_collector)
+    gold_usd = _get_or_refresh_gold_price(db, api_collector)
     usd_zar, _ = _get_latest_price(db, USDZAR_SYMBOL)
 
     with col1:
@@ -65,7 +70,11 @@ def show_krugerrands(db: Session):
 
 def _ensure_gold_symbols(db: Session) -> None:
     """Ensure gold and USD/ZAR Yahoo Finance symbols exist as Stock records."""
-    symbols = {GOLD_YF_SYMBOL: "Gold Futures", USDZAR_SYMBOL: "USD/ZAR"}
+    symbols = {
+        GOLD_YF_SYMBOL: "Gold Futures",
+        USDZAR_SYMBOL: "USD/ZAR",
+        GOLD_LIVE_SYMBOL: "Gold Spot (Live)",
+    }
     for symbol, name in symbols.items():
         stock = db.query(Stock).filter(Stock.symbol == symbol).first()
         if not stock:
@@ -87,11 +96,58 @@ def _get_api_gold_price(api_collector: CommodityPriceAPICollector) -> float:
     return 0.0
 
 
+def _save_gold_spot_price(db: Session, price: float) -> None:
+    """Persist today's live gold spot snapshot so it can be reused without refetching."""
+    stock = db.query(Stock).filter(Stock.symbol == GOLD_LIVE_SYMBOL).first()
+    if not stock:
+        stock = Stock(symbol=GOLD_LIVE_SYMBOL, name="Gold Spot (Live)")
+        db.add(stock)
+        db.flush()
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    existing_today = db.query(StockPrice).filter(
+        StockPrice.symbol == GOLD_LIVE_SYMBOL,
+        StockPrice.timestamp >= today_start,
+    ).order_by(StockPrice.timestamp.desc()).first()
+    if existing_today:
+        existing_today.close_price = price
+        existing_today.timestamp = now
+    else:
+        db.add(StockPrice(stock_id=stock.id, symbol=GOLD_LIVE_SYMBOL, timestamp=now, close_price=price))
+    db.commit()
+
+
+def _get_or_refresh_gold_price(
+    db: Session, api_collector: CommodityPriceAPICollector, force: bool = False
+) -> float:
+    """Return the gold spot price, hitting CommodityPriceAPI only when stale/forced.
+
+    Without this gate, every page navigation/rerun hit CommodityPriceAPI live,
+    even when nothing needed refreshing.
+    """
+    if not api_collector.enabled:
+        return 0.0
+
+    latest_timestamp = get_latest_market_data_timestamp(db, [GOLD_LIVE_SYMBOL])
+    if not force and not is_market_data_stale(latest_timestamp):
+        cached_price, _ = _get_latest_price(db, GOLD_LIVE_SYMBOL)
+        return cached_price
+
+    price = _get_api_gold_price(api_collector)
+    if price:
+        _save_gold_spot_price(db, price)
+        return price
+
+    cached_price, _ = _get_latest_price(db, GOLD_LIVE_SYMBOL)
+    return cached_price
+
+
 def _refresh_gold_prices(db: Session, api_collector: CommodityPriceAPICollector) -> None:
     """Fetch gold spot from CommodityPriceAPI and historical data from Yahoo Finance."""
     if api_collector.enabled:
         try:
-            _get_api_gold_price(api_collector)
+            _get_or_refresh_gold_price(db, api_collector, force=True)
         except Exception as e:
             logger.error(f"Failed to refresh gold price from CommodityPriceAPI: {e}")
 
@@ -155,14 +211,14 @@ def _render_krugerrand_chart(db: Session):
 
     gold_prices = db.query(StockPrice).filter(
         StockPrice.symbol == GOLD_YF_SYMBOL,
-        StockPrice.timestamp >= datetime.utcnow() - timedelta(days=90)
+        StockPrice.timestamp >= datetime.now(timezone.utc) - timedelta(days=90)
     ).order_by(StockPrice.timestamp.asc()).all()
 
     fx_prices = {
         p.timestamp.date(): p.close_price
         for p in db.query(StockPrice).filter(
             StockPrice.symbol == USDZAR_SYMBOL,
-            StockPrice.timestamp >= datetime.utcnow() - timedelta(days=90)
+            StockPrice.timestamp >= datetime.now(timezone.utc) - timedelta(days=90)
         ).all()
     }
 

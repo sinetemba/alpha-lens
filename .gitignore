@@ -73,9 +73,6 @@ alembic/versions/*.pyc
 .ipynb_checkpoints/
 *.ipynb
 
-# Playwright
-.playwright/
-
 # Docker
 docker-compose.override.yml
 

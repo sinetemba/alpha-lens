@@ -23,10 +23,61 @@ def drop_tables():
     print("Database tables dropped successfully.")
 
 
+def _migrate_schema():
+    """Apply lightweight schema migrations for existing databases.
+
+    SQLAlchemy ``create_all`` only creates *new* tables; it will not add
+    columns to tables that already exist.  This function fills that gap by
+    running simple ``ALTER TABLE`` statements when needed.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+
+    # --- portfolio_holdings.account_type (added to track ZAR / TFSA / USD) ---
+    if "portfolio_holdings" in inspector.get_table_names():
+        columns = [col["name"] for col in inspector.get_columns("portfolio_holdings")]
+        if "account_type" not in columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE portfolio_holdings ADD COLUMN account_type VARCHAR(50) DEFAULT 'ZAR'")
+                )
+            print("Migration: added 'account_type' column to portfolio_holdings.")
+
+    # --- portfolios.last_easyequities_sync (added to persist sync staleness tracking) ---
+    if "portfolios" in inspector.get_table_names():
+        columns = [col["name"] for col in inspector.get_columns("portfolios")]
+        if "last_easyequities_sync" not in columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE portfolios ADD COLUMN last_easyequities_sync DATETIME")
+                )
+            print("Migration: added 'last_easyequities_sync' column to portfolios.")
+
+
+def _cleanup_excluded_holdings():
+    """Remove previously-synced holdings from excluded EasyEquities accounts (e.g. Demo ZAR)."""
+    db = SessionLocal()
+    try:
+        deleted = db.query(PortfolioHolding).filter(
+            PortfolioHolding.account_type == "Demo ZAR"
+        ).delete()
+        if deleted:
+            db.commit()
+            print(f"Cleanup: removed {deleted} 'Demo ZAR' holding(s) from the database.")
+    except Exception as e:
+        db.rollback()
+        print(f"Error cleaning up excluded holdings: {e}")
+    finally:
+        db.close()
+
+
 def init_database():
     """Initialize the database with tables and seed data."""
     print("Initializing database...")
     create_tables()
+    _migrate_schema()
+    _cleanup_excluded_holdings()
     
     # Add seed data if needed
     # For example, add default JSE stocks

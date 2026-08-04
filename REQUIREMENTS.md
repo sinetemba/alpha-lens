@@ -197,7 +197,6 @@ Libraries
 ```
 BeautifulSoup4
 Requests
-Playwright
 ```
 
 Scrape
@@ -545,7 +544,6 @@ stock-analyzer/
 | Database             | SQLAlchemy                  |
 | Scheduler            | APScheduler                 |
 | Web Scraping         | BeautifulSoup4              |
-| Dynamic Scraping     | Playwright                  |
 | HTTP                 | Requests                    |
 | Notifications        | Apprise                     |
 | Finance              | yfinance                    |

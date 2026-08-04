@@ -23,9 +23,17 @@ logger.add(
     level=settings.log_level
 )
 
-# Initialize database on first run
-try:
+# Initialize database on first run.
+# st.cache_resource ensures this only runs once per process, since the whole
+# script re-executes on every widget interaction (Streamlit's rerun model).
+@st.cache_resource(show_spinner=False)
+def _init_database_once():
     init_database()
+    return True
+
+
+try:
+    _init_database_once()
     logger.info("Database initialized successfully")
 except Exception as e:
     logger.error(f"Error initializing database: {e}")

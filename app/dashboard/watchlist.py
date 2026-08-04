@@ -1,10 +1,10 @@
+import pandas as pd
 import streamlit as st
 from sqlalchemy.orm import Session
-from app.models.stock import Stock, StockPrice
+from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
-from app.config.settings import settings
-from app.dashboard.utils import format_stock_label, render_market_data_refresh_control
-from datetime import datetime, timedelta
+from app.dashboard.utils import format_stock_label, render_market_data_refresh_control, style_gain_loss_row
+from app.dashboard.home import _get_latest_and_previous_prices
 from loguru import logger
 
 
@@ -52,17 +52,27 @@ def show_watchlist(db: Session):
         return
     
     # Summary metrics
+    prices = _get_latest_and_previous_prices(db, [item.symbol for item in watchlist_items])
+
+    above_target = 0
+    below_stop = 0
+    for item in watchlist_items:
+        latest, _ = prices.get(item.symbol, (None, None))
+        if latest and latest.close_price:
+            if item.target_price and latest.close_price >= item.target_price:
+                above_target += 1
+            if item.stop_loss and latest.close_price <= item.stop_loss:
+                below_stop += 1
+
     col1, col2, col3 = st.columns(3)
     
     with col1:
         st.metric("Total Stocks", len(watchlist_items))
     
     with col2:
-        above_target = sum(1 for item in watchlist_items if item.target_price and _get_current_price(db, item.symbol) >= item.target_price)
         st.metric("Above Target", above_target)
     
     with col3:
-        below_stop = sum(1 for item in watchlist_items if item.stop_loss and _get_current_price(db, item.symbol) <= item.stop_loss)
         st.metric("Below Stop Loss", below_stop)
     
     st.markdown("---")
@@ -72,9 +82,10 @@ def show_watchlist(db: Session):
     
     data = []
     for item in watchlist_items:
-        current_price = _get_current_price(db, item.symbol)
+        latest, prev = prices.get(item.symbol, (None, None))
+        current_price = latest.close_price if latest else None
         
-        if current_price:
+        if current_price is not None:
             if item.purchase_price:
                 gain_loss = current_price - item.purchase_price
                 gain_loss_pct = (gain_loss / item.purchase_price) * 100
@@ -82,8 +93,11 @@ def show_watchlist(db: Session):
                 gain_loss = 0
                 gain_loss_pct = 0
             
-            # Get daily change
-            daily_change = _get_daily_change(db, item.symbol)
+            # Daily change vs previous day's close
+            daily_change = (
+                ((current_price - prev.close_price) / prev.close_price) * 100
+                if prev and prev.close_price else 0.0
+            )
             
             data.append({
                 "Symbol": format_stock_label(item.symbol, item.stock.name if item.stock else None),
@@ -94,10 +108,15 @@ def show_watchlist(db: Session):
                 "Stop Loss": f"R {item.stop_loss:.2f}" if item.stop_loss else "N/A",
                 "Gain/Loss": f"R {gain_loss:.2f}",
                 "Gain/Loss %": f"{gain_loss_pct:+.2f}%",
+                "_gain_loss": gain_loss if item.purchase_price else None,
             })
     
     if data:
-        st.dataframe(data, use_container_width=True)
+        watchlist_table = pd.DataFrame(data)
+        styled_table = watchlist_table.style.apply(style_gain_loss_row, axis=1).hide(
+            axis="columns", subset=["_gain_loss"]
+        )
+        st.dataframe(styled_table, use_container_width=True, hide_index=True)
     
     st.markdown("---")
     
@@ -170,30 +189,4 @@ def _remove_from_watchlist(db: Session, symbols: list):
     db.commit()
 
 
-def _get_current_price(db: Session, symbol: str) -> float:
-    """Get current price for a symbol."""
-    price = db.query(StockPrice).filter(
-        StockPrice.symbol == symbol
-    ).order_by(StockPrice.timestamp.desc()).first()
-    
-    return price.close_price if price else 0.0
 
-
-def _get_daily_change(db: Session, symbol: str) -> float:
-    """Calculate daily percentage change."""
-    latest = db.query(StockPrice).filter(
-        StockPrice.symbol == symbol
-    ).order_by(StockPrice.timestamp.desc()).first()
-    
-    if not latest:
-        return 0.0
-    
-    prev = db.query(StockPrice).filter(
-        StockPrice.symbol == symbol,
-        StockPrice.timestamp < latest.timestamp
-    ).order_by(StockPrice.timestamp.desc()).first()
-    
-    if prev and prev.close_price > 0:
-        return ((latest.close_price - prev.close_price) / prev.close_price) * 100
-    
-    return 0.0

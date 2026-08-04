@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey
 from sqlalchemy.orm import relationship
-from datetime import datetime
+from datetime import datetime, timezone
 from .base import Base
 
 
@@ -19,8 +19,13 @@ class Portfolio(Base):
     total_gain_loss = Column(Float, default=0.0)
     total_gain_loss_percentage = Column(Float, default=0.0)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    # Set only on a successful EasyEquities sync (not bumped by unrelated
+    # writes like updated_at), so sync staleness can be tracked persistently
+    # across app restarts/sessions instead of relying on session state.
+    last_easyequities_sync = Column(DateTime)
 
     # Relationships
     holdings = relationship("PortfolioHolding", back_populates="portfolio", cascade="all, delete-orphan")
@@ -38,6 +43,7 @@ class PortfolioHolding(Base):
     portfolio_id = Column(Integer, ForeignKey("portfolios.id"), nullable=False)
     stock_id = Column(Integer, ForeignKey("stocks.id"), nullable=False)
     symbol = Column(String(10), index=True, nullable=False)
+    account_type = Column(String(50), default="ZAR")
     
     # Purchase information
     quantity = Column(Float, nullable=False)
@@ -53,8 +59,8 @@ class PortfolioHolding(Base):
     # Dividend tracking
     total_dividends_received = Column(Float, default=0.0)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     # Relationships
     portfolio = relationship("Portfolio", back_populates="holdings")

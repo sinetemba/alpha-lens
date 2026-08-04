@@ -108,12 +108,6 @@ python -c "from app.database.init_db import init_database; init_database()"
 
 This will create the database tables and seed it with popular JSE stocks.
 
-### Step 6: Install Playwright (for dynamic scraping)
-
-```bash
-playwright install
-```
-
 ## Running the Application
 
 ### Development Mode

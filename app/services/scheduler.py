@@ -81,12 +81,36 @@ class SchedulerService:
         db = SessionLocal()
         try:
             data_service = DataService(db)
-            updated = data_service.update_stock_prices()
+            symbols = self._get_tracked_symbols(db)
+            updated = data_service.update_stock_prices(symbols)
             logger.info(f"Hourly price update completed: {updated} symbols updated")
         except Exception as e:
             logger.error(f"Error in hourly price update: {e}")
         finally:
             db.close()
+
+    def _get_tracked_symbols(self, db: Session) -> list:
+        """Symbols actually relevant to the user: watchlist + non-excluded portfolio holdings.
+
+        Falls back to `settings.default_watchlist_symbols` only when there is
+        nothing to scope to, so the hourly job doesn't waste time retrying
+        long-delisted/irrelevant symbols that accumulated in the Stock table
+        over time (e.g. from ad-hoc Company View lookups).
+        """
+        from app.models.watchlist import WatchlistItem
+        from app.models.portfolio import PortfolioHolding
+        from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
+
+        watchlist_symbols = [
+            item.symbol for item in db.query(WatchlistItem).filter(WatchlistItem.is_active == True).all()
+        ]
+        portfolio_symbols = [
+            h.symbol for h in db.query(PortfolioHolding).filter(
+                ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
+            ).all()
+        ]
+        symbols = sorted(set(watchlist_symbols + portfolio_symbols))
+        return symbols if symbols else settings.default_watchlist_symbols
     
     def _hourly_news_collection(self):
         """Job: Collect news hourly."""

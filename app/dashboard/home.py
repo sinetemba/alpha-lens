@@ -82,8 +82,22 @@ def _render_home(db: Session):
         db.add(Stock(symbol=JSE_INDEX_YF_SYMBOL, name="JSE All Share Index"))
         db.commit()
 
+    watchlist_symbols = [
+        item.symbol for item in db.query(WatchlistItem).filter(WatchlistItem.is_active == True).all()
+    ]
+    portfolio_symbols = [
+        h.symbol for h in db.query(PortfolioHolding).filter(
+            ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
+        ).all()
+    ]
+    refresh_symbols = sorted(set(watchlist_symbols + portfolio_symbols + [JSE_INDEX_YF_SYMBOL]))
+
     render_market_data_refresh_control(
-        db, key="home_market_data_refresh", include_news=True, auto_refresh=True
+        db,
+        key="home_market_data_refresh",
+        symbols=refresh_symbols,
+        include_news=True,
+        auto_refresh=True,
     )
     # Get latest market data
     col1, col2, col3, col4 = st.columns(4)
@@ -159,14 +173,11 @@ def _get_jse_index(db: Session) -> str:
 
 def _get_jse_change(db: Session) -> str:
     """Get JSE index daily percentage change."""
-    latest = db.query(StockPrice).filter(
-        StockPrice.symbol == JSE_INDEX_YF_SYMBOL
-    ).order_by(StockPrice.timestamp.desc()).first()
+    prices = _get_latest_and_previous_prices(db, [JSE_INDEX_YF_SYMBOL])
+    latest, prev = prices.get(JSE_INDEX_YF_SYMBOL, (None, None))
 
     if not latest:
         return "N/A"
-
-    prev = _get_previous_day_price(db, JSE_INDEX_YF_SYMBOL, latest.timestamp)
 
     if prev and prev.close_price and prev.close_price > 0:
         change_pct = ((latest.close_price - prev.close_price) / prev.close_price) * 100
@@ -209,21 +220,18 @@ def _get_daily_gain(db: Session) -> float:
     holdings = db.query(PortfolioHolding).filter(
         ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
     ).all()
+    if not holdings:
+        return 0.0
+
+    prices = _get_latest_and_previous_prices(db, [h.symbol for h in holdings])
     daily_gain = 0.0
 
     for h in holdings:
         if not h.current_price or not h.quantity:
             continue
-        # Get the previous trading day's close for this symbol
-        latest = db.query(StockPrice).filter(
-            StockPrice.symbol == h.symbol
-        ).order_by(StockPrice.timestamp.desc()).first()
-
+        latest, prev = prices.get(h.symbol, (None, None))
         if not latest:
             continue
-
-        prev = _get_previous_day_price(db, h.symbol, latest.timestamp)
-
         if prev and prev.close_price:
             daily_gain += (latest.close_price - prev.close_price) * h.quantity
 
@@ -251,15 +259,12 @@ def _render_watchlist_summary(db: Session):
         return
     
     # Get latest prices for watchlist items
+    prices = _get_latest_and_previous_prices(db, [item.symbol for item in watchlist_items])
     data = []
     for item in watchlist_items:
-        latest_price = db.query(StockPrice).filter(
-            StockPrice.symbol == item.symbol
-        ).order_by(StockPrice.timestamp.desc()).first()
-        
-        if latest_price:
-            prev_price = _get_previous_day_price(db, item.symbol, latest_price.timestamp)
+        latest_price, prev_price = prices.get(item.symbol, (None, None))
 
+        if latest_price:
             if prev_price:
                 change = ((latest_price.close_price - prev_price.close_price) / prev_price.close_price) * 100
             else:
@@ -278,19 +283,32 @@ def _render_watchlist_summary(db: Session):
         st.warning("No price data available for watchlist items.")
 
 
-def _get_previous_day_price(db: Session, symbol: str, latest_timestamp: datetime) -> Optional[StockPrice]:
-    """Get the most recent price for a symbol from a calendar day before `latest_timestamp`.
+def _get_latest_and_previous_prices(
+    db: Session, symbols: list[str]
+) -> dict[str, tuple[Optional[StockPrice], Optional[StockPrice]]]:
+    """Batch-fetch each symbol's latest price and its most recent prior-day price.
 
-    Auto-refresh can store multiple price points for the same symbol on the
-    same day (e.g. hourly), so comparing against "whatever the second-most-recent
-    row is" would understate/overstate moves as an intraday change rather than
-    a true day-over-day one. This looks back to the last *prior* calendar day instead.
+    Replaces per-symbol N+1 query loops (2 queries per symbol) with a single
+    query, grouping and pairing results in memory.
     """
-    latest_day_start = latest_timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
-    return db.query(StockPrice).filter(
-        StockPrice.symbol == symbol,
-        StockPrice.timestamp < latest_day_start
-    ).order_by(StockPrice.timestamp.desc()).first()
+    if not symbols:
+        return {}
+
+    rows = db.query(StockPrice).filter(
+        StockPrice.symbol.in_(symbols)
+    ).order_by(StockPrice.timestamp.desc()).all()
+
+    by_symbol: dict[str, list[StockPrice]] = {}
+    for row in rows:
+        by_symbol.setdefault(row.symbol, []).append(row)
+
+    result: dict[str, tuple[Optional[StockPrice], Optional[StockPrice]]] = {}
+    for symbol, prices in by_symbol.items():
+        latest = prices[0]
+        latest_day_start = latest.timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+        prev = next((p for p in prices if p.timestamp < latest_day_start), None)
+        result[symbol] = (latest, prev)
+    return result
 
 
 def _get_daily_movers(db: Session, limit: int = 5) -> tuple[list, list]:
@@ -305,16 +323,14 @@ def _get_daily_movers(db: Session, limit: int = 5) -> tuple[list, list]:
         Stock.symbol != JSE_INDEX_YF_SYMBOL,
     ).all()
 
+    prices = _get_latest_and_previous_prices(db, [stock.symbol for stock in stocks])
+
     movers = []
     for stock in stocks:
-        latest = db.query(StockPrice).filter(
-            StockPrice.symbol == stock.symbol
-        ).order_by(StockPrice.timestamp.desc()).first()
+        latest, prev = prices.get(stock.symbol, (None, None))
 
         if not latest:
             continue
-
-        prev = _get_previous_day_price(db, stock.symbol, latest.timestamp)
 
         if not prev or not prev.close_price:
             continue

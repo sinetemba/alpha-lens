@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean
-from datetime import datetime
+from datetime import datetime, timezone
 from .base import Base
 
 
@@ -28,7 +28,7 @@ class Notification(Base):
     is_read = Column(Boolean, default=False)
     read_at = Column(DateTime)
     
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
     def __repr__(self):
         return f"<Notification(type='{self.type}', title='{self.title[:50]}...', is_sent={self.is_sent})>"

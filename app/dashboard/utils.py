@@ -107,6 +107,8 @@ def render_market_data_refresh_control(
                 data_service = DataService(db)
                 updated_prices = data_service.update_stock_prices(symbol_list)
                 new_articles = data_service.collect_news() if include_news else 0
+            if data_service.quota_message:
+                st.warning(data_service.quota_message)
             if manual_refresh:
                 status = f"Updated prices for {updated_prices} symbol{'s' if updated_prices != 1 else ''}."
                 if include_news:

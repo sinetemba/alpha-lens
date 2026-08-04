@@ -1,5 +1,5 @@
 from typing import List, Dict, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from app.models.news import NewsArticle
 from app.models.stock import Stock
@@ -49,7 +49,7 @@ class NewsScraper:
                 summary=article_data["summary"],
                 url=article_data["url"],
                 source=article_data["source"],
-                published_at=article_data["published_at"] or datetime.utcnow(),
+                published_at=article_data["published_at"] or datetime.now(timezone.utc),
                 stock_symbol=stock_symbol,
             )
             
@@ -85,7 +85,7 @@ class NewsScraper:
     def get_recent_news(self, days: int = 7, symbol: Optional[str] = None) -> List[NewsArticle]:
         """Get recent news articles."""
         query = self.db.query(NewsArticle).filter(
-            NewsArticle.published_at >= datetime.utcnow() - timedelta(days=days)
+            NewsArticle.published_at >= datetime.now(timezone.utc) - timedelta(days=days)
         )
         
         if symbol:
@@ -101,7 +101,7 @@ class NewsScraper:
     
     def clean_old_articles(self, days: int = 90) -> int:
         """Delete articles older than specified days."""
-        cutoff_date = datetime.utcnow() - timedelta(days=days)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
         
         deleted = self.db.query(NewsArticle).filter(
             NewsArticle.published_at < cutoff_date
