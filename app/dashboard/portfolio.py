@@ -84,6 +84,12 @@ def show_portfolio(db: Session):
                 _update_holding_values(db, holding)
     _update_portfolio_totals(db, portfolio, holdings)
 
+    # Pull Funds to Invest per EasyEquities account
+    account_funds: dict[str, float] = {}
+    if collector.enabled:
+        account_funds = collector.get_funds_to_invest_by_account() or {}
+        st.session_state["ee_last_funds_raw"] = getattr(collector, "_last_funds_raw", {})
+
     # Portfolio summary
     total_purchase_value = sum(holding.quantity * holding.purchase_price for holding in holdings)
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -223,10 +229,10 @@ def show_portfolio(db: Session):
 
     # Render a table for each account type
     for account_type, group_holdings in account_groups.items():
-        _render_holdings_table(db, account_type, group_holdings)
+        _render_holdings_table(db, account_type, group_holdings, account_funds.get(account_type))
     
     st.markdown("---")
-    _render_easyequities_debug(collector, portfolio, holdings)
+    _render_easyequities_debug(collector, portfolio, holdings, account_funds)
     
     st.markdown("---")
     
@@ -283,7 +289,9 @@ def _get_group_latest_and_previous_prices(
     return result
 
 
-def _render_holdings_table(db: Session, account_type: str, holdings: list) -> None:
+def _render_holdings_table(
+    db: Session, account_type: str, holdings: list, funds_to_invest: float | None = None
+) -> None:
     """Render a single holdings table section for the given account type."""
     st.subheader(f"{account_type} Holdings")
 
@@ -328,6 +336,9 @@ def _render_holdings_table(db: Session, account_type: str, holdings: list) -> No
     if not data:
         st.info(f"No holdings in {account_type} account.")
         return
+
+    if funds_to_invest is not None:
+        st.metric("Funds to Invest", f"R {funds_to_invest:,.2f}")
 
     holdings_table = pd.DataFrame(data)
     available_columns = [c for c in holdings_table.columns if c != "_gain_loss"]
@@ -410,13 +421,19 @@ def _update_easyequities_sync_caption(sync_caption, portfolio: Portfolio) -> Non
 
 
 def _render_easyequities_debug(
-    collector: EasyEquitiesCollector, portfolio: Portfolio, holdings: list
+    collector: EasyEquitiesCollector,
+    portfolio: Portfolio,
+    holdings: list,
+    account_funds: dict[str, float] | None = None,
 ) -> None:
     """Show raw EasyEquities holdings and why each one is included/excluded."""
     if not collector.enabled:
         return
 
     with st.expander("Debug EasyEquities sync"):
+        if collector.last_error:
+            st.error(f"EasyEquities last error: {collector.last_error}")
+
         raw = st.session_state.get("ee_last_raw_holdings")
         if not raw:
             if st.button("Load raw EasyEquities data"):
@@ -430,7 +447,7 @@ def _render_easyequities_debug(
         raw_total = 0.0
         filtered_total = 0.0
         filtered_count = 0
-        for h in raw:
+        for idx, h in enumerate(raw, start=1):
             current_value = h.get("current_value") or 0.0
             raw_total += current_value
             symbol = h.get("symbol", "")
@@ -450,6 +467,7 @@ def _render_easyequities_debug(
                 filtered_count += 1
 
             rows.append({
+                "#": idx,
                 "Symbol": symbol or "N/A",
                 "Name": h.get("name", ""),
                 "Account": account,
@@ -470,6 +488,15 @@ def _render_easyequities_debug(
         c4.metric("Raw holdings count", len(raw))
         c5.metric("Filtered holdings count", filtered_count)
         c6.metric("App holdings count", len(holdings))
+
+        if account_funds:
+            st.subheader("Funds to Invest by Account")
+            st.write(account_funds)
+
+        raw_funds = st.session_state.get("ee_last_funds_raw")
+        if raw_funds:
+            st.subheader("Raw Funds Valuations")
+            st.json(raw_funds)
 
         if st.button("Clear debug data"):
             st.session_state.pop("ee_last_raw_holdings", None)
