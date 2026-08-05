@@ -14,6 +14,14 @@ EXCLUDED_PORTFOLIO_SYMBOLS = {"SZK"}
 EXCLUDED_ACCOUNT_TYPES = {"Demo ZAR"}
 
 
+def _normalize_account_type(account_type: str | None) -> str:
+    """Strip the 'EasyEquities ' prefix and whitespace so account names
+    align with the portfolio's account_type values (e.g. 'ZAR', 'TFSA')."""
+    if not account_type:
+        return "ZAR"
+    return account_type.strip().replace("EasyEquities ", "")
+
+
 def show_portfolio(db: Session):
     """Display the portfolio page."""
     st.header("💼 Portfolio")
@@ -544,7 +552,7 @@ def _sync_portfolio_from_easyequities(
     seen_account_types = set()
     for ee_holding in ee_holdings:
         symbol = ee_holding["symbol"]
-        account_name = ee_holding.get("account_name", "ZAR")
+        account_name = _normalize_account_type(ee_holding.get("account_name"))
         if account_name not in EXCLUDED_ACCOUNT_TYPES:
             seen_account_types.add(account_name)
         if (
@@ -634,7 +642,7 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
 def _sync_holding_from_easyequities(db: Session, portfolio_id: int, ee_holding: dict):
     """Create or update a holding from parsed EasyEquities data."""
     symbol = ee_holding["symbol"]
-    account_type = ee_holding.get("account_name", "ZAR")
+    account_type = _normalize_account_type(ee_holding.get("account_name"))
     if (
         not symbol
         or symbol in EXCLUDED_PORTFOLIO_SYMBOLS

@@ -97,7 +97,7 @@ def _render_home(db: Session):
         key="home_market_data_refresh",
         symbols=refresh_symbols,
         include_news=True,
-        auto_refresh=True,
+        auto_refresh=False,
     )
     # Get latest market data
     col1, col2, col3, col4 = st.columns(4)

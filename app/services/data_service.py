@@ -1,4 +1,5 @@
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
 from app.models.dividend import Dividend
@@ -67,33 +68,44 @@ class DataService:
             stocks = self.db.query(Stock).filter(Stock.is_active == True).all()
             symbols = [stock.symbol for stock in stocks]
         
+        def _fetch(symbol: str) -> tuple[str, Optional[Dict], Optional[pd.DataFrame]]:
+            """Fetch a symbol's price from external sources without touching the DB."""
+            try:
+                quote = self.twelve_data.get_quote(symbol)
+                if quote:
+                    return symbol, quote, None
+
+                logger.warning(f"Twelve Data failed for {symbol}, trying Yahoo Finance")
+                hist = self.yfinance.get_history(symbol, period="1d", interval="1d")
+                return symbol, None, hist
+            except Exception as e:
+                logger.error(f"Error fetching price for {symbol}: {e}")
+                return symbol, None, None
+        
         updated_count = 0
         
-        for symbol in symbols:
+        # Fetch prices concurrently; saving stays serial on the main thread so the
+        # SQLAlchemy session is not shared across threads.
+        max_workers = min(len(symbols), 8) if symbols else 1
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(_fetch, symbols))
+        
+        for symbol, quote, hist in results:
             try:
-                # Try Twelve Data first
-                quote = self.twelve_data.get_quote(symbol)
-                
                 if quote:
                     self._save_price_from_quote(symbol, quote)
                     updated_count += 1
                     logger.info(f"Updated price for {symbol} using Twelve Data")
                     self._update_technical_indicators(symbol)
+                elif hist is not None and not hist.empty:
+                    self._save_price_from_history(symbol, hist)
+                    updated_count += 1
+                    logger.info(f"Updated price for {symbol} using Yahoo Finance")
+                    self._update_technical_indicators(symbol)
                 else:
-                    # Fallback to Yahoo Finance
-                    logger.warning(f"Twelve Data failed for {symbol}, trying Yahoo Finance")
-                    hist = self.yfinance.get_history(symbol, period="1d", interval="1d")
-
-                    if hist is not None and not hist.empty:
-                        self._save_price_from_history(symbol, hist)
-                        updated_count += 1
-                        logger.info(f"Updated price for {symbol} using Yahoo Finance")
-                        self._update_technical_indicators(symbol)
-                    else:
-                        logger.error(f"Failed to get price for {symbol} from both sources")
-            
+                    logger.error(f"Failed to get price for {symbol} from both sources")
             except Exception as e:
-                logger.error(f"Error updating price for {symbol}: {e}")
+                logger.error(f"Error saving price for {symbol}: {e}")
         
         self.db.commit()
         logger.info(f"Updated prices for {updated_count} symbols")
