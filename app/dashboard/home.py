@@ -370,11 +370,13 @@ def _get_daily_movers(db: Session, limit: int = 10) -> tuple[list, list]:
             [{
                 "Symbol": format_stock_label(m["Symbol"], m.get("Name")),
                 "Price": m["Price"],
+                "Move": m["Move"],
                 "Change": m["Change"],
             } for m in winners[:limit]],
             [{
                 "Symbol": format_stock_label(m["Symbol"], m.get("Name")),
                 "Price": m["Price"],
+                "Move": m["Move"],
                 "Change": m["Change"],
             } for m in losers[:limit]],
         )
@@ -397,10 +399,12 @@ def _get_daily_movers(db: Session, limit: int = 10) -> tuple[list, list]:
         if not prev or not prev.close_price:
             continue
 
-        change_pct = ((latest.close_price - prev.close_price) / prev.close_price) * 100
+        price_move = latest.close_price - prev.close_price
+        change_pct = (price_move / prev.close_price) * 100
         movers.append({
             "Symbol": format_stock_label(stock.symbol, stock.name),
             "Price": f"R {latest.close_price:.2f}",
+            "Move": f"{price_move:,.2f}",
             "Change": f"{change_pct:+.2f}%",
             "_change_pct": change_pct,
         })
@@ -423,7 +427,7 @@ def _render_top_movers(db: Session):
         st.markdown("**🟢 Top 10 Winners**")
         if winners:
             st.dataframe(
-                [{"Symbol": m["Symbol"], "Price": m["Price"], "Change": m["Change"]} for m in winners],
+                [{"Symbol": m["Symbol"], "Price": m["Price"], "Move": m["Move"], "Change": m["Change"]} for m in winners],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -434,7 +438,7 @@ def _render_top_movers(db: Session):
         st.markdown("**🔴 Top 10 Losers**")
         if losers:
             st.dataframe(
-                [{"Symbol": m["Symbol"], "Price": m["Price"], "Change": m["Change"]} for m in losers],
+                [{"Symbol": m["Symbol"], "Price": m["Price"], "Move": m["Move"], "Change": m["Change"]} for m in losers],
                 use_container_width=True,
                 hide_index=True,
             )
