@@ -1,22 +1,56 @@
 import streamlit as st
-import plotly.graph_objects as go
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from sqlalchemy import and_, func, or_
-from sqlalchemy.orm import joinedload, Session
+from sqlalchemy.orm import Session
 from app.models.base import SessionLocal
 from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
-from app.models.watchlist import WatchlistItem
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.config.settings import settings
 from app.collectors.moneyweb import MoneywebCollector
-from app.dashboard.utils import format_stock_label, PriceSnapshot, render_market_data_refresh_control
+from app.dashboard.utils import (
+    format_stock_label,
+    PriceSnapshot,
+    get_latest_market_data_timestamp,
+    get_latest_news_timestamp,
+    format_market_data_age,
+    format_news_age,
+)
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
+from app.services.data_service import DataService
 from loguru import logger
 
 # Yahoo Finance symbol for the JSE All Share Index (J203)
 JSE_INDEX_YF_SYMBOL = "^J203.JO"
+
+# Thread pool for non-blocking home page price/news refreshes.
+_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="home_market_refresh_")
+
+
+def _run_refresh(symbols: list[str], fetch_news: bool) -> None:
+    """Background refresh of prices and, if allowed, news."""
+    db = SessionLocal()
+    try:
+        data_service = DataService(db)
+        data_service.update_stock_prices(symbols)
+        if fetch_news:
+            data_service.collect_news()
+        logger.info(f"Background refresh completed for {len(symbols)} symbols")
+    except Exception as e:
+        logger.error(f"Background refresh failed: {e}")
+    finally:
+        db.close()
+
+
+def _should_fetch_news(db: Session) -> bool:
+    """Only fetch news if it has not already been fetched today."""
+    latest = get_latest_news_timestamp(db)
+    if latest is None:
+        return True
+    latest = latest if latest.tzinfo else latest.replace(tzinfo=timezone.utc)
+    return latest.date() < datetime.now(timezone.utc).date()
 
 
 def show_home():
@@ -27,22 +61,22 @@ def show_home():
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    
+
     header_col, source_col = st.columns([4, 1])
     with header_col:
         st.title("JSE Stock Analysis Platform")
     with source_col:
         st.markdown(
             "<p style='text-align: right; font-size: small; color: #888; margin: 0;'>"
-            "Data: Yahoo Finance, Twelve Data, EasyEquities, JSE"
+            "Data: Moneyweb (top movers), Twelve Data, Yahoo Finance"
             "</p>",
             unsafe_allow_html=True,
         )
     st.markdown("---")
-    
+
     # Initialize database session
     db = SessionLocal()
-    
+
     try:
         # Sidebar navigation
         page = st.sidebar.radio(
@@ -72,7 +106,7 @@ def show_home():
             elif page == "Krugerrands":
                 from .krugerrands import show_krugerrands
                 show_krugerrands(db)
-    
+
     finally:
         db.close()
 
@@ -84,33 +118,25 @@ def _render_home(db: Session):
         db.add(Stock(symbol=JSE_INDEX_YF_SYMBOL, name="JSE All Share Index"))
         db.commit()
 
-    watchlist_symbols = [
-        item.symbol for item in db.query(WatchlistItem).filter(WatchlistItem.is_active == True).all()
-    ]
     portfolio_symbols = [
         h.symbol for h in db.query(PortfolioHolding).filter(
             ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
         ).all()
     ]
-    refresh_symbols = sorted(set(watchlist_symbols + portfolio_symbols + [JSE_INDEX_YF_SYMBOL]))
+    refresh_symbols = sorted(set(portfolio_symbols + [JSE_INDEX_YF_SYMBOL]))
 
-    render_market_data_refresh_control(
-        db,
-        key="home_market_data_refresh",
-        symbols=refresh_symbols,
-        include_news=True,
-        auto_refresh=False,
-    )
+    _render_home_refresh_control(db, refresh_symbols)
+
     # Get latest market data
-    col1, col2, col3, col4 = st.columns(4)
-    
+    col1, col2, col3 = st.columns(3)
+
     with col1:
         st.metric(
             label="JSE Index",
             value=_get_jse_index(db),
             delta=_get_jse_change(db)
         )
-    
+
     with col2:
         portfolio_value = _get_portfolio_value(db)
         st.metric(
@@ -118,48 +144,42 @@ def _render_home(db: Session):
             value=f"R {portfolio_value:,.2f}",
             delta=_get_portfolio_change(db)
         )
-    
+
     with col3:
         st.metric(
             label="Daily Gain",
             value=f"R {_get_daily_gain(db):,.2f}",
             delta=_get_daily_gain_percentage(db)
         )
-    
-    with col4:
-        watchlist_count = db.query(WatchlistItem).filter(
-            WatchlistItem.is_active == True
-        ).count()
-        st.metric(
-            label="Watchlist Items",
-            value=watchlist_count,
-            delta="Stocks tracked"
-        )
-    
+
     st.markdown("---")
-    
+
     # Top movers for the day
     st.subheader("🚀 Top Movers Today")
     _render_top_movers(db)
 
     st.markdown("---")
 
-    # Two-column layout
-    col_left, col_right = st.columns([2, 1])
+    # Market news
+    st.subheader("📰 Market News")
+    _render_news_feed(db)
 
-    with col_left:
-        st.subheader("📊 Watchlist Summary")
-        _render_watchlist_summary(db)
 
-    with col_right:
-        st.subheader("📰 Market News")
-        _render_news_feed(db)
+def _render_home_refresh_control(db: Session, symbols: list[str]) -> None:
+    """Render a non-blocking refresh control with last fetch times."""
+    latest_price_ts = get_latest_market_data_timestamp(db, symbols)
+    latest_news_ts = get_latest_news_timestamp(db)
+    fetch_news = _should_fetch_news(db)
 
-    st.markdown("---")
-    
-    # Recent performance chart
-    st.subheader("📈 Recent Market Performance")
-    _render_performance_chart(db)
+    _, refresh_col = st.columns([3, 1])
+    with refresh_col:
+        if st.button("🔄 Refresh Prices", key="home_market_data_refresh"):
+            _REFRESH_EXECUTOR.submit(_run_refresh, symbols, fetch_news)
+            st.info("Refresh started in the background; data will appear on the next page load.")
+
+        price_age = format_market_data_age(latest_price_ts)
+        news_age = format_news_age(latest_news_ts)
+        st.caption(f"{price_age} | {news_age}")
 
 
 @st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
@@ -252,41 +272,6 @@ def _get_daily_gain_percentage(db: Session) -> str:
     return "0.0%"
 
 
-def _render_watchlist_summary(db: Session):
-    """Render watchlist summary table."""
-    watchlist_items = db.query(WatchlistItem).filter(
-        WatchlistItem.is_active == True
-    ).all()
-    
-    if not watchlist_items:
-        st.info("No stocks in watchlist. Add stocks to track them.")
-        return
-    
-    # Get latest prices for watchlist items
-    prices = _get_latest_and_previous_prices(db, [item.symbol for item in watchlist_items])
-    data = []
-    for item in watchlist_items:
-        latest_price, prev_price = prices.get(item.symbol, (None, None))
-
-        if latest_price:
-            if prev_price:
-                change = ((latest_price.close_price - prev_price.close_price) / prev_price.close_price) * 100
-            else:
-                change = 0.0
-            
-            data.append({
-                "Symbol": format_stock_label(item.symbol, item.stock.name if item.stock else None),
-                "Price": f"R {latest_price.close_price:.2f}",
-                "Change": f"{change:+.2f}%",
-                "Volume": f"{latest_price.volume:,}" if latest_price.volume else "N/A"
-            })
-    
-    if data:
-        st.dataframe(data, use_container_width=True)
-    else:
-        st.warning("No price data available for watchlist items.")
-
-
 @st.cache_data(
     ttl=60,
     show_spinner=False,
@@ -360,7 +345,7 @@ def _get_latest_and_previous_prices(
 
 @st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
 def _get_daily_movers(db: Session, limit: int = 10) -> tuple[list, list]:
-    """Return the top daily winners and losers from Moneyweb, falling back to locally stored prices."""
+    """Return the top daily winners and losers from Moneyweb (always used, no fallback)."""
     collector = MoneywebCollector()
     result = collector.get_winners_and_losers()
 
@@ -381,40 +366,7 @@ def _get_daily_movers(db: Session, limit: int = 10) -> tuple[list, list]:
             } for m in losers[:limit]],
         )
 
-    # Fallback: compute from the local stock_prices table
-    stocks = db.query(Stock).filter(
-        Stock.is_active == True,
-        Stock.symbol != JSE_INDEX_YF_SYMBOL,
-    ).all()
-
-    prices = _get_latest_and_previous_prices(db, [stock.symbol for stock in stocks])
-
-    movers = []
-    for stock in stocks:
-        latest, prev = prices.get(stock.symbol, (None, None))
-
-        if not latest:
-            continue
-
-        if not prev or not prev.close_price:
-            continue
-
-        price_move = latest.close_price - prev.close_price
-        change_pct = (price_move / prev.close_price) * 100
-        movers.append({
-            "Symbol": format_stock_label(stock.symbol, stock.name),
-            "Price": latest.close_price,
-            "Move": price_move,
-            "Change": change_pct,
-            "_change_pct": change_pct,
-        })
-
-    movers.sort(key=lambda m: m["_change_pct"], reverse=True)
-    winners = [m for m in movers if m["_change_pct"] > 0][:limit]
-    losers = sorted(
-        [m for m in movers if m["_change_pct"] < 0], key=lambda m: m["_change_pct"]
-    )[:limit]
-    return winners, losers
+    return [], []
 
 
 def _render_top_movers(db: Session):
@@ -439,7 +391,7 @@ def _render_top_movers(db: Session):
                 column_config=column_config,
             )
         else:
-            st.info("No winners found. Try refreshing market data.")
+            st.info("No winners from Moneyweb. Check Moneyweb credentials or try again later.")
 
     with col_losers:
         st.markdown("**🔴 Top 10 Losers**")
@@ -451,7 +403,7 @@ def _render_top_movers(db: Session):
                 column_config=column_config,
             )
         else:
-            st.info("No losers found. Try refreshing market data.")
+            st.info("No losers from Moneyweb. Check Moneyweb credentials or try again later.")
 
 
 def _render_news_feed(db: Session):
@@ -459,84 +411,13 @@ def _render_news_feed(db: Session):
     recent_news = db.query(NewsArticle).order_by(
         NewsArticle.published_at.desc()
     ).limit(10).all()
-    
+
     if not recent_news:
         st.info("No recent news available.")
         return
-    
+
     for article in recent_news:
         with st.expander(f"**{article.title}** - {article.source}"):
             st.markdown(f"*Published: {article.published_at.strftime('%Y-%m-%d %H:%M')}*")
             st.markdown(article.summary)
             st.markdown(f"[Read more]({article.url})")
-
-
-@st.cache_data(
-    ttl=60,
-    show_spinner=False,
-    hash_funcs={
-        Session: lambda db: id(db.bind),
-        list: lambda x: hash(tuple(sorted(x))),
-    },
-)
-def _get_performance_chart_data(
-    db: Session, symbols: list[str]
-) -> dict[str, list[PriceSnapshot]]:
-    """Batch-fetch 30-day price history for the requested symbols."""
-    start = datetime.now(timezone.utc) - timedelta(days=30)
-    rows = db.query(
-        StockPrice.symbol,
-        StockPrice.timestamp,
-        StockPrice.close_price,
-    ).filter(
-        StockPrice.symbol.in_(symbols),
-        StockPrice.timestamp >= start,
-    ).order_by(StockPrice.symbol, StockPrice.timestamp.asc()).all()
-
-    data: dict[str, list[PriceSnapshot]] = {}
-    for row in rows:
-        data.setdefault(row.symbol, []).append(
-            PriceSnapshot(
-                close_price=row.close_price,
-                timestamp=row.timestamp,
-                volume=None,
-            )
-        )
-    return data
-
-
-def _render_performance_chart(db: Session):
-    """Render performance chart for watchlist stocks."""
-    watchlist_items = db.query(WatchlistItem).options(
-        joinedload(WatchlistItem.stock)
-    ).filter(
-        WatchlistItem.is_active == True
-    ).limit(5).all()
-
-    if not watchlist_items:
-        st.info("Add stocks to watchlist to see performance charts.")
-        return
-
-    chart_data = _get_performance_chart_data(db, [item.symbol for item in watchlist_items])
-
-    fig = go.Figure()
-
-    for item in watchlist_items:
-        prices = chart_data.get(item.symbol, [])
-        if prices:
-            fig.add_trace(go.Scatter(
-                x=[p.timestamp for p in prices],
-                y=[p.close_price for p in prices],
-                name=format_stock_label(item.symbol, item.stock.name if item.stock else None),
-                mode='lines'
-            ))
-
-    fig.update_layout(
-        title="30-Day Price Performance",
-        xaxis_title="Date",
-        yaxis_title="Price (ZAR)",
-        hovermode='x unified',
-        height=400
-    )
-
-    st.plotly_chart(fig, use_container_width=True)

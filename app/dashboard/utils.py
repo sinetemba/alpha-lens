@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy.orm import Session
 from app.config.settings import settings
+from app.models.news import NewsArticle
 from app.models.stock import StockPrice
 from app.services.data_service import DataService
 
@@ -97,6 +98,36 @@ def format_market_data_age(timestamp: Optional[datetime]) -> str:
         age_label = f"{minutes} minute{'s' if minutes != 1 else ''} ago"
 
     return f"Last market data: {display_timestamp.strftime('%d %b %Y %H:%M')} ({age_label})"
+
+
+def get_latest_news_timestamp(db: Session) -> Optional[datetime]:
+    """Return the most recent news fetch time (from created_at)."""
+    latest = (
+        db.query(NewsArticle.created_at)
+        .order_by(NewsArticle.created_at.desc())
+        .first()
+    )
+    return latest[0] if latest else None
+
+
+def format_news_age(timestamp: Optional[datetime]) -> str:
+    """Format the age of the latest news fetch for display."""
+    if timestamp is None:
+        return "No news has been fetched yet."
+
+    timestamp = _ensure_aware(timestamp)
+    display_timestamp = _to_display_tz(timestamp)
+    age = max(datetime.now(timezone.utc) - timestamp, timedelta(0))
+    if age.days:
+        age_label = f"{age.days} day{'s' if age.days != 1 else ''} ago"
+    elif age.seconds >= 3600:
+        hours = age.seconds // 3600
+        age_label = f"{hours} hour{'s' if hours != 1 else ''} ago"
+    else:
+        minutes = age.seconds // 60
+        age_label = f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+
+    return f"Last news fetch: {display_timestamp.strftime('%d %b %Y %H:%M')} ({age_label})"
 
 
 def render_market_data_refresh_control(
