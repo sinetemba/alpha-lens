@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import streamlit as st
 from app.dashboard.home import show_home
 from app.database.init_db import init_database
+from app.models.base import Base, engine
 from app.services.scheduler import SchedulerService
 from app.config.settings import settings
 from loguru import logger
@@ -37,6 +38,15 @@ try:
     logger.info("Database initialized successfully")
 except Exception as e:
     logger.error(f"Error initializing database: {e}")
+
+# Ensure any new tables introduced by model updates are created, even when the
+# cached init above has not re-run (e.g. after a code change while the app is up).
+# This is a lightweight no-op when tables already exist.
+try:
+    Base.metadata.create_all(bind=engine, checkfirst=True)
+    logger.info("Ensured all database tables exist")
+except Exception as e:
+    logger.error(f"Error ensuring database tables: {e}")
 
 # Start background scheduler (in production, this would run in a separate process)
 # st.cache_resource keeps this to a single instance across Streamlit reruns,
