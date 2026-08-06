@@ -25,6 +25,17 @@ from loguru import logger
 # Yahoo Finance symbol for the JSE All Share Index (J203)
 JSE_INDEX_YF_SYMBOL = "^J203.JO"
 
+# Data sources shown per page in the top-right header.
+PAGE_DATA_SOURCES = {
+    "Home": "Moneyweb (top movers), Twelve Data, Yahoo Finance",
+    "Watchlist": "Twelve Data, Yahoo Finance",
+    "Portfolio": "EasyEquities, Twelve Data, Yahoo Finance",
+    "Dividends": "Yahoo Finance, Moneyweb",
+    "Company View": "Twelve Data, Yahoo Finance",
+    "Commodities": "Metals.dev, Yahoo Finance",
+    "Krugerrands": "GoldAPI",
+}
+
 # Thread pool for non-blocking home page price/news refreshes.
 _REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="home_market_refresh_")
 
@@ -62,18 +73,6 @@ def show_home():
         initial_sidebar_state="expanded"
     )
 
-    header_col, source_col = st.columns([4, 1])
-    with header_col:
-        st.title("JSE Stock Analysis Platform")
-    with source_col:
-        st.markdown(
-            "<p style='text-align: right; font-size: small; color: #888; margin: 0;'>"
-            "Data: Moneyweb (top movers), Twelve Data, Yahoo Finance"
-            "</p>",
-            unsafe_allow_html=True,
-        )
-    st.markdown("---")
-
     # Initialize database session
     db = SessionLocal()
 
@@ -84,6 +83,20 @@ def show_home():
             ["Home", "Watchlist", "Portfolio", "Dividends", "Company View", "Commodities", "Krugerrands"],
             index=0
         )
+
+        # Page-specific header with data sources
+        data_source = PAGE_DATA_SOURCES.get(page, "Multiple sources")
+        header_col, source_col = st.columns([4, 1])
+        with header_col:
+            st.title("JSE Stock Analysis Platform")
+        with source_col:
+            st.markdown(
+                f"<p style='text-align: right; font-size: small; color: #888; margin: 0;'>"
+                f"Data: {data_source}"
+                f"</p>",
+                unsafe_allow_html=True,
+            )
+        st.markdown("---")
 
         with st.spinner("Loading page..."):
             if page == "Home":
