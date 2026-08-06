@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     easyequities_username: str = Field(default="", alias="EASYEQUITIES_USERNAME")
     easyequities_password: str = Field(default="", alias="EASYEQUITIES_PASSWORD")
 
+    # Moneyweb (credentials for scraping subscriber-only data)
+    moneyweb_username: str = Field(default="", alias="MONEYWEB_USERNAME")
+    moneyweb_password: str = Field(default="", alias="MONEYWEB_PASSWORD")
+
     # Financial Modeling Prep API
     fmp_api_key: str = Field(default="", alias="FMP_API_KEY")
     fmp_base_url: str = Field(default="https://financialmodelingprep.com/api/v3", alias="FMP_BASE_URL")

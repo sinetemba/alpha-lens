@@ -1,0 +1,143 @@
+import time
+from typing import Any, Dict, List, Optional
+import requests
+from bs4 import BeautifulSoup
+from app.config.settings import settings
+from loguru import logger
+
+
+class MoneywebCollector:
+    """Collector for scraping authenticated Moneyweb data pages.
+
+    Moneyweb does not expose an official API for subscriber-only data, so this
+    logs in through the public WordPress /wp-login.php form and reuses the
+    resulting session cookie for subsequent requests.
+    """
+
+    def __init__(self, max_retries: int = 3, base_delay: float = 1.0):
+        self.username = settings.moneyweb_username
+        self.password = settings.moneyweb_password
+        self.enabled = bool(self.username and self.password)
+        self.last_error: Optional[str] = None
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self._session: Optional[requests.Session] = None
+        self._authenticated = False
+
+    def _get_session(self) -> requests.Session:
+        """Return a reusable requests Session."""
+        if self._session is not None:
+            return self._session
+
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.5",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        })
+        self._session = s
+        return s
+
+    def _call_with_retry(self, label: str, fn) -> Optional[Any]:
+        """Run a callable with exponential-backoff retries."""
+        last_exception: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                result = fn()
+                if attempt > 1:
+                    logger.info(f"{label} succeeded on attempt {attempt}")
+                self.last_error = None
+                return result
+            except Exception as e:
+                last_exception = e
+                logger.warning(f"{label} failed on attempt {attempt}: {e}")
+                if attempt < self.max_retries:
+                    sleep_seconds = self.base_delay * (2 ** (attempt - 1))
+                    logger.info(f"Retrying {label} in {sleep_seconds:.1f}s")
+                    time.sleep(sleep_seconds)
+
+        self.last_error = str(last_exception) if last_exception else "unknown error"
+        logger.error(f"{label} failed after {self.max_retries} attempts")
+        return None
+
+    def _login(self) -> bool:
+        """Log in to Moneyweb and store the authenticated session."""
+        if not self.enabled:
+            logger.warning("Moneyweb credentials not configured")
+            return False
+
+        if self._authenticated:
+            return True
+
+        def _do_login():
+            s = self._get_session()
+            login_url = "https://www.moneyweb.co.za/wp-login.php"
+
+            # Hit the login page first so the WordPress test cookie is set.
+            s.get(login_url, timeout=20)
+
+            data = {
+                "log": self.username,
+                "pwd": self.password,
+                "wp-submit": "Log In",
+                "redirect_to": "https://www.moneyweb.co.za/wp-admin/",
+                "testcookie": "1",
+                "rememberme": "forever",
+            }
+            r = s.post(login_url, data=data, timeout=20, allow_redirects=False)
+
+            # WordPress returns a 302 redirect on successful login.
+            if r.status_code in (302, 303):
+                self._authenticated = True
+                return True
+
+            text = r.text.lower()
+            if "login_error" in text or "invalid" in text or "incorrect" in text:
+                raise Exception("Login failed: invalid credentials")
+            if r.status_code >= 400:
+                raise Exception(f"Login failed with HTTP {r.status_code}")
+            raise Exception("Login failed: unexpected response")
+
+        return bool(self._call_with_retry("Moneyweb login", _do_login))
+
+    def get_dividend_watch(self) -> Optional[List[Dict[str, Any]]]:
+        """Return the authenticated Dividend Watch table as a list of dicts."""
+        if not self._login():
+            return None
+
+        def _do_fetch():
+            s = self._get_session()
+            url = "https://www.moneyweb.co.za/tools-and-data/dividend-watch/"
+            r = s.get(url, timeout=30)
+            r.raise_for_status()
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            table = soup.find("table", {"id": "dividend-watch-table"})
+            if not table:
+                raise Exception("Dividend watch table not found in page")
+
+            thead = table.find("thead")
+            tbody = table.find("tbody")
+            if not thead or not tbody:
+                raise Exception("Dividend watch table missing thead/tbody")
+
+            headers = [th.get_text(strip=True) for th in thead.find_all("th")]
+            rows = []
+            for tr in tbody.find_all("tr"):
+                cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if not cells or not any(cells):
+                    continue
+                row = {h: v for h, v in zip(headers, cells) if h}
+                rows.append(row)
+
+            return rows
+
+        return self._call_with_retry("Moneyweb dividend watch", _do_fetch)
