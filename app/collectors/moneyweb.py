@@ -1,8 +1,11 @@
 import time
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 import requests
 from bs4 import BeautifulSoup
+from sqlalchemy.orm import Session
 from app.config.settings import settings
+from app.models.dividend import MoneywebDividendWatch
 from loguru import logger
 
 
@@ -141,3 +144,44 @@ class MoneywebCollector:
             return rows
 
         return self._call_with_retry("Moneyweb dividend watch", _do_fetch)
+
+    def save_dividend_watch(self, db: Session) -> int:
+        """Fetch the latest Moneyweb Dividend Watch and persist it to the DB."""
+        rows = self.get_dividend_watch()
+        if rows is None:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        watch_rows = []
+        for row in rows:
+            instrument = str(row.get("Instrument", "")).strip()
+            if not instrument:
+                continue
+
+            watch_rows.append(MoneywebDividendWatch(
+                instrument=instrument,
+                declared_date=self._parse_date(row.get("Declared date")),
+                last_day_to_trade=self._parse_date(row.get("Last day to trade")),
+                pay_date=self._parse_date(row.get("Pay date")),
+                dividend_type=row.get("Type"),
+                value=row.get("Value"),
+                fetched_at=now,
+            ))
+
+        if not watch_rows:
+            return 0
+
+        db.query(MoneywebDividendWatch).delete()
+        db.add_all(watch_rows)
+        db.commit()
+        return len(watch_rows)
+
+    @staticmethod
+    def _parse_date(value: Optional[Any]) -> Optional[date]:
+        """Parse a Moneyweb date string (yyyy/mm/dd) into a Python date."""
+        if not value:
+            return None
+        try:
+            return datetime.strptime(str(value).strip(), "%Y/%m/%d").date()
+        except ValueError:
+            return None

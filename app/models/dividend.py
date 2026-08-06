@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Index
+from sqlalchemy import Column, Integer, String, Float, DateTime, Date, ForeignKey, Index
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 from .base import Base
@@ -34,3 +34,22 @@ class Dividend(Base):
 
     def __repr__(self):
         return f"<Dividend(symbol='{self.symbol}', amount={self.amount}, payment_date='{self.payment_date}')>"
+
+
+class MoneywebDividendWatch(Base):
+    """Snapshot of Moneyweb's authenticated Dividend Watch calendar."""
+
+    __tablename__ = "moneyweb_dividend_watch"
+
+    id = Column(Integer, primary_key=True, index=True)
+    instrument = Column(String(50), nullable=False, index=True)
+    declared_date = Column(Date)
+    last_day_to_trade = Column(Date)
+    pay_date = Column(Date)
+    dividend_type = Column(String(20))
+    value = Column(String(50))
+    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def __repr__(self):
+        return f"<MoneywebDividendWatch(instrument='{self.instrument}', pay_date='{self.pay_date}', value='{self.value}')>"

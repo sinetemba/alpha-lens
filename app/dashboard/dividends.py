@@ -3,10 +3,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime, timezone
 
-from app.models.dividend import Dividend
+from app.models.dividend import Dividend, MoneywebDividendWatch
 from app.models.portfolio import PortfolioHolding
 from app.models.stock import Stock
 from app.services.data_service import DataService
+from app.collectors.moneyweb import MoneywebCollector
 from app.dashboard.utils import format_stock_label
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 
@@ -103,6 +104,47 @@ def show_dividends(db: Session):
         st.dataframe(holdings_data, use_container_width=True)
     else:
         st.info("No holdings found. Add holdings on the Portfolio page first.")
+
+    # Moneyweb Dividend Watch Calendar
+    st.markdown("---")
+    st.subheader("Dividends Watch Calendar")
+
+    if st.button("🌐 Fetch from Moneyweb"):
+        with st.spinner("Pulling dividend watch data from Moneyweb..."):
+            collector = MoneywebCollector()
+            saved = collector.save_dividend_watch(db)
+        if saved > 0:
+            st.success(f"Saved {saved} dividend calendar rows from Moneyweb.")
+        elif collector.last_error:
+            st.warning(f"Could not fetch Moneyweb data: {collector.last_error}")
+        else:
+            st.info("No new Moneyweb dividend data found.")
+        st.rerun()
+
+    moneyweb_rows = db.query(MoneywebDividendWatch).order_by(
+        MoneywebDividendWatch.pay_date
+    ).all()
+
+    if moneyweb_rows:
+        latest = db.query(MoneywebDividendWatch).order_by(
+            MoneywebDividendWatch.fetched_at.desc()
+        ).first()
+        if latest and latest.fetched_at:
+            st.caption(f"Last fetched: {latest.fetched_at.strftime('%Y-%m-%d %H:%M')} UTC")
+
+        data = []
+        for d in moneyweb_rows:
+            data.append({
+                "Instrument": d.instrument,
+                "Declared date": d.declared_date.strftime("%Y/%m/%d") if d.declared_date else "N/A",
+                "Last day to trade": d.last_day_to_trade.strftime("%Y/%m/%d") if d.last_day_to_trade else "N/A",
+                "Pay date": d.pay_date.strftime("%Y/%m/%d") if d.pay_date else "N/A",
+                "Type": d.dividend_type or "N/A",
+                "Value": d.value or "N/A",
+            })
+        st.dataframe(data, use_container_width=True)
+    else:
+        st.info("No Moneyweb Dividend Watch data yet. Click 'Fetch from Moneyweb' to load it.")
 
     # Manual entry
     st.markdown("---")

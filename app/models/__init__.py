@@ -3,7 +3,7 @@ from .stock import Stock, StockPrice
 from .news import NewsArticle
 from .watchlist import WatchlistItem
 from .portfolio import Portfolio, PortfolioHolding
-from .dividend import Dividend
+from .dividend import Dividend, MoneywebDividendWatch
 from .notification import Notification
 
 __all__ = [
@@ -15,5 +15,6 @@ __all__ = [
     "Portfolio",
     "PortfolioHolding",
     "Dividend",
+    "MoneywebDividendWatch",
     "Notification",
 ]
