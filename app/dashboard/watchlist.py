@@ -157,10 +157,45 @@ def show_watchlist(db: Session):
         st.dataframe(styled_table, use_container_width=True, hide_index=True)
     
     st.markdown("---")
+
+    # Edit target / stop loss
+    with st.expander("✏️ Edit Target / Stop Loss"):
+        watchlist_names = {item.symbol: item.stock.name if item.stock else None for item in watchlist_items}
+        symbol_to_edit = st.selectbox(
+            "Select stock",
+            [item.symbol for item in watchlist_items],
+            format_func=lambda s: format_stock_label(s, watchlist_names.get(s)),
+            key="edit_watchlist_symbol",
+        )
+        item_to_edit = next((i for i in watchlist_items if i.symbol == symbol_to_edit), None)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            new_target = st.number_input(
+                "Target Price",
+                min_value=0.0,
+                step=0.01,
+                value=item_to_edit.target_price or 0.0 if item_to_edit else 0.0,
+                key=f"edit_target_{symbol_to_edit}",
+            )
+        with col2:
+            new_stop = st.number_input(
+                "Stop Loss",
+                min_value=0.0,
+                step=0.01,
+                value=item_to_edit.stop_loss or 0.0 if item_to_edit else 0.0,
+                key=f"edit_stop_{symbol_to_edit}",
+            )
+
+        if st.button("Update") and item_to_edit:
+            _edit_watchlist_item(db, item_to_edit.symbol, new_target, new_stop)
+            st.success(f"Updated {item_to_edit.symbol} target/stop loss.")
+            st.rerun()
+
+    st.markdown("---")
     
     # Remove from watchlist
     st.subheader("Remove from Watchlist")
-    watchlist_names = {item.symbol: item.stock.name if item.stock else None for item in watchlist_items}
     symbols_to_remove = st.multiselect(
         "Select stocks to remove",
         [item.symbol for item in watchlist_items],
@@ -224,6 +259,22 @@ def _remove_from_watchlist(db: Session, symbols: list):
     db.query(WatchlistItem).filter(
         WatchlistItem.symbol.in_(symbols)
     ).update({"is_active": False})
+    db.commit()
+
+
+def _edit_watchlist_item(db: Session, symbol: str, target_price: float, stop_loss: float):
+    """Update a watchlist item's target price and stop loss."""
+    item = db.query(WatchlistItem).filter(
+        WatchlistItem.symbol == symbol,
+        WatchlistItem.is_active == True,
+    ).first()
+
+    if not item:
+        logger.warning(f"Cannot edit {symbol}: not in watchlist")
+        return
+
+    item.target_price = target_price if target_price > 0 else None
+    item.stop_loss = stop_loss if stop_loss > 0 else None
     db.commit()
 
 
