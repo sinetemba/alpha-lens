@@ -2,14 +2,15 @@ import streamlit as st
 import plotly.graph_objects as go
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func, or_
+from sqlalchemy.orm import joinedload, Session
 from app.models.base import SessionLocal
 from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
 from app.models.watchlist import WatchlistItem
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.config.settings import settings
-from app.dashboard.utils import format_stock_label, render_market_data_refresh_control
+from app.dashboard.utils import format_stock_label, PriceSnapshot, render_market_data_refresh_control
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 from loguru import logger
 
@@ -160,6 +161,7 @@ def _render_home(db: Session):
     _render_performance_chart(db)
 
 
+@st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
 def _get_jse_index(db: Session) -> str:
     """Get current JSE index value from the database."""
     latest = db.query(StockPrice).filter(
@@ -171,6 +173,7 @@ def _get_jse_index(db: Session) -> str:
     return "N/A"
 
 
+@st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
 def _get_jse_change(db: Session) -> str:
     """Get JSE index daily percentage change."""
     prices = _get_latest_and_previous_prices(db, [JSE_INDEX_YF_SYMBOL])
@@ -283,34 +286,78 @@ def _render_watchlist_summary(db: Session):
         st.warning("No price data available for watchlist items.")
 
 
+@st.cache_data(
+    ttl=60,
+    show_spinner=False,
+    hash_funcs={
+        Session: lambda db: id(db.bind),
+        list: lambda x: hash(tuple(sorted(x))),
+    },
+)
 def _get_latest_and_previous_prices(
     db: Session, symbols: list[str]
-) -> dict[str, tuple[Optional[StockPrice], Optional[StockPrice]]]:
+) -> dict[str, tuple[Optional[PriceSnapshot], Optional[PriceSnapshot]]]:
     """Batch-fetch each symbol's latest price and its most recent prior-day price.
 
-    Replaces per-symbol N+1 query loops (2 queries per symbol) with a single
-    query, grouping and pairing results in memory.
+    Uses a single windowed CTE to pull only the latest and prior-day rows per
+    requested symbol, avoiding full scans and per-symbol N+1 queries.
     """
     if not symbols:
         return {}
 
-    rows = db.query(StockPrice).filter(
-        StockPrice.symbol.in_(symbols)
-    ).order_by(StockPrice.timestamp.desc()).all()
+    ranked = db.query(
+        StockPrice.symbol,
+        StockPrice.timestamp,
+        StockPrice.close_price,
+        StockPrice.volume,
+        StockPrice.rsi,
+        StockPrice.macd,
+        StockPrice.macd_signal,
+        func.dense_rank().over(
+            partition_by=StockPrice.symbol,
+            order_by=func.strftime('%Y-%m-%d', StockPrice.timestamp).desc(),
+        ).label('day_rank'),
+        func.row_number().over(
+            partition_by=[StockPrice.symbol, func.strftime('%Y-%m-%d', StockPrice.timestamp)],
+            order_by=StockPrice.timestamp.desc(),
+        ).label('intra_rank'),
+    ).filter(StockPrice.symbol.in_(symbols)).cte('ranked')
 
-    by_symbol: dict[str, list[StockPrice]] = {}
+    rows = db.query(
+        ranked.c.symbol,
+        ranked.c.timestamp,
+        ranked.c.close_price,
+        ranked.c.volume,
+        ranked.c.rsi,
+        ranked.c.macd,
+        ranked.c.macd_signal,
+        ranked.c.day_rank,
+    ).filter(or_(
+        and_(ranked.c.day_rank == 1, ranked.c.intra_rank == 1),
+        and_(ranked.c.day_rank == 2, ranked.c.intra_rank == 1),
+    )).order_by(ranked.c.symbol, ranked.c.day_rank).all()
+
+    result: dict[str, tuple[Optional[PriceSnapshot], Optional[PriceSnapshot]]] = {}
     for row in rows:
-        by_symbol.setdefault(row.symbol, []).append(row)
-
-    result: dict[str, tuple[Optional[StockPrice], Optional[StockPrice]]] = {}
-    for symbol, prices in by_symbol.items():
-        latest = prices[0]
-        latest_day_start = latest.timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
-        prev = next((p for p in prices if p.timestamp < latest_day_start), None)
-        result[symbol] = (latest, prev)
+        sym = row.symbol
+        latest, prev = result.get(sym, (None, None))
+        snapshot = PriceSnapshot(
+            close_price=row.close_price,
+            timestamp=row.timestamp,
+            volume=row.volume,
+            rsi=row.rsi,
+            macd=row.macd,
+            macd_signal=row.macd_signal,
+        )
+        if row.day_rank == 1:
+            latest = snapshot
+        else:
+            prev = snapshot
+        result[sym] = (latest, prev)
     return result
 
 
+@st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
 def _get_daily_movers(db: Session, limit: int = 5) -> tuple[list, list]:
     """Compute the top daily winners and losers across all tracked JSE stocks.
 
@@ -397,24 +444,58 @@ def _render_news_feed(db: Session):
             st.markdown(f"[Read more]({article.url})")
 
 
+@st.cache_data(
+    ttl=60,
+    show_spinner=False,
+    hash_funcs={
+        Session: lambda db: id(db.bind),
+        list: lambda x: hash(tuple(sorted(x))),
+    },
+)
+def _get_performance_chart_data(
+    db: Session, symbols: list[str]
+) -> dict[str, list[PriceSnapshot]]:
+    """Batch-fetch 30-day price history for the requested symbols."""
+    start = datetime.now(timezone.utc) - timedelta(days=30)
+    rows = db.query(
+        StockPrice.symbol,
+        StockPrice.timestamp,
+        StockPrice.close_price,
+    ).filter(
+        StockPrice.symbol.in_(symbols),
+        StockPrice.timestamp >= start,
+    ).order_by(StockPrice.symbol, StockPrice.timestamp.asc()).all()
+
+    data: dict[str, list[PriceSnapshot]] = {}
+    for row in rows:
+        data.setdefault(row.symbol, []).append(
+            PriceSnapshot(
+                close_price=row.close_price,
+                timestamp=row.timestamp,
+                volume=None,
+            )
+        )
+    return data
+
+
 def _render_performance_chart(db: Session):
     """Render performance chart for watchlist stocks."""
-    watchlist_items = db.query(WatchlistItem).filter(
+    watchlist_items = db.query(WatchlistItem).options(
+        joinedload(WatchlistItem.stock)
+    ).filter(
         WatchlistItem.is_active == True
     ).limit(5).all()
-    
+
     if not watchlist_items:
         st.info("Add stocks to watchlist to see performance charts.")
         return
-    
+
+    chart_data = _get_performance_chart_data(db, [item.symbol for item in watchlist_items])
+
     fig = go.Figure()
-    
+
     for item in watchlist_items:
-        prices = db.query(StockPrice).filter(
-            StockPrice.symbol == item.symbol,
-            StockPrice.timestamp >= datetime.now(timezone.utc) - timedelta(days=30)
-        ).order_by(StockPrice.timestamp.asc()).all()
-        
+        prices = chart_data.get(item.symbol, [])
         if prices:
             fig.add_trace(go.Scatter(
                 x=[p.timestamp for p in prices],
@@ -422,7 +503,7 @@ def _render_performance_chart(db: Session):
                 name=format_stock_label(item.symbol, item.stock.name if item.stock else None),
                 mode='lines'
             ))
-    
+
     fig.update_layout(
         title="30-Day Price Performance",
         xaxis_title="Date",
@@ -430,5 +511,5 @@ def _render_performance_chart(db: Session):
         hovermode='x unified',
         height=400
     )
-    
+
     st.plotly_chart(fig, use_container_width=True)

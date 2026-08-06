@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Optional
+from typing import Iterable, NamedTuple, Optional
 from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
@@ -7,6 +7,16 @@ from sqlalchemy.orm import Session
 from app.config.settings import settings
 from app.models.stock import StockPrice
 from app.services.data_service import DataService
+
+
+class PriceSnapshot(NamedTuple):
+    """Lightweight, hashable price row for cache-friendly lookups."""
+    close_price: float
+    timestamp: datetime
+    volume: Optional[int] = None
+    rsi: Optional[float] = None
+    macd: Optional[float] = None
+    macd_signal: Optional[float] = None
 
 
 def format_stock_label(symbol: str, name: Optional[str] = None) -> str:

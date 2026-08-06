@@ -1,10 +1,17 @@
 from collections import Counter
 import pandas as pd
 import streamlit as st
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_stock_label, style_gain_loss_row, is_market_data_stale, _to_display_tz
+from app.dashboard.utils import (
+    format_stock_label,
+    is_market_data_stale,
+    PriceSnapshot,
+    style_gain_loss_row,
+    _to_display_tz,
+)
 from app.collectors.easyequities import EasyEquitiesCollector
 from datetime import datetime, timedelta, timezone
 from loguru import logger
@@ -36,7 +43,11 @@ def show_portfolio(db: Session):
         db.commit()
         st.info("Created new portfolio. Add holdings below.")
 
-    collector = EasyEquitiesCollector()
+    # Reuse the logged-in EasyEquities collector across Streamlit reruns.
+    if "ee_collector" not in st.session_state:
+        st.session_state["ee_collector"] = EasyEquitiesCollector()
+    collector = st.session_state["ee_collector"]
+
     holdings = db.query(PortfolioHolding).filter(
         PortfolioHolding.portfolio_id == portfolio.id,
         ~PortfolioHolding.symbol.in_(EXCLUDED_PORTFOLIO_SYMBOLS),
@@ -273,27 +284,74 @@ def show_portfolio(db: Session):
                 st.rerun()
 
 
+@st.cache_data(
+    ttl=60,
+    show_spinner=False,
+    hash_funcs={
+        Session: lambda db: id(db.bind),
+        list: lambda x: hash(tuple(sorted(x))),
+    },
+)
 def _get_group_latest_and_previous_prices(
     db: Session, symbols: list[str]
-) -> dict[str, tuple[StockPrice | None, StockPrice | None]]:
-    """Batch-fetch each symbol's latest price and its most recent prior-day price."""
+) -> dict[str, tuple[PriceSnapshot | None, PriceSnapshot | None]]:
+    """Batch-fetch each symbol's latest price and its most recent prior-day price.
+
+    Uses a single windowed CTE to pull only the latest and prior-day rows per
+    requested symbol, avoiding full scans and per-symbol N+1 queries.
+    """
     if not symbols:
         return {}
 
-    rows = db.query(StockPrice).filter(
-        StockPrice.symbol.in_(symbols)
-    ).order_by(StockPrice.timestamp.desc()).all()
+    ranked = db.query(
+        StockPrice.symbol,
+        StockPrice.timestamp,
+        StockPrice.close_price,
+        StockPrice.volume,
+        StockPrice.rsi,
+        StockPrice.macd,
+        StockPrice.macd_signal,
+        func.dense_rank().over(
+            partition_by=StockPrice.symbol,
+            order_by=func.strftime('%Y-%m-%d', StockPrice.timestamp).desc(),
+        ).label('day_rank'),
+        func.row_number().over(
+            partition_by=[StockPrice.symbol, func.strftime('%Y-%m-%d', StockPrice.timestamp)],
+            order_by=StockPrice.timestamp.desc(),
+        ).label('intra_rank'),
+    ).filter(StockPrice.symbol.in_(symbols)).cte('ranked')
 
-    by_symbol: dict[str, list[StockPrice]] = {}
+    rows = db.query(
+        ranked.c.symbol,
+        ranked.c.timestamp,
+        ranked.c.close_price,
+        ranked.c.volume,
+        ranked.c.rsi,
+        ranked.c.macd,
+        ranked.c.macd_signal,
+        ranked.c.day_rank,
+    ).filter(or_(
+        and_(ranked.c.day_rank == 1, ranked.c.intra_rank == 1),
+        and_(ranked.c.day_rank == 2, ranked.c.intra_rank == 1),
+    )).order_by(ranked.c.symbol, ranked.c.day_rank).all()
+
+    result: dict[str, tuple[PriceSnapshot | None, PriceSnapshot | None]] = {}
     for row in rows:
-        by_symbol.setdefault(row.symbol, []).append(row)
-
-    result: dict[str, tuple[StockPrice | None, StockPrice | None]] = {}
-    for symbol, prices in by_symbol.items():
-        latest = prices[0]
-        latest_day_start = latest.timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
-        prev = next((p for p in prices if p.timestamp < latest_day_start), None)
-        result[symbol] = (latest, prev)
+        sym = row.symbol
+        latest, prev = result.get(sym, (None, None))
+        snapshot = PriceSnapshot(
+            close_price=row.close_price,
+            timestamp=row.timestamp,
+            volume=row.volume,
+            rsi=row.rsi,
+            macd=row.macd,
+            macd_signal=row.macd_signal,
+        )
+        if row.day_rank == 1:
+            latest = snapshot
+        else:
+            prev = snapshot
+        result[sym] = (latest, prev)
     return result
 
 

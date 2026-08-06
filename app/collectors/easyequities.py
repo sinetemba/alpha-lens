@@ -37,6 +37,8 @@ class EasyEquitiesCollector:
         self.max_retries = max_retries
         self.base_delay = base_delay
         self._last_funds_raw: Dict[str, Any] = {}
+        self._client: Any | None = None
+        self._client_authenticated = False
 
     def _call_with_retry(self, label: str, fn):
         """Run a callable with exponential-backoff retries.
@@ -66,10 +68,13 @@ class EasyEquitiesCollector:
         return None
 
     def _get_client(self):
-        """Log in and return an authenticated client."""
+        """Return an authenticated client, creating one if necessary."""
         if not self.enabled:
             logger.warning("EasyEquities credentials not configured")
             return None
+
+        if self._client is not None:
+            return self._client
 
         try:
             from easy_equities_client.clients import EasyEquitiesClient
@@ -81,6 +86,8 @@ class EasyEquitiesCollector:
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
+            self._client = client
+            self._client_authenticated = False
             return client
         except Exception as e:
             logger.error(f"Error creating EasyEquities client: {e}")
@@ -88,11 +95,18 @@ class EasyEquitiesCollector:
 
     def _login(self, client) -> bool:
         """Authenticate the client. Returns True on success."""
+        if self._client is client and self._client_authenticated:
+            return True
+
         def _do_login():
             client.login(username=self.username, password=self.password)
             return True
 
-        return bool(self._call_with_retry("EasyEquities login", _do_login))
+        success = bool(self._call_with_retry("EasyEquities login", _do_login))
+        if success:
+            self._client = client
+            self._client_authenticated = True
+        return success
 
     def list_accounts(self) -> Optional[List[Dict]]:
         """List the trust accounts (e.g. ZAR, TFSA, USD) on the EasyEquities profile."""
