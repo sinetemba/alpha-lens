@@ -20,7 +20,7 @@ An open-source, Python-based web application focused on providing investors with
 - **Database**: SQLite (development), PostgreSQL (production)
 - **ORM**: SQLAlchemy
 - **Scheduler**: APScheduler
-- **Data Sources**: Twelve Data API, Yahoo Finance, RSS feeds
+- **Data Sources**: Twelve Data API, Yahoo Finance, Moneyweb, RSS feeds, EasyEquities
 - **Notifications**: Apprise (Email, ntfy, Discord, Telegram)
 
 ## Project Structure
@@ -135,7 +135,7 @@ See the Docker section below for containerized deployment.
 
 The application has seven main sections:
 
-1. **Home**: Overview of market data, portfolio summary, and recent news
+1. **Home**: JSE index, portfolio value, daily gain, Moneyweb top movers, and recent news
 2. **Watchlist**: Manage your stock watchlist with price alerts
 3. **Portfolio**: Track your holdings and performance
 4. **Dividends**: Track dividend history and payments
@@ -212,6 +212,11 @@ Get a free API key at: https://twelvedata.com/
 - Dividends and splits
 - Company metadata
 - Financial statements
+
+### Top Movers (Moneyweb)
+
+- Daily winners and losers
+- Requires Moneyweb credentials (`MONEYWEB_USERNAME`, `MONEYWEB_PASSWORD`)
 
 ### News Sources (RSS)
 

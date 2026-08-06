@@ -18,13 +18,13 @@ The `show_portfolio` function in `app/dashboard/portfolio.py` calls `_sync_portf
 
 The function exists in `app/dashboard/portfolio.py` (lines 420–467) but is never called anywhere.
 
-### 🔴 JSE Index is hard-coded
+### ✅ JSE Index is now sourced from the database
 
-`app/dashboard/home.py` — `_get_jse_index()` and `_get_jse_change()` return static placeholder values (`"78,450"` and `"+1.2%"`). The Home page always shows fake data.
+`app/dashboard/home.py` — `_get_jse_index()` and `_get_jse_change()` read the latest `StockPrice` for `^J203.JO` and compute the daily change against the previous close.
 
-### 🔴 Daily Gain is actually total gain
+### ✅ Daily Gain is now a daily change
 
-`app/dashboard/home.py` — `_get_daily_gain()` sums **all-time** gain/loss across all holdings, not the daily change. The label says "Daily Gain" which is misleading.
+`app/dashboard/home.py` — `_get_daily_gain()` compares each holding's latest close to the previous day's close using `_get_latest_and_previous_prices()`.
 
 ### 🟡 Deprecated SQLAlchemy API
 
@@ -123,8 +123,8 @@ The `tests/` directory is **completely empty**. Despite having `pytest`, `pytest
 ## 8. Recommended Next Steps (Priority Order)
 
 1. **Fix portfolio refresh root cause** — force `updated_at = datetime.utcnow()` on every sync, not just when values change
-2. **Fix the JSE index placeholder** — fetch real J203 data via Yahoo Finance
-3. **Fix daily gain calculation** — compare today's values vs yesterday's
+2. ✅ ~~Fix the JSE index placeholder~~ — now fetches real J203 data from stored prices
+3. ✅ ~~Fix daily gain calculation~~ — now compares latest vs previous close
 4. **Add basic tests** — start with the data service and portfolio sync logic
 5. **Cache EasyEquities login** — use `st.session_state` to avoid re-authenticating on every rerun
 6. **Build a Notifications page** — the backend service is complete but invisible to the user

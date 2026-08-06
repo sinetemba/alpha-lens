@@ -350,8 +350,10 @@ Displays
 * JSE Index
 * Portfolio Value
 * Daily Gain
-* Watchlist Summary
+* Top Movers (Moneyweb)
 * Market News
+
+Also provides a non-blocking **Refresh Prices** control. News is only fetched once per day.
 
 ---
 
