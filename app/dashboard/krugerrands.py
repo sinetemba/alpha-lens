@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 from app.models.stock import Stock, StockPrice
 from app.collectors.gold_api import GoldAPICollector
-from app.dashboard.utils import get_latest_market_data_timestamp, is_market_data_stale
+from app.dashboard.utils import get_latest_market_data_timestamp, is_market_data_stale, render_last_fetch_caption
 from loguru import logger
 
 
@@ -23,6 +23,7 @@ def show_krugerrands(db: Session):
     """Display the dedicated Krugerrand tracking page."""
     st.header("🪙 Krugerrands")
     st.markdown("Track the spot-gold value of South African Krugerrands and your holdings.")
+    render_last_fetch_caption(db, [GOLD_USD_LIVE_SYMBOL, GOLD_LIVE_SYMBOL])
 
     _ensure_gold_symbols(db)
 

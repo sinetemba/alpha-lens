@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.models.base import SessionLocal
 from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
-from app.dashboard.utils import format_stock_label
+from app.dashboard.utils import format_stock_label, render_last_fetch_caption
 from datetime import datetime, timedelta, timezone
 from loguru import logger
 
@@ -44,7 +44,9 @@ def show_company(db: Session):
     
     if not selected_symbol:
         return
-    
+
+    render_last_fetch_caption(db, [selected_symbol])
+
     # Get stock information
     stock = db.query(Stock).filter(Stock.symbol == selected_symbol).first()
     

@@ -8,7 +8,7 @@ from app.models.portfolio import PortfolioHolding
 from app.models.stock import Stock
 from app.services.data_service import DataService
 from app.collectors.moneyweb import MoneywebCollector
-from app.dashboard.utils import format_stock_label
+from app.dashboard.utils import format_stock_label, render_last_fetch_caption
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 
 
@@ -43,6 +43,7 @@ def show_dividends(db: Session):
         st.metric("Portfolio Dividend Income", f"R {total_income:,.2f}")
 
     st.markdown("---")
+    render_last_fetch_caption(db, [h.symbol for h in holdings])
 
     # Fetch control
     if st.button("Fetch Latest Dividends"):

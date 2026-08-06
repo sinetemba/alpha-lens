@@ -130,6 +130,12 @@ def format_news_age(timestamp: Optional[datetime]) -> str:
     return f"Last news fetch: {display_timestamp.strftime('%d %b %Y %H:%M')} ({age_label})"
 
 
+def render_last_fetch_caption(db: Session, symbols: Optional[Iterable[str]] = None) -> None:
+    """Render a caption showing the last market data fetch for the given symbols."""
+    timestamp = get_latest_market_data_timestamp(db, symbols)
+    st.caption(format_market_data_age(timestamp))
+
+
 def render_market_data_refresh_control(
     db: Session,
     key: str,

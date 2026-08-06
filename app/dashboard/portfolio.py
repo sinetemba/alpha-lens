@@ -9,6 +9,7 @@ from app.dashboard.utils import (
     format_stock_label,
     is_market_data_stale,
     PriceSnapshot,
+    render_last_fetch_caption,
     style_gain_loss_row,
     _to_display_tz,
 )
@@ -102,6 +103,7 @@ def show_portfolio(db: Session):
             if holding.current_price is None:
                 _update_holding_values(db, holding)
     _update_portfolio_totals(db, portfolio, holdings)
+    render_last_fetch_caption(db, [h.symbol for h in holdings])
 
     # Pull Funds to Invest per EasyEquities account
     account_funds: dict[str, float] = {}

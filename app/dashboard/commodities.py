@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_stock_label, get_latest_market_data_timestamp, is_market_data_stale
+from app.dashboard.utils import format_stock_label, get_latest_market_data_timestamp, is_market_data_stale, render_last_fetch_caption
 from app.collectors.alpha_vantage import AlphaVantageCollector
 from app.collectors.metals_dev import MetalsDevCollector
 from loguru import logger
@@ -25,6 +25,7 @@ def show_commodities(db: Session):
     """Display the commodities tracking page."""
     st.header("🌍 Commodities")
     st.markdown("Track global commodity prices and recent performance.")
+    render_last_fetch_caption(db, [yf_symbol for _, yf_symbol in COMMODITY_SYMBOLS.values()])
 
     _ensure_commodity_stocks(db)
 
