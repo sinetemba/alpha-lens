@@ -403,9 +403,9 @@ def _get_daily_movers(db: Session, limit: int = 10) -> tuple[list, list]:
         change_pct = (price_move / prev.close_price) * 100
         movers.append({
             "Symbol": format_stock_label(stock.symbol, stock.name),
-            "Price": f"R {latest.close_price:.2f}",
-            "Move": f"{price_move:,.2f}",
-            "Change": f"{change_pct:+.2f}%",
+            "Price": latest.close_price,
+            "Move": price_move,
+            "Change": change_pct,
             "_change_pct": change_pct,
         })
 
@@ -423,6 +423,12 @@ def _render_top_movers(db: Session):
 
     col_winners, col_losers = st.columns(2)
 
+    column_config = {
+        "Price": st.column_config.NumberColumn("Price", format="R %.2f"),
+        "Move": st.column_config.NumberColumn("Move", format="%.2f"),
+        "Change": st.column_config.NumberColumn("Change", format="%.2f%%"),
+    }
+
     with col_winners:
         st.markdown("**🟢 Top 10 Winners**")
         if winners:
@@ -430,6 +436,7 @@ def _render_top_movers(db: Session):
                 [{"Symbol": m["Symbol"], "Price": m["Price"], "Move": m["Move"], "Change": m["Change"]} for m in winners],
                 use_container_width=True,
                 hide_index=True,
+                column_config=column_config,
             )
         else:
             st.info("No winners found. Try refreshing market data.")
@@ -441,6 +448,7 @@ def _render_top_movers(db: Session):
                 [{"Symbol": m["Symbol"], "Price": m["Price"], "Move": m["Move"], "Change": m["Change"]} for m in losers],
                 use_container_width=True,
                 hide_index=True,
+                column_config=column_config,
             )
         else:
             st.info("No losers found. Try refreshing market data.")

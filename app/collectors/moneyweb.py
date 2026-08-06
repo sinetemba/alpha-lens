@@ -239,9 +239,9 @@ class MoneywebCollector:
             rows.append({
                 "Symbol": share["symbol"],
                 "Name": share["name"],
-                "Price": self._clean_html_text(row[1]),
-                "Move": self._clean_html_text(row[2]),
-                "Change": self._clean_html_text(row[3]),
+                "Price": self._parse_number(row[1]),
+                "Move": self._parse_number(row[2]),
+                "Change": self._parse_percent(row[3]),
             })
         return rows
 
@@ -262,3 +262,25 @@ class MoneywebCollector:
     def _clean_html_text(html: str) -> str:
         """Strip HTML tags and extra whitespace from a cell value."""
         return BeautifulSoup(str(html), "html.parser").get_text(strip=True)
+
+    @staticmethod
+    def _parse_number(value: Any) -> Optional[float]:
+        """Parse a Moneyweb numeric cell into a float."""
+        text = MoneywebCollector._clean_html_text(value).replace(",", "").strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_percent(value: Any) -> Optional[float]:
+        """Parse a Moneyweb percentage cell like '13.76%' into a float."""
+        text = MoneywebCollector._clean_html_text(value).replace("%", "").replace(",", "").strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
