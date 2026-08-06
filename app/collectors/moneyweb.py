@@ -1,6 +1,6 @@
 import time
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import requests
 from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
@@ -185,3 +185,80 @@ class MoneywebCollector:
             return datetime.strptime(str(value).strip(), "%Y/%m/%d").date()
         except ValueError:
             return None
+
+    def get_winners_and_losers(self) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+        """Return the daily top winners and losers from Moneyweb as (winners, losers)."""
+        if not self._login():
+            return None
+
+        def _do_fetch():
+            s = self._get_session()
+            url = "https://cache.moneyweb.co.za/mny-mover-tables.php"
+            headers = {
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": "https://www.moneyweb.co.za/tools-and-data/latest-winners-and-losers/",
+                "Origin": "https://www.moneyweb.co.za",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+            }
+
+            winners = self._fetch_mover_table(s, url, "winnersfull", "winners-feed-table", headers)
+            losers = self._fetch_mover_table(s, url, "losersfull", "losers-feed-table", headers)
+            return winners, losers
+
+        return self._call_with_retry("Moneyweb winners and losers", _do_fetch)
+
+    def _fetch_mover_table(
+        self,
+        s: requests.Session,
+        url: str,
+        feed_id: str,
+        table_id: str,
+        headers: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        r = s.post(
+            url,
+            data={
+                "action": "mover_tables",
+                "tableId": table_id,
+                "records": "all",
+                "tableType": "data-feed",
+                "act": feed_id,
+            },
+            headers=headers,
+            timeout=30,
+        )
+        r.raise_for_status()
+
+        raw_rows = r.json()
+        rows = []
+        for row in raw_rows:
+            if len(row) < 4:
+                continue
+
+            share = self._parse_share_cell(row[0])
+            rows.append({
+                "Symbol": share["symbol"],
+                "Name": share["name"],
+                "Price": self._clean_html_text(row[1]),
+                "Move": self._clean_html_text(row[2]),
+                "Change": self._clean_html_text(row[3]),
+            })
+        return rows
+
+    @staticmethod
+    def _parse_share_cell(html: str) -> Dict[str, str]:
+        """Extract the share code and name from the Moneyweb HTML share cell."""
+        soup = BeautifulSoup(html, "html.parser")
+        a = soup.find("a")
+        if a:
+            href = a.get("href", "")
+            symbol = href.rstrip("/").split("/")[-1] if href else ""
+            name = a.get_text(strip=True)
+            return {"symbol": symbol, "name": name}
+        text = soup.get_text(strip=True)
+        return {"symbol": text, "name": text}
+
+    @staticmethod
+    def _clean_html_text(html: str) -> str:
+        """Strip HTML tags and extra whitespace from a cell value."""
+        return BeautifulSoup(str(html), "html.parser").get_text(strip=True)

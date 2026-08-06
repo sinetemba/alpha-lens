@@ -10,6 +10,7 @@ from app.models.news import NewsArticle
 from app.models.watchlist import WatchlistItem
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.config.settings import settings
+from app.collectors.moneyweb import MoneywebCollector
 from app.dashboard.utils import format_stock_label, PriceSnapshot, render_market_data_refresh_control
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 from loguru import logger
@@ -358,13 +359,27 @@ def _get_latest_and_previous_prices(
 
 
 @st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
-def _get_daily_movers(db: Session, limit: int = 5) -> tuple[list, list]:
-    """Compute the top daily winners and losers across all tracked JSE stocks.
+def _get_daily_movers(db: Session, limit: int = 10) -> tuple[list, list]:
+    """Return the top daily winners and losers from Moneyweb, falling back to locally stored prices."""
+    collector = MoneywebCollector()
+    result = collector.get_winners_and_losers()
 
-    This considers every active stock in the database (default seeded stocks,
-    watchlist additions, and portfolio holdings alike) — not just the ones on
-    the user's current watchlist or in their portfolio.
-    """
+    if result is not None:
+        winners, losers = result
+        return (
+            [{
+                "Symbol": format_stock_label(m["Symbol"], m.get("Name")),
+                "Price": m["Price"],
+                "Change": m["Change"],
+            } for m in winners[:limit]],
+            [{
+                "Symbol": format_stock_label(m["Symbol"], m.get("Name")),
+                "Price": m["Price"],
+                "Change": m["Change"],
+            } for m in losers[:limit]],
+        )
+
+    # Fallback: compute from the local stock_prices table
     stocks = db.query(Stock).filter(
         Stock.is_active == True,
         Stock.symbol != JSE_INDEX_YF_SYMBOL,
@@ -399,13 +414,13 @@ def _get_daily_movers(db: Session, limit: int = 5) -> tuple[list, list]:
 
 
 def _render_top_movers(db: Session):
-    """Render the top 5 winners and losers of the day side by side."""
+    """Render the top 10 winners and losers of the day side by side."""
     winners, losers = _get_daily_movers(db)
 
     col_winners, col_losers = st.columns(2)
 
     with col_winners:
-        st.markdown("**🟢 Top 5 Winners**")
+        st.markdown("**🟢 Top 10 Winners**")
         if winners:
             st.dataframe(
                 [{"Symbol": m["Symbol"], "Price": m["Price"], "Change": m["Change"]} for m in winners],
@@ -416,7 +431,7 @@ def _render_top_movers(db: Session):
             st.info("No winners found. Try refreshing market data.")
 
     with col_losers:
-        st.markdown("**🔴 Top 5 Losers**")
+        st.markdown("**🔴 Top 10 Losers**")
         if losers:
             st.dataframe(
                 [{"Symbol": m["Symbol"], "Price": m["Price"], "Change": m["Change"]} for m in losers],
