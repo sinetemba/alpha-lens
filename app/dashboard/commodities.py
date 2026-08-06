@@ -213,15 +213,28 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
 
         latest_prices.append({
             "Commodity": format_stock_label(api_symbol, name),
-            "Price": f"R {price:,.2f}/g" if api_rate is not None else f"$ {price:,.2f}",
-            "Change": f"{change_pct:+.2f}%" if change_pct is not None else "N/A",
-            "High": f"{latest_db.high_price:,.2f}" if api_rate is None and latest_db and latest_db.high_price else "N/A",
-            "Low": f"{latest_db.low_price:,.2f}" if api_rate is None and latest_db and latest_db.low_price else "N/A",
+            "Currency": "ZAR" if api_rate is not None else "USD",
+            "Price": float(price),
+            "Change": float(change_pct) if change_pct is not None else float("nan"),
+            "High": float(latest_db.high_price) if api_rate is None and latest_db and latest_db.high_price is not None else float("nan"),
+            "Low": float(latest_db.low_price) if api_rate is None and latest_db and latest_db.low_price is not None else float("nan"),
             "Source": "Metals.dev" if api_rate is not None else "Yahoo Finance",
         })
 
     if latest_prices:
-        st.dataframe(latest_prices, use_container_width=True)
+        st.dataframe(
+            latest_prices,
+            use_container_width=True,
+            column_config={
+                "Commodity": st.column_config.TextColumn("Commodity"),
+                "Currency": st.column_config.TextColumn("Currency"),
+                "Price": st.column_config.NumberColumn("Price (per gram)", format="%.2f"),
+                "Change": st.column_config.NumberColumn("Change", format="%.2f%%"),
+                "High": st.column_config.NumberColumn("High", format="%.2f"),
+                "Low": st.column_config.NumberColumn("Low", format="%.2f"),
+                "Source": st.column_config.TextColumn("Source"),
+            },
+        )
     else:
         st.info("No commodity price data available. Click Refresh Prices to fetch data.")
 

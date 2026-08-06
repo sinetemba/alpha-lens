@@ -533,17 +533,31 @@ def _render_easyequities_debug(
                 filtered_count += 1
 
             rows.append({
-                "#": idx,
+                "#": int(idx),
                 "Symbol": symbol or "N/A",
                 "Name": h.get("name", ""),
                 "Account": account,
-                "Shares": f"{shares:,.4f}" if shares else "0",
-                "Current Value (raw)": f"R {current_value:,.2f}",
+                "Shares": float(shares) if shares is not None else 0.0,
+                "Current Value (raw)": float(current_value) if current_value is not None else 0.0,
                 "Included?": "No" if reasons else "Yes",
                 "Reason if excluded": "; ".join(reasons),
             })
 
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(
+            rows,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "#": st.column_config.NumberColumn("#"),
+                "Symbol": st.column_config.TextColumn("Symbol"),
+                "Name": st.column_config.TextColumn("Name"),
+                "Account": st.column_config.TextColumn("Account"),
+                "Shares": st.column_config.NumberColumn("Shares", format="%.4f"),
+                "Current Value (raw)": st.column_config.NumberColumn("Current Value (raw)", format="R %.2f"),
+                "Included?": st.column_config.TextColumn("Included?"),
+                "Reason if excluded": st.column_config.TextColumn("Reason if excluded"),
+            },
+        )
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Raw EasyEquities total", f"R {raw_total:,.2f}")
