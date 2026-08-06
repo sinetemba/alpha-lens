@@ -136,14 +136,14 @@ def show_watchlist(db: Session):
 
             data.append({
                 "Symbol": format_stock_label(item.symbol, item.stock.name if item.stock else None),
-                "Current Price": float(current_price) if current_price is not None else float("nan"),
-                "Daily Change": float(daily_change) if current_price is not None else 0.0,
-                "Purchase Price": float(purchase_price) if purchase_price is not None else float("nan"),
-                "Target Price": float(item.target_price) if item.target_price is not None else float("nan"),
-                "Stop Loss": float(item.stop_loss) if item.stop_loss is not None else float("nan"),
-                "Gain/Loss": float(gain_loss) if purchase_price is not None else float("nan"),
-                "Gain/Loss %": float(gain_loss_pct) if purchase_price is not None else float("nan"),
-                "_gain_loss": gain_loss if purchase_price is not None else None,
+                "Current Price": f"R {current_price:.2f}",
+                "Daily Change": f"{daily_change:+.2f}%",
+                "Purchase Price": f"R {purchase_price:.2f}" if purchase_price else "N/A",
+                "Target Price": f"R {item.target_price:.2f}" if item.target_price else "N/A",
+                "Stop Loss": f"R {item.stop_loss:.2f}" if item.stop_loss else "N/A",
+                "Gain/Loss": f"R {gain_loss:.2f}",
+                "Gain/Loss %": f"{gain_loss_pct:+.2f}%",
+                "_gain_loss": gain_loss if purchase_price else None,
             })
 
     if watchlist_updated:
@@ -154,21 +154,7 @@ def show_watchlist(db: Session):
         styled_table = watchlist_table.style.apply(style_gain_loss_row, axis=1).hide(
             axis="columns", subset=["_gain_loss"]
         )
-        st.dataframe(
-            styled_table,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
-                "Current Price": st.column_config.NumberColumn("Current Price", help="Latest market price per share.", format="R %.2f"),
-                "Daily Change": st.column_config.NumberColumn("Daily Change", help="Change since the previous close.", format="%.2f%%"),
-                "Purchase Price": st.column_config.NumberColumn("Purchase Price", help="Average purchase price tracked for this stock.", format="R %.2f"),
-                "Target Price": st.column_config.NumberColumn("Target Price", help="Target alert price.", format="R %.2f"),
-                "Stop Loss": st.column_config.NumberColumn("Stop Loss", help="Stop-loss alert price.", format="R %.2f"),
-                "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", help="Current price vs purchase price.", format="R %.2f"),
-                "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", help="Percentage gain or loss.", format="%.2f%%"),
-            },
-        )
+        st.dataframe(styled_table, use_container_width=True, hide_index=True)
     
     st.markdown("---")
 

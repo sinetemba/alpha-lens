@@ -202,20 +202,16 @@ def _render_krugerrand_calculator(gram_22k: float):
         retail_value = spot_value * premium_factor
         size_data.append({
             "Size": size,
-            "Spot value": float(spot_value),
-            f"Retail value ({premium:.0f}% premium)": float(retail_value),
+            "Spot value": f"R {spot_value:,.2f}",
+            f"Retail value ({premium:.0f}% premium)": f"R {retail_value:,.2f}",
+            "_spot_value": spot_value,
         })
 
     st.markdown("**Value by size (live)**")
     st.dataframe(
-        size_data,
+        [{"Size": d["Size"], "Spot value": d["Spot value"], "Retail value": d[f"Retail value ({premium:.0f}% premium)"]} for d in size_data],
         use_container_width=True,
         hide_index=True,
-        column_config={
-            "Size": st.column_config.TextColumn("Size"),
-            "Spot value": st.column_config.NumberColumn("Spot value", format="R %.2f"),
-            f"Retail value ({premium:.0f}% premium)": st.column_config.NumberColumn(f"Retail value ({premium:.0f}% premium)", format="R %.2f"),
-        },
     )
 
     # Selected size totals
@@ -249,13 +245,13 @@ def _get_historical_year_end_prices(gold_api: GoldAPICollector) -> list[dict]:
         row = {"Year": str(year)}
         for size, grams in KRUGERRAND_SIZES.items():
             pure_oz = grams / 33.930  # exact fraction of a full Krugerrand
-            row[size] = float(price * pure_oz)
+            row[size] = f"R {price * pure_oz:,.2f}"
 
         if prev_price is not None:
             growth = ((price - prev_price) / prev_price) * 100
-            row["YoY Growth (1 oz)"] = float(growth)
+            row["YoY Growth (1 oz)"] = f"{growth:+.2f}%"
         else:
-            row["YoY Growth (1 oz)"] = float("nan")
+            row["YoY Growth (1 oz)"] = "-"
         rows.append(row)
         prev_price = price
     return rows
@@ -282,16 +278,7 @@ def _render_historical_grid():
         st.info("No historical data available. Add a GoldAPI key to enable.")
         return
 
-    st.dataframe(
-        rows,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Year": st.column_config.TextColumn("Year"),
-            **{size: st.column_config.NumberColumn(size, format="R %.2f") for size in KRUGERRAND_SIZES},
-            "YoY Growth (1 oz)": st.column_config.NumberColumn("YoY Growth (1 oz)", format="%.2f%%"),
-        },
-    )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 

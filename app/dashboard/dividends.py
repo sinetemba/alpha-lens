@@ -69,7 +69,7 @@ def show_dividends(db: Session):
         for d in dividends:
             data.append({
                 "Symbol": format_stock_label(d.symbol, d.stock.name if d.stock else None),
-                "Amount (per share)": float(d.amount),
+                "Amount (per share)": f"R {d.amount:,.4f}",
                 "Ex-Dividend Date": d.ex_dividend_date.strftime("%Y-%m-%d") if d.ex_dividend_date else "N/A",
                 "Payment Date": d.payment_date.strftime("%Y-%m-%d") if d.payment_date else "N/A",
                 "Frequency": d.frequency or "N/A",
@@ -77,14 +77,7 @@ def show_dividends(db: Session):
             })
 
         st.subheader("All Dividends")
-        st.dataframe(
-            data,
-            use_container_width=True,
-            column_config={
-                "Symbol": st.column_config.TextColumn("Symbol"),
-                "Amount (per share)": st.column_config.NumberColumn("Amount (per share)", format="R %.4f"),
-            },
-        )
+        st.dataframe(data, use_container_width=True)
     else:
         st.info("No dividend records found yet. Fetch from Yahoo Finance or add one manually below.")
 
@@ -103,22 +96,12 @@ def show_dividends(db: Session):
             holdings_data.append({
                 "Symbol": format_stock_label(h.symbol, h.stock.name if h.stock else None),
                 "Account": h.account_type or "ZAR",
-                "Quantity": float(h.quantity) if h.quantity is not None else 0.0,
-                "Dividends per Share": float(per_share),
-                "Estimated Income": float(income),
+                "Quantity": h.quantity,
+                "Dividends per Share": f"R {per_share:,.4f}",
+                "Estimated Income": f"R {income:,.2f}",
             })
 
-        st.dataframe(
-            holdings_data,
-            use_container_width=True,
-            column_config={
-                "Symbol": st.column_config.TextColumn("Symbol"),
-                "Account": st.column_config.TextColumn("Account"),
-                "Quantity": st.column_config.NumberColumn("Quantity", format="%.0f"),
-                "Dividends per Share": st.column_config.NumberColumn("Dividends per Share", format="R %.4f"),
-                "Estimated Income": st.column_config.NumberColumn("Estimated Income", format="R %.2f"),
-            },
-        )
+        st.dataframe(holdings_data, use_container_width=True)
     else:
         st.info("No holdings found. Add holdings on the Portfolio page first.")
 
@@ -149,12 +132,6 @@ def show_dividends(db: Session):
         if latest and latest.fetched_at:
             st.caption(f"Last fetched: {latest.fetched_at.strftime('%Y-%m-%d %H:%M')} UTC")
 
-        def _parse_moneyweb_value(value):
-            try:
-                return float(value) if value is not None else float("nan")
-            except (ValueError, TypeError):
-                return float("nan")
-
         data = []
         for d in moneyweb_rows:
             data.append({
@@ -163,16 +140,9 @@ def show_dividends(db: Session):
                 "Last day to trade": d.last_day_to_trade.strftime("%Y/%m/%d") if d.last_day_to_trade else "N/A",
                 "Pay date": d.pay_date.strftime("%Y/%m/%d") if d.pay_date else "N/A",
                 "Type": d.dividend_type or "N/A",
-                "Value": _parse_moneyweb_value(d.value),
+                "Value": d.value or "N/A",
             })
-        st.dataframe(
-            data,
-            use_container_width=True,
-            column_config={
-                "Instrument": st.column_config.TextColumn("Instrument"),
-                "Value": st.column_config.NumberColumn("Value", format="R %.4f"),
-            },
-        )
+        st.dataframe(data, use_container_width=True)
     else:
         st.info("No Moneyweb Dividend Watch data yet. Click 'Fetch from Moneyweb' to load it.")
 

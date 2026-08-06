@@ -249,26 +249,15 @@ def _render_historical_data(db: Session, symbol: str):
     for price in prices:
         data.append({
             "Date": price.timestamp.strftime("%Y-%m-%d"),
-            "Open": float(price.open_price) if price.open_price is not None else float("nan"),
-            "High": float(price.high_price) if price.high_price is not None else float("nan"),
-            "Low": float(price.low_price) if price.low_price is not None else float("nan"),
-            "Close": float(price.close_price) if price.close_price is not None else float("nan"),
-            "Volume": float(price.volume) if price.volume is not None else float("nan"),
+            "Open": f"R {price.open_price:.2f}" if price.open_price else "N/A",
+            "High": f"R {price.high_price:.2f}" if price.high_price else "N/A",
+            "Low": f"R {price.low_price:.2f}" if price.low_price else "N/A",
+            "Close": f"R {price.close_price:.2f}",
+            "Volume": f"{price.volume:,}" if price.volume else "N/A",
         })
 
     st.caption(f"Page {page} of {total_pages} ({total} rows, {page_size} per page)")
-    st.dataframe(
-        data,
-        use_container_width=True,
-        column_config={
-            "Date": st.column_config.TextColumn("Date"),
-            "Open": st.column_config.NumberColumn("Open", format="R %.2f"),
-            "High": st.column_config.NumberColumn("High", format="R %.2f"),
-            "Low": st.column_config.NumberColumn("Low", format="R %.2f"),
-            "Close": st.column_config.NumberColumn("Close", format="R %.2f"),
-            "Volume": st.column_config.NumberColumn("Volume", format=",.0f"),
-        },
-    )
+    st.dataframe(data, use_container_width=True)
 
 
 def _render_company_news(db: Session, symbol: str):
