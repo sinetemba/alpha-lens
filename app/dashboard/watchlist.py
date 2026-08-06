@@ -1,10 +1,13 @@
 import pandas as pd
 import streamlit as st
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
+from app.models.portfolio import PortfolioHolding
 from app.dashboard.utils import format_stock_label, render_market_data_refresh_control, style_gain_loss_row
 from app.dashboard.home import _get_latest_and_previous_prices
+from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 from loguru import logger
 
 
@@ -79,39 +82,72 @@ def show_watchlist(db: Session):
     
     st.markdown("---")
     
+    # Aggregate local portfolio holdings for the watchlisted symbols
+    holdings = db.query(
+        PortfolioHolding.symbol,
+        func.sum(PortfolioHolding.quantity).label("quantity"),
+        func.sum(PortfolioHolding.quantity * PortfolioHolding.purchase_price).label("purchase_value"),
+        func.max(PortfolioHolding.current_price).label("current_price"),
+    ).filter(
+        PortfolioHolding.symbol.in_([item.symbol for item in watchlist_items]),
+        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
+    ).group_by(PortfolioHolding.symbol).all()
+    holdings_by_symbol = {h.symbol: h for h in holdings}
+
     # Watchlist table
     st.subheader("Your Watchlist")
-    
+
     data = []
+    watchlist_updated = False
     for item in watchlist_items:
         latest, prev = prices.get(item.symbol, (None, None))
-        current_price = latest.close_price if latest else None
-        
+        holding = holdings_by_symbol.get(item.symbol)
+
+        # Prefer local holding current price, fall back to latest market price
+        if holding and holding.current_price is not None:
+            current_price = holding.current_price
+        elif latest:
+            current_price = latest.close_price
+        else:
+            current_price = None
+
+        # Use holding purchase price (weighted avg) if available, else the stored watchlist value
+        if holding and holding.quantity:
+            purchase_price = holding.purchase_value / holding.quantity
+            if item.purchase_price is None or abs(item.purchase_price - purchase_price) > 1e-6:
+                item.purchase_price = purchase_price
+                watchlist_updated = True
+        else:
+            purchase_price = item.purchase_price
+
         if current_price is not None:
-            if item.purchase_price:
-                gain_loss = current_price - item.purchase_price
-                gain_loss_pct = (gain_loss / item.purchase_price) * 100
+            if purchase_price:
+                gain_loss = current_price - purchase_price
+                gain_loss_pct = (gain_loss / purchase_price) * 100
             else:
                 gain_loss = 0
                 gain_loss_pct = 0
-            
+
             # Daily change vs previous day's close
             daily_change = (
                 ((current_price - prev.close_price) / prev.close_price) * 100
                 if prev and prev.close_price else 0.0
             )
-            
+
             data.append({
                 "Symbol": format_stock_label(item.symbol, item.stock.name if item.stock else None),
                 "Current Price": f"R {current_price:.2f}",
                 "Daily Change": f"{daily_change:+.2f}%",
-                "Purchase Price": f"R {item.purchase_price:.2f}" if item.purchase_price else "N/A",
+                "Purchase Price": f"R {purchase_price:.2f}" if purchase_price else "N/A",
                 "Target Price": f"R {item.target_price:.2f}" if item.target_price else "N/A",
                 "Stop Loss": f"R {item.stop_loss:.2f}" if item.stop_loss else "N/A",
                 "Gain/Loss": f"R {gain_loss:.2f}",
                 "Gain/Loss %": f"{gain_loss_pct:+.2f}%",
-                "_gain_loss": gain_loss if item.purchase_price else None,
+                "_gain_loss": gain_loss if purchase_price else None,
             })
+
+    if watchlist_updated:
+        db.commit()
     
     if data:
         watchlist_table = pd.DataFrame(data)
