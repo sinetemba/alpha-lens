@@ -3,10 +3,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from typing import List, Dict, Optional
 from app.models.base import SessionLocal
-from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
+from app.models.stock import Stock, StockPrice
 from app.dashboard.utils import format_stock_label, render_last_fetch_caption
+from app.services.company_news import CompanyNewsService
 from datetime import datetime, timedelta, timezone
 from loguru import logger
 
@@ -262,22 +264,53 @@ def _render_historical_data(db: Session, symbol: str):
     st.dataframe(data, use_container_width=True)
 
 
+def _get_company_news(symbol: str, company_name: Optional[str]) -> List[Dict]:
+    """Fetch live news for a company. Only cache non-empty results."""
+    cache_key = f"company_news_{symbol}"
+    if cache_key in st.session_state and st.session_state[cache_key]:
+        return st.session_state[cache_key]
+    
+    news = CompanyNewsService().get_company_news(symbol, company_name)
+    if news:
+        st.session_state[cache_key] = news
+    return news
+
+
 def _render_company_news(db: Session, symbol: str):
     """Render news related to a company."""
-    st.subheader(f"News for {symbol}")
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    company_name = stock.name if stock else None
     
-    news = db.query(NewsArticle).filter(
-        NewsArticle.stock_symbol == symbol
-    ).order_by(NewsArticle.published_at.desc()).limit(20).all()
+    st.subheader(f"News for {format_stock_label(symbol, company_name)}")
+    
+    with st.spinner("Loading company news..."):
+        news = _get_company_news(symbol, company_name)
     
     if not news:
-        st.info(f"No news available for {symbol}.")
-        return
+        archived = db.query(NewsArticle).filter(
+            NewsArticle.stock_symbol == symbol
+        ).order_by(NewsArticle.published_at.desc()).limit(10).all()
+        
+        if archived:
+            st.caption("No live news found — showing archived articles from the database.")
+            news = [
+                {
+                    "title": a.title,
+                    "summary": a.summary or "",
+                    "url": a.url,
+                    "source": a.source,
+                    "published_at": a.published_at,
+                }
+                for a in archived
+            ]
+        else:
+            st.info(f"No recent news available for {symbol}.")
+            return
     
     for article in news:
-        with st.expander(f"**{article.title}** - {article.source}"):
-            st.markdown(f"*Published: {article.published_at.strftime('%Y-%m-%d %H:%M')}*")
-            if article.sentiment:
-                st.markdown(f"Sentiment: **{article.sentiment}**")
-            st.markdown(article.summary)
-            st.markdown(f"[Read more]({article.url})")
+        published = article.get("published_at")
+        published_str = published.strftime("%Y-%m-%d %H:%M") if published else "Unknown"
+        with st.expander(f"**{article['title']}** - {article['source']}"):
+            st.markdown(f"*Published: {published_str}*")
+            st.markdown(article.get("summary", ""))
+            st.markdown(f"[Read more]({article['url']})")

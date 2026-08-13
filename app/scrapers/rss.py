@@ -1,4 +1,5 @@
 import feedparser
+from email.utils import parsedate_to_datetime
 from typing import List, Dict, Optional
 from datetime import datetime
 from app.config.settings import settings
@@ -18,7 +19,8 @@ class RSSScraper:
             
             if feed.bozo:
                 logger.warning(f"Error parsing RSS feed from {url}: {feed.bozo_exception}")
-                return None
+                if not feed.entries:
+                    return None
             
             articles = []
             
@@ -57,11 +59,7 @@ class RSSScraper:
             return None
         
         try:
-            # feedparser usually parses dates automatically
-            # but we can try to parse as string if needed
-            parsed = feedparser._parse_date(date_str)
-            if parsed:
-                return datetime(*parsed[:6])
+            return parsedate_to_datetime(date_str)
         except Exception as e:
             logger.warning(f"Error parsing date '{date_str}': {e}")
         

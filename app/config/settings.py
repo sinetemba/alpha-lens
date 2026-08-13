@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     exchange_rate_api_key: str = Field(default="", alias="EXCHANGE_RATE_API_KEY")
     exchange_rate_base_url: str = Field(default="https://v6.exchangerate-api.com/v6", alias="EXCHANGE_RATE_BASE_URL")
 
+    # Company News (optional)
+    newsdata_api_key: str = Field(default="", alias="NEWSDATA_API_KEY")
+
     # Scheduler Configuration
     scheduler_enabled: bool = Field(default=True, alias="SCHEDULER_ENABLED")
     scheduler_timezone: str = Field(default="Africa/Johannesburg", alias="SCHEDULER_TIMEZONE")
@@ -63,6 +66,7 @@ class Settings(BaseSettings):
     rss_businesstech: str = Field(default="https://businesstech.co.za/news/feed/", alias="RSS_BUSINESSTECH")
     rss_news24_business: str = Field(default="https://www.news24.com/Services/Site/Feeds/24/Article/TopStories?sectionId=3", alias="RSS_NEWS24_BUSINESS")
     rss_daily_investor: str = Field(default="https://www.dailyinvestor.com/feed/", alias="RSS_DAILY_INVESTOR")
+    rss_iol_business: str = Field(default="https://iol.co.za/rss/iol/business", alias="RSS_IOL_BUSINESS")
 
     # Caching Configuration
     cache_type: str = Field(default="diskcache", alias="CACHE_TYPE")
@@ -100,6 +104,7 @@ class Settings(BaseSettings):
             self.rss_businesstech,
             self.rss_news24_business,
             self.rss_daily_investor,
+            self.rss_iol_business,
         ]
 
     @property

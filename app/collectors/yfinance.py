@@ -58,6 +58,60 @@ class YFinanceCollector:
             logger.error(f"Error getting info for {symbol}: {e}")
             return None
     
+    def get_news(self, symbol: str) -> List[Dict]:
+        """Get latest Yahoo Finance news for a symbol."""
+        ticker = self.get_ticker(symbol)
+        if not ticker:
+            return []
+        
+        try:
+            raw_news = ticker.news
+            if not raw_news:
+                return []
+            
+            articles = []
+            for item in raw_news:
+                content = item.get("content") if isinstance(item, dict) else None
+                if not content:
+                    continue
+                
+                title = content.get("title", "")
+                summary = content.get("summary", "") or content.get("description", "")
+                
+                url = ""
+                canonical = content.get("canonicalUrl")
+                if isinstance(canonical, dict):
+                    url = canonical.get("url", "")
+                if not url:
+                    url = content.get("previewUrl", "")
+                
+                provider = ""
+                provider_data = content.get("provider")
+                if isinstance(provider_data, dict):
+                    provider = provider_data.get("displayName", "")
+                
+                published_at = None
+                date_str = content.get("pubDate") or content.get("displayTime")
+                if date_str:
+                    try:
+                        published_at = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+                
+                if title and url:
+                    articles.append({
+                        "title": title,
+                        "summary": summary,
+                        "url": url,
+                        "source": provider or "Yahoo Finance",
+                        "published_at": published_at,
+                    })
+            
+            return articles
+        except Exception as e:
+            logger.error(f"Error getting news for {symbol}: {e}")
+            return []
+    
     def get_history(
         self, 
         symbol: str, 
