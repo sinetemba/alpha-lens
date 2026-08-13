@@ -2,6 +2,7 @@ import streamlit as st
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 from app.models.stock import Stock, StockPrice
+from app.collectors.alpha_vantage import AlphaVantageCollector
 from app.collectors.gold_api import GoldAPICollector
 from app.dashboard.utils import get_latest_market_data_timestamp, is_market_data_stale, render_last_fetch_caption
 from loguru import logger
@@ -40,28 +41,55 @@ def show_krugerrands(db: Session):
         st.success("Prices refreshed.")
         st.rerun()
 
-    col1, col2, col3 = st.columns(3)
+    show_silver = st.toggle("Show Silver Spot", value=False)
 
     gold_usd, gold_zar, gram_22k = _get_or_refresh_gold_prices(db, gold_api)
     usd_zar = (gold_zar / gold_usd) if gold_usd and gold_usd > 0 else 0.0
+
+    st.metric("USD/ZAR", f"R {usd_zar:,.2f}" if usd_zar else "N/A")
+
+    col1, col2 = st.columns(2)
 
     with col1:
         st.metric("Gold Spot (USD/oz)", f"$ {gold_usd:,.2f}" if gold_usd else "N/A")
 
     with col2:
-        st.metric("USD/ZAR", f"R {usd_zar:,.2f}" if usd_zar else "N/A")
-
-    with col3:
         st.metric(
             "Gold Spot (ZAR/oz)",
             f"R {gold_zar:,.2f}" if gold_zar else "N/A"
         )
 
-    st.markdown("---")
-    _render_krugerrand_calculator(gram_22k)
+    gram_silver = 0.0
+
+    if show_silver:
+        silver_usd_data = gold_api.get_live_price(metal="XAG", currency="USD")
+        silver_zar_data = gold_api.get_live_price(metal="XAG", currency="ZAR")
+
+        if silver_usd_data and silver_zar_data:
+            st.markdown("---")
+            st.subheader("Silver Spot")
+            silver_usd = float(silver_usd_data["price"]) if "price" in silver_usd_data else 0.0
+            silver_zar = float(silver_zar_data["price"]) if "price" in silver_zar_data else 0.0
+
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.metric("Silver Spot (USD/oz)", f"$ {silver_usd:,.2f}" if silver_usd else "N/A")
+            with sc2:
+                st.metric("Silver Spot (ZAR/oz)", f"R {silver_zar:,.2f}" if silver_zar else "N/A")
+
+            gram_silver = (silver_zar / 33.93) if silver_zar else 0.0
+        else:
+            st.info("Unable to fetch silver prices. Ensure GoldAPI key is configured and valid.")
 
     st.markdown("---")
-    _render_historical_grid()
+    _render_krugerrand_calculator(gram_22k, gram_silver)
+
+    st.markdown("---")
+    _render_historical_grid(usd_zar=usd_zar)
+
+    if show_silver:
+        st.markdown("---")
+        _render_historical_grid(metal="XAG", title="Silver", usd_zar=usd_zar)
 
 
 def _ensure_gold_symbols(db: Session) -> None:
@@ -168,8 +196,8 @@ def _get_latest_price(db: Session, symbol: str) -> tuple:
     return 0.0, None
 
 
-def _render_krugerrand_calculator(gram_22k: float):
-    """Render a calculator for Krugerrand values across sizes."""
+def _render_krugerrand_calculator(gram_22k: float, gram_silver: float = 0.0):
+    """Render a calculator for Krugerrand values across sizes, optionally with silver."""
     st.subheader("Krugerrand Calculator")
 
     premium = st.number_input(
@@ -198,19 +226,36 @@ def _render_krugerrand_calculator(gram_22k: float):
 
     # Live values for every Krugerrand size, using the 22k per-gram spot from GoldAPI.
     size_data = []
+    has_silver = gram_silver > 0
     for size, grams in KRUGERRAND_SIZES.items():
         spot_value = gram_22k * grams
         retail_value = spot_value * premium_factor
-        size_data.append({
+        row = {
             "Size": size,
             "Spot value": f"R {spot_value:,.2f}",
             f"Retail value ({premium:.0f}% premium)": f"R {retail_value:,.2f}",
             "_spot_value": spot_value,
-        })
+        }
+        if has_silver:
+            silver_spot = gram_silver * grams
+            silver_retail = silver_spot * premium_factor
+            row["Silver spot value"] = f"R {silver_spot:,.2f}"
+            row[f"Silver retail value ({premium:.0f}% premium)"] = f"R {silver_retail:,.2f}"
+        size_data.append(row)
 
     st.markdown("**Value by size (live)**")
+    display_columns = [
+        "Size",
+        "Spot value",
+        f"Retail value ({premium:.0f}% premium)",
+    ]
+    if has_silver:
+        display_columns += [
+            "Silver spot value",
+            f"Silver retail value ({premium:.0f}% premium)",
+        ]
     st.dataframe(
-        [{"Size": d["Size"], "Spot value": d["Spot value"], "Retail value": d[f"Retail value ({premium:.0f}% premium)"]} for d in size_data],
+        [{c: d[c] for c in display_columns} for d in size_data],
         use_container_width=True,
         hide_index=True,
     )
@@ -225,8 +270,8 @@ def _render_krugerrand_calculator(gram_22k: float):
     st.metric(f"Total Value ({quantity} × {coin_size})", f"R {total:,.2f}")
 
 
-def _get_historical_year_end_prices(gold_api: GoldAPICollector) -> list[dict]:
-    """Fetch year-end XAU/ZAR prices for the last 10 years."""
+def _get_historical_year_end_prices(gold_api: GoldAPICollector, metal: str = "XAU", usd_zar: float = 1.0) -> list[dict]:
+    """Fetch year-end metal/ZAR prices for the last 10 years."""
     if not gold_api.enabled:
         return []
 
@@ -235,17 +280,55 @@ def _get_historical_year_end_prices(gold_api: GoldAPICollector) -> list[dict]:
     prev_price: float | None = None
     for year in range(current_year - 10, current_year):
         date = f"{year}1231"
-        data = gold_api.get_historical_price("XAU", "ZAR", date)
+        data = gold_api.get_historical_price(metal, "ZAR", date)
         if not data or "price" not in data:
             continue
 
         price = float(data["price"])
-        # GoldAPI returns price per troy ounce of fine gold. Krugerrand sizes are
-        # denominated in troy ounces of pure gold (1, 0.5, 0.25, 0.1), so the
-        # size value is a simple fraction of the 1 oz price.
+        # Metal prices are per troy ounce. Krugerrand sizes are denominated in
+        # troy ounces of pure metal (1, 0.5, 0.25, 0.1), so the size value is a
+        # simple fraction of the 1 oz price.
         row = {"Year": str(year)}
         for size, grams in KRUGERRAND_SIZES.items():
             pure_oz = grams / 33.930  # exact fraction of a full Krugerrand
+            row[size] = f"R {price * pure_oz:,.2f}"
+
+        if prev_price is not None:
+            growth = ((price - prev_price) / prev_price) * 100
+            row["YoY Growth (1 oz)"] = f"{growth:+.2f}%"
+        else:
+            row["YoY Growth (1 oz)"] = "-"
+        rows.append(row)
+        prev_price = price
+
+    if rows:
+        return rows
+
+    # Fallback to Alpha Vantage if GoldAPI does not support historical data.
+    av = AlphaVantageCollector()
+    if not av.enabled or usd_zar <= 0:
+        return []
+
+    commodity = "gold" if metal == "XAU" else "silver"
+    history = av.get_commodity_history(commodity)
+    if not history:
+        return []
+
+    # Convert USD year-end prices to ZAR using the current USD/ZAR cross.
+    conversion = usd_zar
+
+    prev_price = None
+    for year in range(current_year - 10, current_year):
+        year_points = [p for p in history if p["timestamp"].year == year]
+        if not year_points:
+            continue
+        year_points.sort(key=lambda p: p["timestamp"])
+        price_usd = float(year_points[-1]["close"])
+        price = price_usd * conversion
+
+        row = {"Year": str(year)}
+        for size, grams in KRUGERRAND_SIZES.items():
+            pure_oz = grams / 33.930
             row[size] = f"R {price * pure_oz:,.2f}"
 
         if prev_price is not None:
@@ -259,24 +342,25 @@ def _get_historical_year_end_prices(gold_api: GoldAPICollector) -> list[dict]:
 
 
 @st.cache_data(ttl=2592000)
-def _get_cached_historical_grid(version: int = 2) -> list[dict]:
+def _get_cached_historical_grid(version: int = 2, metal: str = "XAU", usd_zar: float = 1.0) -> list[dict]:
     """Cache the 10-year year-end grid for 30 days to stay within the free tier.
 
     The ``version`` argument is a cache-buster: bump it when the grid schema
     changes so existing cached results are ignored.
     """
-    return _get_historical_year_end_prices(GoldAPICollector())
+    return _get_historical_year_end_prices(GoldAPICollector(), metal, usd_zar)
 
 
-def _render_historical_grid():
-    """Render a 10-year grid of Krugerrand year-end values."""
-    st.subheader("Historical Year-End Krugerrand Values (ZAR)")
+def _render_historical_grid(metal: str = "XAU", title: str = "Krugerrand", usd_zar: float = 1.0):
+    """Render a 10-year grid of year-end values for a metal."""
+    st.subheader(f"Historical Year-End {title} Values (ZAR)")
 
-    with st.spinner("Loading 10-year historical values..."):
-        rows = _get_cached_historical_grid(version=2)
+    with st.spinner(f"Loading 10-year {title.lower()} historical values..."):
+        version = 2 if metal == "XAU" else 1
+        rows = _get_cached_historical_grid(version=version, metal=metal, usd_zar=usd_zar)
 
     if not rows:
-        st.info("No historical data available. Add a GoldAPI key to enable.")
+        st.info("No historical data available. Check your GoldAPI or Alpha Vantage configuration.")
         return
 
     st.dataframe(rows, use_container_width=True, hide_index=True)
