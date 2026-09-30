@@ -84,6 +84,7 @@ def _save_latest_rates(db: Session, latest_rates: dict[str, float]) -> None:
         if existing_today:
             existing_today.close_price = rate
             existing_today.timestamp = now
+            existing_today.fetched_at = now
         else:
             db.add(StockPrice(stock_id=stock.id, symbol=yf_symbol, timestamp=now, close_price=rate))
 
@@ -150,6 +151,7 @@ def _save_historical_prices(db: Session, api_symbol: str, historical_prices: lis
             StockPrice.timestamp == point["timestamp"],
         ).first()
         if existing:
+            existing.fetched_at = datetime.now(timezone.utc)
             continue
         db.add(StockPrice(
             stock_id=stock.id,

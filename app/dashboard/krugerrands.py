@@ -143,6 +143,7 @@ def _save_gold_prices(db: Session, gold_usd: float, gold_zar: float) -> None:
         if existing_today:
             existing_today.close_price = price
             existing_today.timestamp = now
+            existing_today.fetched_at = now
         else:
             db.add(StockPrice(stock_id=stock.id, symbol=symbol, timestamp=now, close_price=price))
     db.commit()

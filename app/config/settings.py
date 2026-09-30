@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     hourly_update_hour: str = Field(default="*", alias="HOURLY_UPDATE_HOUR")
     hourly_update_minute: str = Field(default="0", alias="HOURLY_UPDATE_MINUTE")
 
+    # Updater Service Configuration
+    updater_logon_min_interval: int = Field(default=600, alias="UPDATER_LOGON_MIN_INTERVAL")
+    updater_log_file: str = Field(default="./data/logs/updater.log", alias="UPDATER_LOG_FILE")
+
     # RSS Feed URLs
     rss_moneyweb: str = Field(default="https://www.moneyweb.co.za/feed/", alias="RSS_MONEYWEB")
     rss_businesstech: str = Field(default="https://businesstech.co.za/news/feed/", alias="RSS_BUSINESSTECH")
@@ -94,6 +98,7 @@ class Settings(BaseSettings):
 
     # JSE Configuration
     jse_index_symbol: str = Field(default="J203", alias="JSE_INDEX_SYMBOL")
+    jse_index_yf_symbol: str = Field(default="^J203.JO", alias="JSE_INDEX_YF_SYMBOL")
     default_watchlist: str = Field(default="NPN,CFR,AGL,SOL,SBK", alias="DEFAULT_WATCHLIST")
 
     @property

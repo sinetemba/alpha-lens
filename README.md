@@ -175,6 +175,76 @@ The application includes a background scheduler that:
 
 The scheduler is automatically started when you run the application. To disable it, set `SCHEDULER_ENABLED=false` in your `.env` file.
 
+## Windows Headless Updater (Scheduled Task / Service)
+
+The in-process scheduler above only runs while the Streamlit dashboard is open. To keep prices, news and historical data fresh when the UI is closed, install the headless updater.
+
+### Default schedule (Africa/Johannesburg)
+
+- **09:00, 13:00, 17:00** – price and news update for tracked watchlist + portfolio (Twelve Data, falling back to Yahoo Finance)
+- **18:00** – full daily update (historical prices + dividends)
+- **Sunday 02:00** – remove news articles older than 90 days
+- **On user logon and workstation unlock** – lightweight price + news refresh (debounced to avoid rapid lock/unlock loops)
+
+### Recommended: Windows Task Scheduler
+
+Make sure your virtual environment exists, then open PowerShell as Administrator and run:
+
+```powershell
+.\scripts\install_updater_task.ps1
+```
+
+The script prefers the Python interpreter in `.venv\Scripts\python.exe` or `venv\Scripts\python.exe` and falls back to the first `python` in `PATH`.
+
+This creates the `AlphaLensUpdater` scheduled task. Remove it with `.\scripts\uninstall_updater_task.ps1`.
+
+### Alternative: Windows Service
+
+If the machine must update before anyone logs on, install the pywin32-based Windows Service using your venv interpreter:
+
+```powershell
+pip install pywin32
+python scripts\windows_service.py --install
+python scripts\windows_service.py --start
+```
+
+Use `python scripts\windows_service.py --stop` or `--remove` to manage it.
+
+### API rate limits
+
+The updater reuses the existing Twelve Data throttling and adds a pre-flight quota estimate. If the daily quota is too low for the planned run, it logs the shortfall and falls back to Yahoo Finance.
+
+## Production Database: PostgreSQL
+
+SQLite is perfect for development and single-user desktop use. If you are running the headless updater alongside the Streamlit dashboard, or if multiple users will access the app, switch to PostgreSQL.
+
+### 1. Install PostgreSQL
+
+On Windows, download and install from [postgresql.org/download](https://www.postgresql.org/download/windows/). On macOS/Linux, use your package manager or Docker.
+
+### 2. Create the database and user
+
+Run the included SQL bootstrap as the `postgres` superuser:
+
+```powershell
+psql -U postgres -f .\scripts\setup_postgres.sql
+```
+
+### 3. Update your `.env`
+
+```env
+DATABASE_URL=postgresql://alphalens:changeme@localhost:5432/alphalens
+```
+
+### 4. Install the driver and create the tables
+
+```bash
+pip install -r requirements.txt
+python -c "from app.database.init_db import init_database; init_database()"
+```
+
+The app will create the tables automatically. No manual schema import is required.
+
 ## Database Migrations
 
 ### Create a New Migration

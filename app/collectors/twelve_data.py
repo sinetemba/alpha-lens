@@ -190,8 +190,22 @@ class TwelveDataCollector:
 
             return data
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error making request to Twelve Data API: {e}")
+        except requests.exceptions.RequestException as exc:
+            # Never log `str(exc)` directly - requests exceptions can include the
+            # full request URL, which would leak the API key.
+            response = getattr(exc, "response", None)
+            if response is not None:
+                logger.error(
+                    f"Twelve Data API request failed ({response.status_code} {response.reason})"
+                )
+                try:
+                    body = response.text[:500]
+                    if body:
+                        logger.error(f"Twelve Data response body: {body}")
+                except Exception:
+                    pass
+            else:
+                logger.error(f"Twelve Data request failed before a response was received: {exc.__class__.__name__}")
             return None
     
     def get_price(self, symbol: str) -> Optional[Dict]:

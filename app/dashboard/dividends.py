@@ -8,7 +8,7 @@ from app.models.portfolio import PortfolioHolding
 from app.models.stock import Stock
 from app.services.data_service import DataService
 from app.collectors.moneyweb import MoneywebCollector
-from app.dashboard.utils import format_stock_label, render_last_fetch_caption
+from app.dashboard.utils import format_stock_label, render_last_fetch_caption, _to_display_tz
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 
 
@@ -69,7 +69,7 @@ def show_dividends(db: Session):
             MoneywebDividendWatch.fetched_at.desc()
         ).first()
         if latest and latest.fetched_at:
-            st.caption(f"Last fetched: {latest.fetched_at.strftime('%Y-%m-%d %H:%M')} UTC")
+            st.caption(f"Last fetched: {_to_display_tz(latest.fetched_at).strftime('%Y-%m-%d %H:%M')} SAST")
 
         data = []
         for d in moneyweb_rows:

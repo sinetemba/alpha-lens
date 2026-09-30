@@ -3,6 +3,7 @@ from typing import Iterable, NamedTuple, Optional
 from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.config.settings import settings
 from app.models.news import NewsArticle
@@ -18,6 +19,16 @@ class PriceSnapshot(NamedTuple):
     rsi: Optional[float] = None
     macd: Optional[float] = None
     macd_signal: Optional[float] = None
+
+
+def day_of(col):
+    """Return a cross-DB expression for the date (day) of a timestamp column.
+
+    SQLite uses strftime; PostgreSQL uses date_trunc.
+    """
+    if "sqlite" in settings.database_url:
+        return func.strftime('%Y-%m-%d', col)
+    return func.date_trunc('day', col)
 
 
 def format_stock_label(symbol: str, name: Optional[str] = None) -> str:
@@ -48,13 +59,16 @@ def style_gain_loss_row(row: pd.Series) -> list[str]:
 def get_latest_market_data_timestamp(
     db: Session, symbols: Optional[Iterable[str]] = None
 ) -> Optional[datetime]:
-    query = db.query(StockPrice.timestamp)
+    # fetched_at tracks when data was last pulled from a provider; fall back to
+    # the bar timestamp for rows predating the column.
+    freshness = func.coalesce(StockPrice.fetched_at, StockPrice.timestamp)
+    query = db.query(freshness)
     if symbols is not None:
         symbols = list(symbols)
         if not symbols:
             return None
         query = query.filter(StockPrice.symbol.in_(symbols))
-    latest_price = query.order_by(StockPrice.timestamp.desc()).first()
+    latest_price = query.order_by(freshness.desc()).first()
     return latest_price[0] if latest_price else None
 
 

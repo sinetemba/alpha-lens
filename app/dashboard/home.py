@@ -8,22 +8,24 @@ from app.models.base import SessionLocal
 from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
 from app.models.portfolio import Portfolio, PortfolioHolding
+from app.models.watchlist import WatchlistItem
 from app.config.settings import settings
 from app.collectors.moneyweb import MoneywebCollector
 from app.dashboard.utils import (
+    day_of,
     format_stock_label,
     PriceSnapshot,
     get_latest_market_data_timestamp,
     get_latest_news_timestamp,
     format_market_data_age,
     format_news_age,
+    _to_display_tz,
 )
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 from app.services.data_service import DataService
 from loguru import logger
 
-# Yahoo Finance symbol for the JSE All Share Index (J203)
-JSE_INDEX_YF_SYMBOL = "^J203.JO"
+
 
 # Data sources shown per page in the top-right header.
 PAGE_DATA_SOURCES = {
@@ -32,6 +34,7 @@ PAGE_DATA_SOURCES = {
     "Portfolio": "EasyEquities, Twelve Data, Yahoo Finance",
     "Dividends": "Yahoo Finance, Moneyweb",
     "Company View": "Twelve Data, Yahoo Finance",
+    "Penny Stocks": "Yahoo Finance, RSS feeds",
     "Commodities": "Metals.dev, Yahoo Finance",
     "Krugerrands": "GoldAPI",
 }
@@ -80,7 +83,7 @@ def show_home():
         # Sidebar navigation
         page = st.sidebar.radio(
             "Navigate",
-            ["Home", "Watchlist", "Portfolio", "Dividends", "Company View", "Commodities", "Krugerrands"],
+            ["Home", "Watchlist", "Portfolio", "Dividends", "Company View", "Penny Stocks", "Commodities", "Krugerrands"],
             index=0
         )
 
@@ -113,6 +116,9 @@ def show_home():
             elif page == "Company View":
                 from .company import show_company
                 show_company(db)
+            elif page == "Penny Stocks":
+                from .penny_stocks import show_penny_stocks
+                show_penny_stocks(db)
             elif page == "Commodities":
                 from .commodities import show_commodities
                 show_commodities(db)
@@ -127,16 +133,19 @@ def show_home():
 def _render_home(db: Session):
     """Render the home page content."""
     # Ensure JSE index symbol exists in the database
-    if not db.query(Stock).filter(Stock.symbol == JSE_INDEX_YF_SYMBOL).first():
-        db.add(Stock(symbol=JSE_INDEX_YF_SYMBOL, name="JSE All Share Index"))
+    if not db.query(Stock).filter(Stock.symbol == settings.jse_index_yf_symbol).first():
+        db.add(Stock(symbol=settings.jse_index_yf_symbol, name="JSE All Share Index"))
         db.commit()
 
+    watchlist_symbols = [
+        item.symbol for item in db.query(WatchlistItem).filter(WatchlistItem.is_active == True).all()
+    ]
     portfolio_symbols = [
         h.symbol for h in db.query(PortfolioHolding).filter(
             ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
         ).all()
     ]
-    refresh_symbols = sorted(set(portfolio_symbols + [JSE_INDEX_YF_SYMBOL]))
+    refresh_symbols = sorted(set(watchlist_symbols + portfolio_symbols + [settings.jse_index_yf_symbol]))
 
     _render_home_refresh_control(db, refresh_symbols)
 
@@ -199,7 +208,7 @@ def _render_home_refresh_control(db: Session, symbols: list[str]) -> None:
 def _get_jse_index(db: Session) -> str:
     """Get current JSE index value from the database."""
     latest = db.query(StockPrice).filter(
-        StockPrice.symbol == JSE_INDEX_YF_SYMBOL
+        StockPrice.symbol == settings.jse_index_yf_symbol
     ).order_by(StockPrice.timestamp.desc()).first()
 
     if latest and latest.close_price:
@@ -210,8 +219,8 @@ def _get_jse_index(db: Session) -> str:
 @st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
 def _get_jse_change(db: Session) -> str:
     """Get JSE index daily percentage change."""
-    prices = _get_latest_and_previous_prices(db, [JSE_INDEX_YF_SYMBOL])
-    latest, prev = prices.get(JSE_INDEX_YF_SYMBOL, (None, None))
+    prices = _get_latest_and_previous_prices(db, [settings.jse_index_yf_symbol])
+    latest, prev = prices.get(settings.jse_index_yf_symbol, (None, None))
 
     if not latest:
         return "N/A"
@@ -314,10 +323,10 @@ def _get_latest_and_previous_prices(
         StockPrice.macd_signal,
         func.dense_rank().over(
             partition_by=StockPrice.symbol,
-            order_by=func.strftime('%Y-%m-%d', StockPrice.timestamp).desc(),
+            order_by=day_of(StockPrice.timestamp).desc(),
         ).label('day_rank'),
         func.row_number().over(
-            partition_by=[StockPrice.symbol, func.strftime('%Y-%m-%d', StockPrice.timestamp)],
+            partition_by=[StockPrice.symbol, day_of(StockPrice.timestamp)],
             order_by=StockPrice.timestamp.desc(),
         ).label('intra_rank'),
     ).filter(StockPrice.symbol.in_(symbols)).cte('ranked')
@@ -431,6 +440,6 @@ def _render_news_feed(db: Session):
 
     for article in recent_news:
         with st.expander(f"**{article.title}** - {article.source}"):
-            st.markdown(f"*Published: {article.published_at.strftime('%Y-%m-%d %H:%M')}*")
+            st.markdown(f"*Published: {_to_display_tz(article.published_at).strftime('%Y-%m-%d %H:%M')}*")
             st.markdown(article.summary)
             st.markdown(f"[Read more]({article.url})")

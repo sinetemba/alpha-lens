@@ -54,6 +54,19 @@ def _migrate_schema():
                 )
             print("Migration: added 'last_easyequities_sync' column to portfolios.")
 
+    # --- stock_prices.fetched_at (tracks last fetch time, unlike bar timestamp) ---
+    if "stock_prices" in inspector.get_table_names():
+        columns = [col["name"] for col in inspector.get_columns("stock_prices")]
+        if "fetched_at" not in columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE stock_prices ADD COLUMN fetched_at TIMESTAMP")
+                )
+                conn.execute(
+                    text("UPDATE stock_prices SET fetched_at = COALESCE(created_at, timestamp)")
+                )
+            print("Migration: added 'fetched_at' column to stock_prices.")
+
 
 def _backfill_stock_names():
     """Apply known display-name overrides to existing Stock rows.

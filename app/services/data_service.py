@@ -129,10 +129,11 @@ class DataService:
                 StockPrice.symbol == symbol,
                 StockPrice.timestamp == timestamp
             ).first()
-            
+
             if existing:
+                existing.fetched_at = datetime.now(timezone.utc)
                 return
-            
+
             # Get or create stock
             stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
             if not stock:
@@ -168,16 +169,19 @@ class DataService:
             timestamp = latest.name.to_pydatetime()
             if timestamp.tzinfo is None:
                 timestamp = timestamp.replace(tzinfo=timezone.utc)
+            else:
+                timestamp = timestamp.astimezone(timezone.utc)
             
             # Check if we already have data for this timestamp
             existing = self.db.query(StockPrice).filter(
                 StockPrice.symbol == symbol,
                 StockPrice.timestamp == timestamp
             ).first()
-            
+
             if existing:
+                existing.fetched_at = datetime.now(timezone.utc)
                 return
-            
+
             # Get or create stock
             stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
             if not stock:
@@ -223,6 +227,19 @@ class DataService:
             t[0] for t in
             self.db.query(StockPrice.timestamp).filter(StockPrice.symbol == symbol).all()
         }
+
+        fetched_timestamps = {
+            record.get("timestamp") for record in records if record.get("timestamp")
+        }
+        refetched = fetched_timestamps & existing
+        if refetched:
+            self.db.query(StockPrice).filter(
+                StockPrice.symbol == symbol,
+                StockPrice.timestamp.in_(refetched),
+            ).update(
+                {"fetched_at": datetime.now(timezone.utc)},
+                synchronize_session=False,
+            )
 
         new_prices = []
         for record in records:
@@ -440,6 +457,8 @@ class DataService:
                 timestamp = index.to_pydatetime()
                 if timestamp.tzinfo is None:
                     timestamp = timestamp.replace(tzinfo=timezone.utc)
+                else:
+                    timestamp = timestamp.astimezone(timezone.utc)
                 records.append({
                     "timestamp": timestamp,
                     "open": row.get("Open", 0),

@@ -87,6 +87,9 @@ Thumbs.db
 *.bak
 *.swp
 
+# Local improvement notes
+improvement.md
+
 # Claude Code / tooling
 .claude/
 .tokensave/

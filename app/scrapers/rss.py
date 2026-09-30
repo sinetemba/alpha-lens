@@ -1,7 +1,7 @@
 import feedparser
 from email.utils import parsedate_to_datetime
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from app.config.settings import settings
 from loguru import logger
 
@@ -59,7 +59,10 @@ class RSSScraper:
             return None
         
         try:
-            return parsedate_to_datetime(date_str)
+            parsed = parsedate_to_datetime(date_str)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
         except Exception as e:
             logger.warning(f"Error parsing date '{date_str}': {e}")
         

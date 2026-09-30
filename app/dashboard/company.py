@@ -7,7 +7,7 @@ from typing import List, Dict, Optional
 from app.models.base import SessionLocal
 from app.models.news import NewsArticle
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_stock_label, render_last_fetch_caption
+from app.dashboard.utils import format_stock_label, render_last_fetch_caption, _to_display_tz
 from app.services.company_news import CompanyNewsService
 from datetime import datetime, timedelta, timezone
 from loguru import logger
@@ -309,7 +309,7 @@ def _render_company_news(db: Session, symbol: str):
     
     for article in news:
         published = article.get("published_at")
-        published_str = published.strftime("%Y-%m-%d %H:%M") if published else "Unknown"
+        published_str = _to_display_tz(published).strftime("%Y-%m-%d %H:%M") if published else "Unknown"
         with st.expander(f"**{article['title']}** - {article['source']}"):
             st.markdown(f"*Published: {published_str}*")
             st.markdown(article.get("summary", ""))

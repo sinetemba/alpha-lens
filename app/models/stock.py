@@ -66,6 +66,11 @@ class StockPrice(Base):
     
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+    # When this row was last (re)fetched from a provider. Unlike ``timestamp``
+    # (the bar's as-of time), this advances on every refresh, including when an
+    # existing bar is re-fetched and deduplicated.
+    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
     # Relationships
     stock = relationship("Stock", back_populates="prices")
 

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.models.portfolio import Portfolio, PortfolioHolding
 from app.models.stock import Stock, StockPrice
 from app.dashboard.utils import (
+    day_of,
     format_stock_label,
     is_market_data_stale,
     PriceSnapshot,
@@ -315,10 +316,10 @@ def _get_group_latest_and_previous_prices(
         StockPrice.macd_signal,
         func.dense_rank().over(
             partition_by=StockPrice.symbol,
-            order_by=func.strftime('%Y-%m-%d', StockPrice.timestamp).desc(),
+            order_by=day_of(StockPrice.timestamp).desc(),
         ).label('day_rank'),
         func.row_number().over(
-            partition_by=[StockPrice.symbol, func.strftime('%Y-%m-%d', StockPrice.timestamp)],
+            partition_by=[StockPrice.symbol, day_of(StockPrice.timestamp)],
             order_by=StockPrice.timestamp.desc(),
         ).label('intra_rank'),
     ).filter(StockPrice.symbol.in_(symbols)).cte('ranked')
