@@ -344,6 +344,10 @@ def _render_outlook(row: dict):
         else:
             st.info("Not enough history for a projection.")
         st.caption("Simple trend extrapolation — highly speculative for penny stocks.")
+        st.link_button(
+            "MoneyWeb watch",
+            f"https://www.moneyweb.co.za/tools-and-data/click-a-company/{row['symbol']}/",
+        )
 
     with col2:
         st.markdown("**⚖️ Key Influences**")
