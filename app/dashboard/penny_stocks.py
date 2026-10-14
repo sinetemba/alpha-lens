@@ -128,15 +128,40 @@ def show_penny_stocks(db: Session):
         selection_mode="single-row",
         key="penny_stock_grid",
         column_config={
-            "Price": st.column_config.NumberColumn("Price", format="R %.2f"),
-            "Day %": st.column_config.NumberColumn("Day %", format="%+.2f%%"),
-            "52w Low": st.column_config.NumberColumn("52w Low", format="R %.2f"),
-            "52w High": st.column_config.NumberColumn("52w High", format="R %.2f"),
-            "Above Low %": st.column_config.NumberColumn("Above Low", format="%+.1f%%"),
-            "RSI": st.column_config.NumberColumn("RSI", format="%.0f"),
-            "3m %": st.column_config.NumberColumn("3m %", format="%+.1f%%"),
+            "Stock": st.column_config.TextColumn(
+                "Stock", help="Ticker and company name of the scanned share"
+            ),
+            "Price": st.column_config.NumberColumn(
+                "Price", format="R %.2f",
+                help="Latest share price in Rand (last close from Yahoo Finance)",
+            ),
+            "Day %": st.column_config.NumberColumn(
+                "Day %", format="%+.2f%%",
+                help="Price change vs the previous trading day's close",
+            ),
+            "52w Low": st.column_config.NumberColumn(
+                "52w Low", format="R %.2f",
+                help="Lowest price over the past 52 weeks",
+            ),
+            "52w High": st.column_config.NumberColumn(
+                "52w High", format="R %.2f",
+                help="Highest price over the past 52 weeks",
+            ),
+            "Above Low %": st.column_config.NumberColumn(
+                "Above Low", format="%+.1f%%",
+                help="How far the current price sits above its 52-week low",
+            ),
+            "RSI": st.column_config.NumberColumn(
+                "RSI", format="%.0f",
+                help="Relative Strength Index (14-day): below 30 = oversold, above 70 = overbought",
+            ),
+            "3m %": st.column_config.NumberColumn(
+                "3m %", format="%+.1f%%",
+                help="3-month price momentum (change vs ~63 trading days ago)",
+            ),
             "Potential": st.column_config.ProgressColumn(
-                "Potential", min_value=0, max_value=100, format="%d"
+                "Potential", min_value=0, max_value=100, format="%d",
+                help="Heuristic 0-100 upside score: MACD, RSI, price vs SMA-20/50, 3-month momentum, recent volume",
             ),
         },
     )
