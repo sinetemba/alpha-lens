@@ -110,3 +110,5 @@ The `strftime('%Y-%m-%d', timestamp)` function is SQLite-only. For PostgreSQL, u
 - Save helpers in `data_service.py` (`_save_price_from_quote`, `_save_price_from_history`) return `bool` and roll back on error. `update_stock_prices` batches Twelve Data quotes 10-per-request and Yahoo fallbacks via `yf.download`.
 - The Twelve Data daily counter is shared across processes via `data/.twelve_data_usage`.
 - `run_updater.py --price-news|--full|--logon` exits non-zero when a run fails — Task Scheduler will show failure.
+- The daemon checks market-data freshness every 60s and runs a catch-up update when the last fetch is >4h old (covers jobs misfired while the machine slept — APScheduler drops those past `misfire_grace_time`). Catch-up retries no more than once per 30min and can't overlap a scheduled run (`_job_lock`).
+- APScheduler's own logging (misfires, job errors) is routed into `updater.log` via a stdlib→loguru handler in `setup()`.

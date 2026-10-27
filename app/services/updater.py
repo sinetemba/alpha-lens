@@ -14,8 +14,10 @@ Schedule defaults (all Africa/Johannesburg):
 import os
 import sys
 import time
+import logging
+import threading
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +25,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.events import EVENT_JOB_ERROR
 from loguru import logger
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 # Make sure app imports resolve when the script is run from any cwd.
@@ -35,6 +38,7 @@ from app.database.init_db import init_database
 from app.models.base import SessionLocal
 from app.models.watchlist import WatchlistItem
 from app.models.portfolio import PortfolioHolding
+from app.models.stock import StockPrice
 from app.services.data_service import DataService
 from app.scrapers.news import NewsScraper
 from app.collectors.twelve_data import TwelveDataCollector
@@ -133,12 +137,64 @@ def _record_logon_update() -> None:
 class UpdaterService:
     """Headless background updater for AlphaLens."""
 
+    # How old stored market data may get before the daemon makes up a missed
+    # run itself, and how long to wait before retrying a failed catch-up.
+    CATCH_UP_MAX_AGE = timedelta(hours=4)
+    CATCH_UP_RETRY_SECONDS = 30 * 60
+
     def __init__(self):
         self.scheduler = BackgroundScheduler(timezone=settings.scheduler_timezone)
         self.scheduler.add_listener(self._on_job_error, EVENT_JOB_ERROR)
+        # Serializes price+news runs across cron jobs, catch-up and logon
+        # one-shots so they can never overlap.
+        self._job_lock = threading.Lock()
+        self._last_catch_up_attempt: Optional[datetime] = None
 
     def _on_job_error(self, event):
         logger.error(f"Scheduler job {event.job_id} failed: {event.exception}")
+
+    def _catch_up_if_stale(self) -> None:
+        """Run a price+news update when stored market data is too old.
+
+        APScheduler drops jobs that misfire past their grace period (e.g.
+        while the machine was asleep or hibernated), so the daemon checks
+        once a minute whether the last successful fetch is older than
+        CATCH_UP_MAX_AGE and makes up the missed run itself. This also
+        covers daemon startup after downtime.
+        """
+        now = datetime.now(timezone.utc)
+        if (
+            self._last_catch_up_attempt is not None
+            and (now - self._last_catch_up_attempt).total_seconds() < self.CATCH_UP_RETRY_SECONDS
+        ):
+            return
+
+        db = SessionLocal()
+        try:
+            latest_fetched, latest_bar = db.query(
+                func.max(StockPrice.fetched_at), func.max(StockPrice.timestamp)
+            ).first()
+        except Exception as e:
+            logger.warning(f"Catch-up freshness check failed: {e}")
+            return
+        finally:
+            db.close()
+
+        latest = max(
+            (t for t in (latest_fetched, latest_bar) if t is not None), default=None
+        )
+        if latest is not None:
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=timezone.utc)
+            if now - latest <= self.CATCH_UP_MAX_AGE:
+                return
+
+        self._last_catch_up_attempt = now
+        logger.info(
+            f"Market data stale (last fetch: {latest or 'never'}) - running catch-up update"
+        )
+        if not self._update_prices_and_news():
+            logger.warning("Catch-up update did not complete successfully")
 
     def _update_prices_and_news(self) -> bool:
         """3x-daily job: update tracked stock prices and collect news.
@@ -146,6 +202,9 @@ class UpdaterService:
         Returns True on success so one-shot invocations can propagate a
         non-zero exit code to Task Scheduler.
         """
+        if not self._job_lock.acquire(blocking=False):
+            logger.warning("Price + news update skipped: another update is in progress")
+            return False
         logger.info("Running scheduled price + news update")
         db = SessionLocal()
         try:
@@ -175,6 +234,7 @@ class UpdaterService:
             return False
         finally:
             db.close()
+            self._job_lock.release()
 
     def _update_historical(self) -> bool:
         """Daily job: update historical data and dividends for tracked symbols."""
@@ -262,6 +322,18 @@ class UpdaterService:
             level=settings.log_level,
         )
 
+        # APScheduler logs misfires/errors through stdlib logging, not loguru -
+        # route them into the same file so dropped jobs are visible.
+        class _LoguruHandler(logging.Handler):
+            def emit(self, record):
+                logger.opt(depth=6, exception=record.exc_info).log(
+                    record.levelname, record.getMessage()
+                )
+
+        apscheduler_logger = logging.getLogger("apscheduler")
+        apscheduler_logger.addHandler(_LoguruHandler())
+        apscheduler_logger.setLevel(logging.INFO)
+
         try:
             init_database()
             logger.info("Database initialized")
@@ -282,6 +354,7 @@ class UpdaterService:
                     break
                 elif stop_event is None:
                     time.sleep(60)
+                self._catch_up_if_stale()
         except KeyboardInterrupt:
             logger.info("Shutting down updater service (keyboard interrupt)")
         finally:
