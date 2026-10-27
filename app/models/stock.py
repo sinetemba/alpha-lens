@@ -69,14 +69,16 @@ class StockPrice(Base):
     # When this row was last (re)fetched from a provider. Unlike ``timestamp``
     # (the bar's as-of time), this advances on every refresh, including when an
     # existing bar is re-fetched and deduplicated.
-    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
     # Relationships
     stock = relationship("Stock", back_populates="prices")
 
-    # Composite index for efficient queries
+    # One bar per (symbol, timestamp): the dashboard scheduler and the headless
+    # updater can run concurrently, and dedup is check-then-insert - this
+    # constraint is the last line of defence against duplicate bars.
     __table_args__ = (
-        Index('ix_stock_prices_symbol_timestamp', 'symbol', 'timestamp'),
+        Index('ix_stock_prices_symbol_timestamp', 'symbol', 'timestamp', unique=True),
     )
 
     def __repr__(self):

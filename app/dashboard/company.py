@@ -264,16 +264,14 @@ def _render_historical_data(db: Session, symbol: str):
     st.dataframe(data, use_container_width=True)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def _get_company_news(symbol: str, company_name: Optional[str]) -> List[Dict]:
-    """Fetch live news for a company. Only cache non-empty results."""
-    cache_key = f"company_news_{symbol}"
-    if cache_key in st.session_state and st.session_state[cache_key]:
-        return st.session_state[cache_key]
-    
-    news = CompanyNewsService().get_company_news(symbol, company_name)
-    if news:
-        st.session_state[cache_key] = news
-    return news
+    """Fetch live news for a company, cached 10 min.
+
+    session_state caching was unbounded (never refreshed) when it hit and
+    re-fetched on every rerun when it missed; a timed cache fixes both.
+    """
+    return CompanyNewsService().get_company_news(symbol, company_name) or []
 
 
 def _render_company_news(db: Session, symbol: str):

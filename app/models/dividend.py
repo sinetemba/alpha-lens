@@ -27,9 +27,9 @@ class Dividend(Base):
     # Relationships
     stock = relationship("Stock", back_populates="dividends")
 
-    # Composite index for efficient queries
+    # One dividend per (symbol, ex-date): dedup across providers.
     __table_args__ = (
-        Index('ix_dividends_symbol_ex_date', 'symbol', 'ex_dividend_date'),
+        Index('ix_dividends_symbol_ex_date', 'symbol', 'ex_dividend_date', unique=True),
     )
 
     def __repr__(self):

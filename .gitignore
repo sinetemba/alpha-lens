@@ -41,6 +41,10 @@ data/*.db-wal
 data/*.sqlite
 data/*.sqlite3
 
+# Runtime state
+data/.twelve_data_usage
+data/.updater_last_logon
+
 # Logs
 *.log
 logs/

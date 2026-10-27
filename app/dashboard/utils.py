@@ -21,12 +21,14 @@ class PriceSnapshot(NamedTuple):
     macd_signal: Optional[float] = None
 
 
-def day_of(col):
+def day_of(db: Session, col):
     """Return a cross-DB expression for the date (day) of a timestamp column.
 
-    SQLite uses strftime; PostgreSQL uses date_trunc.
+    SQLite uses strftime; PostgreSQL uses date_trunc. The choice is made from
+    the session's engine dialect, not settings, so tests running on SQLite
+    still work when .env points at PostgreSQL.
     """
-    if "sqlite" in settings.database_url:
+    if db.bind.dialect.name == "sqlite":
         return func.strftime('%Y-%m-%d', col)
     return func.date_trunc('day', col)
 
@@ -60,16 +62,20 @@ def get_latest_market_data_timestamp(
     db: Session, symbols: Optional[Iterable[str]] = None
 ) -> Optional[datetime]:
     # fetched_at tracks when data was last pulled from a provider; fall back to
-    # the bar timestamp for rows predating the column.
-    freshness = func.coalesce(StockPrice.fetched_at, StockPrice.timestamp)
-    query = db.query(freshness)
+    # the bar timestamp for rows predating the column. Two indexed MAX()s beat
+    # ORDER BY coalesce(...) which cannot use either index.
+    query = db.query(
+        func.max(StockPrice.fetched_at),
+        func.max(StockPrice.timestamp),
+    )
     if symbols is not None:
         symbols = list(symbols)
         if not symbols:
             return None
         query = query.filter(StockPrice.symbol.in_(symbols))
-    latest_price = query.order_by(freshness.desc()).first()
-    return latest_price[0] if latest_price else None
+    latest_fetched, latest_bar = query.first()
+    candidates = [t for t in (latest_fetched, latest_bar) if t is not None]
+    return max(candidates) if candidates else None
 
 
 def _ensure_aware(timestamp: datetime) -> datetime:

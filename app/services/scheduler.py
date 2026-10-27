@@ -84,6 +84,9 @@ class SchedulerService:
             symbols = self._get_tracked_symbols(db)
             updated = data_service.update_stock_prices(symbols)
             logger.info(f"Hourly price update completed: {updated} symbols updated")
+
+            from app.services.updater import _run_notification_checks
+            _run_notification_checks(db)
         except Exception as e:
             logger.error(f"Error in hourly price update: {e}")
         finally:
@@ -108,8 +111,12 @@ class SchedulerService:
             h.symbol for h in db.query(PortfolioHolding).filter(
                 ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
             ).all()
+            # EasyEquities USD-account holdings are stored under bare symbols
+            # (e.g. "AAPL"); they are not JSE listings, so tracking them would
+            # save wrong-exchange prices via the Yahoo ".JO" fallback.
+            if "USD" not in (h.account_type or "").upper()
         ]
-        symbols = sorted(set(watchlist_symbols + portfolio_symbols))
+        symbols = sorted(set(watchlist_symbols + portfolio_symbols) | {settings.jse_index_yf_symbol})
         return symbols if symbols else settings.default_watchlist_symbols
     
     def _hourly_news_collection(self):
@@ -133,19 +140,8 @@ class SchedulerService:
         db = SessionLocal()
         try:
             data_service = DataService(db)
-            
-            # Get watchlist symbols
-            from app.models.watchlist import WatchlistItem
-            watchlist_items = db.query(WatchlistItem).filter(
-                WatchlistItem.is_active == True
-            ).all()
-            
-            symbols = list(set([item.symbol for item in watchlist_items]))
-            
-            if not symbols:
-                # Use default watchlist
-                symbols = settings.default_watchlist_symbols
-            
+            symbols = self._get_tracked_symbols(db)
+
             for symbol in symbols:
                 data_service.update_historical_data(symbol, days=365)
             

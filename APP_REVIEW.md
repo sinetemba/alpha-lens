@@ -1,5 +1,8 @@
 # AlphaLens App Review
 
+> **Superseded (2026-10-27):** most issues below have been fixed. The live
+> backlog is in `improvement.md`. This file is kept for historical context.
+
 Comprehensive review of the AlphaLens JSE Stock Analysis Platform — gaps, bugs, improvements, and feature roadmap.
 
 ---

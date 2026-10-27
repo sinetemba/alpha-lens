@@ -323,10 +323,10 @@ def _get_latest_and_previous_prices(
         StockPrice.macd_signal,
         func.dense_rank().over(
             partition_by=StockPrice.symbol,
-            order_by=day_of(StockPrice.timestamp).desc(),
+            order_by=day_of(db, StockPrice.timestamp).desc(),
         ).label('day_rank'),
         func.row_number().over(
-            partition_by=[StockPrice.symbol, day_of(StockPrice.timestamp)],
+            partition_by=[StockPrice.symbol, day_of(db, StockPrice.timestamp)],
             order_by=StockPrice.timestamp.desc(),
         ).label('intra_rank'),
     ).filter(StockPrice.symbol.in_(symbols)).cte('ranked')

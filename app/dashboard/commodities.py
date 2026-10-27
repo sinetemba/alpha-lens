@@ -40,13 +40,19 @@ def show_commodities(db: Session):
     with col2:
         if st.button("🔄 Refresh Prices"):
             with st.spinner("Fetching commodity data..."):
-                _refresh_commodity_prices(db)
-            st.success("Prices refreshed.")
+                saved, failures = _refresh_commodity_prices(db)
+            if failures:
+                st.warning(f"Refresh finished with {failures} failed source(s) - see logs for details.")
+            elif saved:
+                st.success(f"Prices refreshed ({saved} new data points saved).")
+            else:
+                st.info("No new commodity data fetched.")
             st.rerun()
 
     st.markdown("---")
 
-    _render_commodity_summary(db, api_collector)
+    with st.spinner("Loading commodity prices..."):
+        _render_commodity_summary(db, api_collector)
 
     st.markdown("---")
 
@@ -110,30 +116,42 @@ def _ensure_commodity_stocks(db: Session) -> None:
     db.commit()
 
 
-def _refresh_commodity_prices(db: Session) -> None:
-    """Fetch latest rates from Metals.dev and historical prices via DataService."""
-    api_collector = MetalsDevCollector()
+def _refresh_commodity_prices(db: Session) -> tuple[int, int]:
+    """Fetch latest rates from Metals.dev and historical prices via Alpha Vantage.
 
+    Returns (saved_points, failed_sources) so the UI can report honestly.
+    """
+    saved = 0
+    failures = 0
+
+    api_collector = MetalsDevCollector()
     if api_collector.enabled:
         try:
             latest_rates = api_collector.get_latest_rates()
             _save_latest_rates(db, latest_rates)
+            if latest_rates:
+                saved += len(latest_rates)
         except Exception as e:
+            failures += 1
             logger.error(f"Failed to fetch latest commodity rates: {e}")
 
     historical_collector = AlphaVantageCollector()
-    for api_symbol in HISTORICAL_COMMODITIES:
-        try:
-            historical_prices = historical_collector.get_commodity_history(api_symbol)
-            if historical_prices:
-                cutoff = datetime.now(timezone.utc) - timedelta(days=365)
-                _save_historical_prices(
-                    db,
-                    api_symbol,
-                    [point for point in historical_prices if point["timestamp"] >= cutoff],
-                )
-        except Exception as e:
-            logger.error(f"Failed to refresh historical prices for {api_symbol}: {e}")
+    if historical_collector.enabled:
+        for api_symbol in HISTORICAL_COMMODITIES:
+            try:
+                historical_prices = historical_collector.get_commodity_history(api_symbol)
+                if historical_prices:
+                    cutoff = datetime.now(timezone.utc) - timedelta(days=365)
+                    saved += _save_historical_prices(
+                        db,
+                        api_symbol,
+                        [point for point in historical_prices if point["timestamp"] >= cutoff],
+                    )
+            except Exception as e:
+                failures += 1
+                logger.error(f"Failed to refresh historical prices for {api_symbol}: {e}")
+
+    return saved, failures
 
 
 def _save_historical_prices(db: Session, api_symbol: str, historical_prices: list[dict]) -> int:
@@ -144,20 +162,36 @@ def _save_historical_prices(db: Session, api_symbol: str, historical_prices: lis
         db.add(stock)
         db.flush()
 
+    def _norm(ts):
+        return ts.astimezone(timezone.utc).replace(tzinfo=None) if ts.tzinfo else ts
+
+    # One set-membership check against the DB replaces a SELECT per data point.
+    timestamps = [_norm(p["timestamp"]) for p in historical_prices if p.get("timestamp")]
+    if not timestamps:
+        return 0
+    existing = {
+        t[0] for t in db.query(StockPrice.timestamp).filter(
+            StockPrice.symbol == database_symbol,
+            StockPrice.timestamp.in_(timestamps),
+        ).all()
+    }
+
     saved = 0
     for point in historical_prices:
-        existing = db.query(StockPrice).filter(
-            StockPrice.symbol == database_symbol,
-            StockPrice.timestamp == point["timestamp"],
-        ).first()
-        if existing:
-            existing.fetched_at = datetime.now(timezone.utc)
+        timestamp = point.get("timestamp")
+        if not timestamp:
+            continue
+        timestamp = _norm(timestamp)
+        if timestamp in existing:
+            continue
+        close = point.get("close")
+        if close is None or close <= 0:
             continue
         db.add(StockPrice(
             stock_id=stock.id,
             symbol=database_symbol,
-            timestamp=point["timestamp"],
-            close_price=point["close"],
+            timestamp=timestamp,
+            close_price=close,
         ))
         saved += 1
 

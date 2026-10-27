@@ -67,6 +67,73 @@ def _migrate_schema():
                 )
             print("Migration: added 'fetched_at' column to stock_prices.")
 
+    _enforce_unique_indexes(inspector)
+    _ensure_plain_indexes(inspector)
+
+
+def _enforce_unique_indexes(inspector):
+    """Deduplicate rows and enforce unique indexes that protect against
+    concurrent writers (dashboard scheduler + headless updater).
+
+    ``create_all`` never alters existing tables, so indexes added to the
+    models must be created here for databases that already exist.
+    """
+    from sqlalchemy import text
+
+    table_names = inspector.get_table_names()
+
+    # (table, index name, columns, keep-row rule)
+    targets = [
+        ("stock_prices", "ix_stock_prices_symbol_timestamp", "symbol, timestamp"),
+        ("dividends", "ix_dividends_symbol_ex_date", "symbol, ex_dividend_date"),
+    ]
+
+    for table, index_name, columns in targets:
+        if table not in table_names:
+            continue
+        indexes = {ix["name"]: ix for ix in inspector.get_indexes(table)}
+        existing = indexes.get(index_name)
+        if existing and existing.get("unique"):
+            continue
+        with engine.begin() as conn:
+            # Keep the most recently inserted row of each duplicate group.
+            conn.execute(text(
+                f"DELETE FROM {table} WHERE id NOT IN ("
+                f"SELECT MAX(id) FROM {table} GROUP BY {columns})"
+            ))
+            if existing:
+                conn.execute(text(f"DROP INDEX {index_name}"))
+            conn.execute(text(
+                f"CREATE UNIQUE INDEX {index_name} ON {table} ({columns})"
+            ))
+        print(f"Migration: deduplicated {table} and made ({columns}) unique.")
+
+
+def _ensure_plain_indexes(inspector):
+    """Create non-unique indexes added to models after the table already exists."""
+    from sqlalchemy import text
+
+    table_names = inspector.get_table_names()
+
+    targets = [
+        ("stock_prices", "ix_stock_prices_fetched_at", "fetched_at"),
+        ("portfolio_holdings", "ix_portfolio_holdings_portfolio_id", "portfolio_id"),
+        ("portfolio_holdings", "ix_portfolio_holdings_stock_id", "stock_id"),
+        ("watchlist_items", "ix_watchlist_items_is_active", "is_active"),
+        ("news_articles", "ix_news_articles_created_at", "created_at"),
+    ]
+
+    for table, index_name, columns in targets:
+        if table not in table_names:
+            continue
+        if index_name in {ix["name"] for ix in inspector.get_indexes(table)}:
+            continue
+        with engine.begin() as conn:
+            conn.execute(text(
+                f"CREATE INDEX {index_name} ON {table} ({columns})"
+            ))
+        print(f"Migration: added index {index_name} on {table}({columns}).")
+
 
 def _backfill_stock_names():
     """Apply known display-name overrides to existing Stock rows.

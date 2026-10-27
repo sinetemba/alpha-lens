@@ -40,6 +40,22 @@ from app.scrapers.news import NewsScraper
 from app.collectors.twelve_data import TwelveDataCollector
 
 
+def _run_notification_checks(db: Session) -> None:
+    """Fire watchlist price/technical alerts after fresh prices are saved.
+
+    NotificationService no-ops when notifications are disabled; failures here
+    must never fail the update run.
+    """
+    try:
+        from app.notifications.notification_service import NotificationService
+        notifier = NotificationService(db)
+        notifier.check_price_alerts()
+        notifier.check_technical_alerts()
+        notifier.send_pending_notifications()
+    except Exception as e:
+        logger.error(f"Notification checks failed: {e}")
+
+
 # Track the last time a logon update ran so a user can log on/off repeatedly
 # without hammering the APIs. Always store this in the local data dir so it
 # works for both SQLite and PostgreSQL.
@@ -59,6 +75,10 @@ def _get_tracked_symbols(db: Session) -> list:
         h.symbol for h in db.query(PortfolioHolding).filter(
             ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
         ).all()
+        # EasyEquities USD-account holdings are stored under bare symbols
+        # (e.g. "AAPL"); they are not JSE listings, so tracking them would
+        # save wrong-exchange prices via the Yahoo ".JO" fallback.
+        if "USD" not in (h.account_type or "").upper()
     ]
     tracked = {settings.jse_index_yf_symbol}
     tracked.update(watchlist_symbols)
@@ -71,7 +91,7 @@ def _get_tracked_symbols(db: Session) -> list:
 
 def _estimate_api_calls(symbols: list, include_historical: bool = False) -> int:
     """Rough upper-bound of Twelve Data calls for the next run."""
-    calls = len(symbols)  # quotes
+    calls = -(-len(symbols) // 10)  # quotes are batched 10 symbols per request
     if include_historical:
         calls += len(symbols)
     return calls
@@ -120,8 +140,12 @@ class UpdaterService:
     def _on_job_error(self, event):
         logger.error(f"Scheduler job {event.job_id} failed: {event.exception}")
 
-    def _update_prices_and_news(self):
-        """3x-daily job: update tracked stock prices and collect news."""
+    def _update_prices_and_news(self) -> bool:
+        """3x-daily job: update tracked stock prices and collect news.
+
+        Returns True on success so one-shot invocations can propagate a
+        non-zero exit code to Task Scheduler.
+        """
         logger.info("Running scheduled price + news update")
         db = SessionLocal()
         try:
@@ -132,16 +156,27 @@ class UpdaterService:
             data_service = DataService(db)
             updated = data_service.update_stock_prices(symbols)
             logger.info(f"Updated {updated} tracked stock prices")
+            if symbols and updated == 0:
+                logger.error("Price update refreshed 0 symbols - treating the run as failed")
+                return False
+            if data_service.last_failed_symbols:
+                logger.warning(
+                    f"Symbols with no fresh price this run: {data_service.last_failed_symbols}"
+                )
 
             news_scraper = NewsScraper(db)
             articles = news_scraper.scrape_all_sources()
             logger.info(f"Collected {len(articles)} news articles")
+
+            _run_notification_checks(db)
+            return True
         except Exception as e:
             logger.error(f"Price + news update failed: {e}")
+            return False
         finally:
             db.close()
 
-    def _update_historical(self):
+    def _update_historical(self) -> bool:
         """Daily job: update historical data and dividends for tracked symbols."""
         logger.info("Running daily historical update")
         db = SessionLocal()
@@ -151,17 +186,27 @@ class UpdaterService:
             logger.info(msg)
 
             data_service = DataService(db)
+            failed = 0
             for symbol in symbols:
-                data_service.update_historical_data(symbol, days=365)
+                try:
+                    data_service.update_historical_data(symbol, days=365)
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"Historical update failed for {symbol}: {e}")
 
             data_service.update_dividends(symbols)
             logger.info(f"Daily historical update completed for {len(symbols)} symbols")
+            if symbols and failed == len(symbols):
+                logger.error("Historical update failed for every symbol - treating the run as failed")
+                return False
+            return True
         except Exception as e:
             logger.error(f"Daily historical update failed: {e}")
+            return False
         finally:
             db.close()
 
-    def _weekly_cleanup(self):
+    def _weekly_cleanup(self) -> bool:
         """Weekly job: delete old news articles."""
         logger.info("Running weekly cleanup")
         db = SessionLocal()
@@ -169,8 +214,10 @@ class UpdaterService:
             news_scraper = NewsScraper(db)
             deleted = news_scraper.clean_old_articles(days=90)
             logger.info(f"Cleaned up {deleted} old news articles")
+            return True
         except Exception as e:
             logger.error(f"Weekly cleanup failed: {e}")
+            return False
         finally:
             db.close()
 
@@ -182,6 +229,8 @@ class UpdaterService:
             id="price_news_update",
             name="Price and News Update (3x daily)",
             replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
         )
         self.scheduler.add_job(
             self._update_historical,
@@ -189,6 +238,8 @@ class UpdaterService:
             id="daily_historical",
             name="Daily Historical + Dividend Update",
             replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
         )
         self.scheduler.add_job(
             self._weekly_cleanup,
@@ -196,6 +247,8 @@ class UpdaterService:
             id="weekly_cleanup",
             name="Weekly Old News Cleanup",
             replace_existing=True,
+            misfire_grace_time=86400,
+            coalesce=True,
         )
 
     def setup(self):
@@ -242,28 +295,32 @@ class UpdaterService:
           - price_news: run the 3x-daily price + news job and exit.
           - full: run the 3x-daily job plus historical data and dividends, then exit.
           - logon: run the 3x-daily job only if it has not run recently, then exit.
+
+        One-shot modes exit non-zero on failure so Task Scheduler surfaces the
+        run as failed instead of silently succeeding.
         """
         self.setup()
 
         if mode == "logon":
             if _should_run_logon_update(min_seconds=settings.updater_logon_min_interval or 600):
                 logger.info("Running logon-triggered update")
-                self._update_prices_and_news()
+                ok = self._update_prices_and_news()
                 _record_logon_update()
+                sys.exit(0 if ok else 1)
             else:
                 logger.info("Skipping logon update: ran too recently")
             return
 
         if mode == "price_news":
             logger.info("Running price + news update")
-            self._update_prices_and_news()
-            return
+            ok = self._update_prices_and_news()
+            sys.exit(0 if ok else 1)
 
         if mode == "full":
             logger.info("Running full update")
-            self._update_prices_and_news()
-            self._update_historical()
-            return
+            ok = self._update_prices_and_news()
+            ok = self._update_historical() and ok
+            sys.exit(0 if ok else 1)
 
         self.run_forever(stop_event=stop_event)
 

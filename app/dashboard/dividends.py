@@ -1,5 +1,5 @@
 import streamlit as st
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
 from datetime import datetime, timezone
 
@@ -21,18 +21,25 @@ def show_dividends(db: Session):
     total_dividends = db.query(Dividend).count()
     total_amount = db.query(func.sum(Dividend.amount)).scalar() or 0.0
 
-    holdings = db.query(PortfolioHolding).filter(
+    holdings = db.query(PortfolioHolding).options(
+        joinedload(PortfolioHolding.stock)
+    ).filter(
         ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
     ).all()
-    total_income = 0.0
-    for h in holdings:
-        per_share = (
-            db.query(func.sum(Dividend.amount))
-            .filter(Dividend.symbol == h.symbol)
-            .scalar()
-            or 0.0
-        )
-        total_income += (h.quantity or 0.0) * per_share
+
+    # One grouped query replaces a per-holding SUM (was 2xN queries per render).
+    dividends_per_share: dict[str, float] = {}
+    if holdings:
+        dividends_per_share = {
+            symbol: total or 0.0
+            for symbol, total in db.query(Dividend.symbol, func.sum(Dividend.amount))
+            .filter(Dividend.symbol.in_({h.symbol for h in holdings}))
+            .group_by(Dividend.symbol)
+            .all()
+        }
+    total_income = sum(
+        (h.quantity or 0.0) * dividends_per_share.get(h.symbol, 0.0) for h in holdings
+    )
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -105,8 +112,10 @@ def show_dividends(db: Session):
                 st.error(f"Error fetching dividends: {e}")
         st.rerun()
 
-    # All dividends table
-    dividends = db.query(Dividend).order_by(Dividend.ex_dividend_date.desc()).all()
+    # All dividends table (most recent first, capped so the page stays light)
+    dividends = db.query(Dividend).options(joinedload(Dividend.stock)).order_by(
+        Dividend.ex_dividend_date.desc()
+    ).limit(200).all()
     if dividends:
         data = []
         for d in dividends:
@@ -129,12 +138,7 @@ def show_dividends(db: Session):
         st.subheader("All Holdings")
         holdings_data = []
         for h in holdings:
-            per_share = (
-                db.query(func.sum(Dividend.amount))
-                .filter(Dividend.symbol == h.symbol)
-                .scalar()
-                or 0.0
-            )
+            per_share = dividends_per_share.get(h.symbol, 0.0)
             income = (h.quantity or 0.0) * per_share
             holdings_data.append({
                 "Symbol": format_stock_label(h.symbol, h.stock.name if h.stock else None),
@@ -175,16 +179,24 @@ def show_dividends(db: Session):
                     db.add(stock)
                     db.flush()
 
-                dividend = Dividend(
-                    stock_id=stock.id,
-                    symbol=symbol,
-                    amount=amount,
-                    currency=currency or "ZAR",
-                    ex_dividend_date=datetime.combine(ex_date, datetime.min.time()),
-                    payment_date=datetime.combine(payment_date, datetime.min.time()) if payment_date else None,
-                    frequency=frequency,
-                )
-                db.add(dividend)
-                db.commit()
-                st.success(f"Added {symbol} dividend of R {amount:.4f} per share.")
-                st.rerun()
+                ex_dt = datetime.combine(ex_date, datetime.min.time())
+                existing = db.query(Dividend).filter(
+                    Dividend.symbol == symbol,
+                    Dividend.ex_dividend_date == ex_dt,
+                ).first()
+                if existing:
+                    st.warning(f"A dividend for {symbol} on {ex_date} already exists.")
+                else:
+                    dividend = Dividend(
+                        stock_id=stock.id,
+                        symbol=symbol,
+                        amount=amount,
+                        currency=currency or "ZAR",
+                        ex_dividend_date=ex_dt,
+                        payment_date=datetime.combine(payment_date, datetime.min.time()) if payment_date else None,
+                        frequency=frequency,
+                    )
+                    db.add(dividend)
+                    db.commit()
+                    st.success(f"Added {symbol} dividend of R {amount:.4f} per share.")
+                    st.rerun()

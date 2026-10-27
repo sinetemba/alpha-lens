@@ -136,6 +136,57 @@ class YFinanceCollector:
             logger.error(f"Error getting history for {symbol}: {e}")
             return None
 
+    def get_latest_bars(
+        self,
+        symbols: List[str],
+        period: str = "5d",
+        interval: str = "1d",
+    ) -> Dict[str, "object"]:
+        """Batch-download recent bars for many symbols in a single yf.download call.
+
+        Returns a mapping of original symbol -> DataFrame (columns Open/High/
+        Low/Close/Adj Close/Volume). Symbols that failed to resolve are simply
+        absent from the result. JSE prices are converted from cents to Rand.
+        """
+        if not self.enabled or not symbols:
+            return {}
+
+        yf_symbols = {s: (s if "." in s else f"{s}.JO") for s in symbols}
+
+        try:
+            data = yf.download(
+                list(yf_symbols.values()),
+                period=period,
+                interval=interval,
+                group_by="ticker",
+                threads=True,
+                progress=False,
+                auto_adjust=False,
+            )
+        except Exception as e:
+            logger.error(f"Error batch downloading prices: {e}")
+            return {}
+
+        if data is None or data.empty:
+            return {}
+
+        result = {}
+        for symbol, yf_symbol in yf_symbols.items():
+            frame = None
+            try:
+                frame = data[yf_symbol]
+            except (KeyError, TypeError):
+                # Single-symbol downloads may not produce a ticker level.
+                if len(yf_symbols) == 1:
+                    frame = data
+            if frame is None:
+                continue
+            frame = frame.dropna(how="all")
+            if frame.empty:
+                continue
+            result[symbol] = self._to_rand(frame, symbol)
+        return result
+
     def get_history_date_range(
         self,
         symbol: str,

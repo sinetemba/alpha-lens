@@ -25,7 +25,7 @@ class WatchlistItem(Base):
     price_change_threshold = Column(Float, default=5.0)  # percentage
     notify_news = Column(Boolean, default=True)
     
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=True, index=True)
     added_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 

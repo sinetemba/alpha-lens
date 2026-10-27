@@ -35,11 +35,23 @@ def show_watchlist(db: Session):
         stop_loss = st.number_input("Stop Loss", min_value=0.0, step=0.01)
         notes = st.text_area("Notes")
         
+        flash = st.session_state.pop("watchlist_add_flash", None)
+        if flash:
+            st.warning(flash)
+
         if st.button("Add to Watchlist"):
             if symbol:
-                _add_to_watchlist(db, symbol, target_price, purchase_price, stop_loss, notes)
-                st.success(f"Added {symbol} to watchlist!")
-                st.rerun()
+                saved = _add_to_watchlist(db, symbol, target_price, purchase_price, stop_loss, notes)
+                if saved is None:
+                    st.warning(f"{symbol} is already on your watchlist.")
+                else:
+                    if saved == 0:
+                        st.session_state["watchlist_add_flash"] = (
+                            f"Added {symbol}, but no price history could be fetched - "
+                            "double-check that the ticker is correct."
+                        )
+                    st.success(f"Added {symbol} to watchlist!")
+                    st.rerun()
             else:
                 st.error("Please enter a stock symbol.")
     
@@ -120,31 +132,31 @@ def show_watchlist(db: Session):
         else:
             purchase_price = item.purchase_price
 
-        if current_price is not None:
-            if purchase_price:
-                gain_loss = current_price - purchase_price
-                gain_loss_pct = (gain_loss / purchase_price) * 100
-            else:
-                gain_loss = 0
-                gain_loss_pct = 0
+        if current_price is not None and purchase_price:
+            gain_loss = current_price - purchase_price
+            gain_loss_pct = (gain_loss / purchase_price) * 100
+        else:
+            gain_loss = None
+            gain_loss_pct = None
 
-            # Daily change vs previous day's close
-            daily_change = (
-                ((current_price - prev.close_price) / prev.close_price) * 100
-                if prev and prev.close_price else 0.0
-            )
+        daily_change = (
+            ((current_price - prev.close_price) / prev.close_price) * 100
+            if current_price is not None and prev and prev.close_price else None
+        )
 
-            data.append({
-                "Symbol": format_stock_label(item.symbol, item.stock.name if item.stock else None),
-                "Current Price": f"R {current_price:.2f}",
-                "Daily Change": f"{daily_change:+.2f}%",
-                "Purchase Price": f"R {purchase_price:.2f}" if purchase_price else "N/A",
-                "Target Price": f"R {item.target_price:.2f}" if item.target_price else "N/A",
-                "Stop Loss": f"R {item.stop_loss:.2f}" if item.stop_loss else "N/A",
-                "Gain/Loss": f"R {gain_loss:.2f}",
-                "Gain/Loss %": f"{gain_loss_pct:+.2f}%",
-                "_gain_loss": gain_loss if purchase_price else None,
-            })
+        # Include the row even with no price data - silently dropping it makes
+        # the item count disagree with the table and hides unresolvable symbols.
+        data.append({
+            "Symbol": format_stock_label(item.symbol, item.stock.name if item.stock else None),
+            "Current Price": f"R {current_price:.2f}" if current_price is not None else "N/A",
+            "Daily Change": f"{daily_change:+.2f}%" if daily_change is not None else "N/A",
+            "Purchase Price": f"R {purchase_price:.2f}" if purchase_price else "N/A",
+            "Target Price": f"R {item.target_price:.2f}" if item.target_price else "N/A",
+            "Stop Loss": f"R {item.stop_loss:.2f}" if item.stop_loss else "N/A",
+            "Gain/Loss": f"R {gain_loss:.2f}" if gain_loss is not None else "N/A",
+            "Gain/Loss %": f"{gain_loss_pct:+.2f}%" if gain_loss_pct is not None else "N/A",
+            "_gain_loss": gain_loss,
+        })
 
     if watchlist_updated:
         db.commit()
@@ -201,35 +213,53 @@ def show_watchlist(db: Session):
         [item.symbol for item in watchlist_items],
         format_func=lambda s: format_stock_label(s, watchlist_names.get(s))
     )
-    
+
+    remove_key = "watchlist_remove_pending"
     if st.button("Remove Selected") and symbols_to_remove:
-        _remove_from_watchlist(db, symbols_to_remove)
-        st.success(f"Removed {len(symbols_to_remove)} stocks from watchlist.")
-        st.rerun()
+        st.session_state[remove_key] = tuple(symbols_to_remove)
+
+    pending = st.session_state.get(remove_key)
+    if pending:
+        st.warning(f"Remove {len(pending)} stock{'s' if len(pending) != 1 else ''} ({', '.join(pending)}) from the watchlist?")
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button("Yes, remove", key="watchlist_confirm_remove"):
+                _remove_from_watchlist(db, list(pending))
+                st.session_state[remove_key] = None
+                st.success(f"Removed {len(pending)} stocks from watchlist.")
+                st.rerun()
+        with cancel_col:
+            if st.button("Cancel", key="watchlist_cancel_remove"):
+                st.session_state[remove_key] = None
+                st.rerun()
 
 
-def _add_to_watchlist(db: Session, symbol: str, target_price: float, purchase_price: float, stop_loss: float, notes: str):
-    """Add a stock to the watchlist."""
+def _add_to_watchlist(db: Session, symbol: str, target_price: float, purchase_price: float, stop_loss: float, notes: str) -> int | None:
+    """Add a stock to the watchlist.
+
+    Returns the number of price points backfilled, or None when the symbol is
+    already on the watchlist (nothing was added).
+    """
+    # Check if already in watchlist
+    existing = db.query(WatchlistItem).filter(
+        WatchlistItem.symbol == symbol,
+        WatchlistItem.is_active == True
+    ).first()
+
+    if existing:
+        logger.warning(f"{symbol} already in watchlist")
+        return None
+
     # Check if stock exists in database
     stock = db.query(Stock).filter(Stock.symbol == symbol).first()
-    
+
     if not stock:
         # Create stock entry
         from app.services.data_service import get_company_name
         stock = Stock(symbol=symbol, name=get_company_name(symbol))
         db.add(stock)
         db.flush()
-    
-    # Check if already in watchlist
-    existing = db.query(WatchlistItem).filter(
-        WatchlistItem.symbol == symbol,
-        WatchlistItem.is_active == True
-    ).first()
-    
-    if existing:
-        logger.warning(f"{symbol} already in watchlist")
-        return
-    
+
     # Add to watchlist
     item = WatchlistItem(
         stock_id=stock.id,
@@ -239,11 +269,12 @@ def _add_to_watchlist(db: Session, symbol: str, target_price: float, purchase_pr
         stop_loss=stop_loss if stop_loss > 0 else None,
         notes=notes if notes else None
     )
-    
+
     db.add(item)
     db.commit()
 
     # Backfill historical prices and technical indicators for the newly added stock
+    saved = 0
     try:
         from app.services.data_service import DataService
         with st.spinner(f"Fetching price history for {symbol}..."):
@@ -252,6 +283,7 @@ def _add_to_watchlist(db: Session, symbol: str, target_price: float, purchase_pr
         logger.info(f"Fetched {saved} price points for {symbol}")
     except Exception as e:
         logger.error(f"Failed to fetch price data for {symbol}: {e}")
+    return saved
 
 
 def _remove_from_watchlist(db: Session, symbols: list):

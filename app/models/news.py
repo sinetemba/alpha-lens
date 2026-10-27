@@ -23,7 +23,7 @@ class NewsArticle(Base):
     # Stock association (if article is about specific stock)
     stock_symbol = Column(String(10), index=True)
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
     # Composite index for efficient queries
     __table_args__ = (

@@ -40,8 +40,8 @@ class PortfolioHolding(Base):
     __tablename__ = "portfolio_holdings"
 
     id = Column(Integer, primary_key=True, index=True)
-    portfolio_id = Column(Integer, ForeignKey("portfolios.id"), nullable=False)
-    stock_id = Column(Integer, ForeignKey("stocks.id"), nullable=False)
+    portfolio_id = Column(Integer, ForeignKey("portfolios.id"), nullable=False, index=True)
+    stock_id = Column(Integer, ForeignKey("stocks.id"), nullable=False, index=True)
     symbol = Column(String(10), index=True, nullable=False)
     account_type = Column(String(50), default="ZAR")
     

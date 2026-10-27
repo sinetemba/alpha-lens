@@ -74,6 +74,80 @@ def test_save_historical_data_backfills_and_deduplicates(db_session):
     assert prices[-1].close_price == pytest.approx(107.0)
 
 
+def test_save_price_from_quote_refreshes_same_bar(db_session):
+    """A re-fetch of the same bar must update OHLCV, not freeze at first fetch."""
+    stock = Stock(symbol="NPN", name="Naspers")
+    db_session.add(stock)
+    db_session.commit()
+
+    data_service = DataService(db_session)
+    morning = {
+        "timestamp": "2024-01-15 10:00:00",
+        "open": "100.00", "high": "105.00", "low": "99.00",
+        "close": "102.50", "volume": "1000",
+    }
+    afternoon = dict(morning, close="108.00", volume="2500")
+
+    assert data_service._save_price_from_quote("NPN", morning)
+    assert data_service._save_price_from_quote("NPN", afternoon)
+
+    prices = db_session.query(StockPrice).filter_by(symbol="NPN").all()
+    assert len(prices) == 1
+    assert prices[0].close_price == pytest.approx(108.00)
+    assert prices[0].volume == 2500
+
+
+def test_save_price_from_quote_rejects_invalid_close(db_session):
+    stock = Stock(symbol="NPN", name="Naspers")
+    db_session.add(stock)
+    db_session.commit()
+
+    data_service = DataService(db_session)
+    bad = {"timestamp": "2024-01-15 10:00:00", "close": "0"}
+
+    assert data_service._save_price_from_quote("NPN", bad) is False
+    assert db_session.query(StockPrice).filter_by(symbol="NPN").count() == 0
+
+
+def test_save_historical_data_refreshes_existing_bars(db_session):
+    stock = Stock(symbol="CFR", name="Richemont")
+    db_session.add(stock)
+    db_session.commit()
+
+    data_service = DataService(db_session)
+    points = [{"datetime": "2024-01-10", "close": "102.0", "volume": "1000"}]
+    assert data_service._save_historical_data("CFR", points) == 1
+
+    revised = [{"datetime": "2024-01-10", "close": "105.0", "volume": "2000"}]
+    assert data_service._save_historical_data("CFR", revised) == 0
+
+    prices = db_session.query(StockPrice).filter_by(symbol="CFR").all()
+    assert len(prices) == 1
+    assert prices[0].close_price == pytest.approx(105.0)
+    assert prices[0].volume == 2000
+
+
+def test_update_stock_prices_uses_batch_endpoints(db_session, monkeypatch):
+    """update_stock_prices should batch Twelve Data quotes and batch the Yahoo fallback."""
+    data_service = DataService(db_session)
+    data_service.twelve_data = MagicMock()
+    data_service.yfinance = MagicMock()
+
+    quote = {"timestamp": "2024-01-15 10:00:00", "close": "102.5", "mic_code": "XJSE"}
+    data_service.twelve_data.get_multiple_quotes.return_value = {"NPN": quote}
+    data_service.yfinance.get_latest_bars.return_value = {}
+
+    symbols = [f"S{i}" for i in range(25)] + ["NPN"]
+    updated = data_service.update_stock_prices(symbols)
+
+    # 26 symbols -> 3 batched quote calls (10/10/6), not 26 per-symbol calls.
+    assert data_service.twelve_data.get_multiple_quotes.call_count == 3
+    # Yahoo batch fallback called once with the unresolved symbols.
+    data_service.yfinance.get_latest_bars.assert_called_once()
+    assert updated == 1
+    assert set(data_service.last_failed_symbols) == {f"S{i}" for i in range(25)}
+
+
 def test_update_historical_data_calls_twelve_data(db_session, monkeypatch):
     stock = Stock(symbol="AGL", name="Anglo American")
     db_session.add(stock)

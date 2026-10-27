@@ -102,4 +102,11 @@ It truncates the Postgres tables and copies all rows from the SQLite file, prese
 
 ## Cross-DB SQL expressions
 
-The `strftime('%Y-%m-%d', timestamp)` function is SQLite-only. For PostgreSQL, use `func.date_trunc('day', timestamp)`. The `app/dashboard/utils.py` helper `day_of(col)` selects the right one based on `settings.database_url`.
+The `strftime('%Y-%m-%d', timestamp)` function is SQLite-only. For PostgreSQL, use `func.date_trunc('day', timestamp)`. The `app/dashboard/utils.py` helper `day_of(db, col)` selects the right one from the session's engine dialect (not `settings.database_url`, so SQLite tests work against a Postgres-configured `.env`).
+
+## Data-write conventions
+
+- Daily bars are keyed by naive exchange-local midnight (`YYYY-MM-DD 00:00`), not UTC instants. Re-fetches overwrite the same bar in place — never insert a duplicate row for the same `(symbol, timestamp)`; that pair has a unique index.
+- Save helpers in `data_service.py` (`_save_price_from_quote`, `_save_price_from_history`) return `bool` and roll back on error. `update_stock_prices` batches Twelve Data quotes 10-per-request and Yahoo fallbacks via `yf.download`.
+- The Twelve Data daily counter is shared across processes via `data/.twelve_data_usage`.
+- `run_updater.py --price-news|--full|--logon` exits non-zero when a run fails — Task Scheduler will show failure.

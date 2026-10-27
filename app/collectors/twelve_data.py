@@ -1,8 +1,10 @@
+import json
 import re
 import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Deque, List, Dict, Optional
 
 import requests
@@ -19,6 +21,11 @@ DEFAULT_REQUESTS_PER_MINUTE = 8
 DEFAULT_REQUESTS_PER_DAY = 800
 
 _MINUTE_LIMIT_RE = re.compile(r"current limit being (\d+)")
+
+# The daily request counter is shared on disk so that separate processes (the
+# Task-Scheduler updater, the Streamlit dashboard, manual runs) all draw against
+# the same API key's real daily usage instead of each starting from zero.
+_QUOTA_STATE_FILE = Path(__file__).resolve().parents[2] / "data" / ".twelve_data_usage"
 
 
 class TwelveDataCollector:
@@ -52,6 +59,39 @@ class TwelveDataCollector:
             cls._daily_count_date = today
             cls._daily_count = 0
             cls._quota_exhausted_logged = False
+        cls._load_daily_state()
+
+    @classmethod
+    def _load_daily_state(cls) -> None:
+        """Merge today's request count persisted by other processes."""
+        try:
+            if _QUOTA_STATE_FILE.exists():
+                data = json.loads(_QUOTA_STATE_FILE.read_text(encoding="utf-8"))
+                if data.get("date") == str(datetime.now(timezone.utc).date()):
+                    cls._daily_count = max(cls._daily_count, int(data.get("count", 0)))
+        except (OSError, ValueError):
+            pass
+
+    @classmethod
+    def _persist_daily_state(cls) -> None:
+        """Persist today's request count so other processes share the quota.
+
+        Best-effort: concurrent writers may lose a few increments, which still
+        beats every process counting from zero.
+        """
+        try:
+            _QUOTA_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _QUOTA_STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({
+                    "date": str(datetime.now(timezone.utc).date()),
+                    "count": cls._daily_count,
+                }),
+                encoding="utf-8",
+            )
+            tmp.replace(_QUOTA_STATE_FILE)
+        except OSError:
+            pass
 
     @classmethod
     def quota_exceeded_message(cls) -> Optional[str]:
@@ -92,6 +132,7 @@ class TwelveDataCollector:
 
             cls._request_times.append(time.monotonic())
             cls._daily_count += 1
+            cls._persist_daily_state()
             return True
 
     @classmethod
@@ -128,6 +169,7 @@ class TwelveDataCollector:
                 cls._last_rate_limit_at = time.monotonic()
             elif "day" in message_lower:
                 cls._daily_count = cls._daily_limit
+                cls._persist_daily_state()
                 cls._last_rate_limit_message = (
                     "Twelve Data daily limit reached. Using Yahoo Finance until it resets tomorrow."
                 )
@@ -344,14 +386,36 @@ class TwelveDataCollector:
 
         return None
 
-    def get_multiple_quotes(self, symbols: List[str]) -> Optional[Dict]:
-        """Get quotes for multiple symbols at once."""
+    def get_multiple_quotes(self, symbols: List[str]) -> Dict[str, Dict]:
+        """Get quotes for up to 10 symbols in one request, keyed by symbol.
+
+        Applies the same JSE exchange check as get_quote to each returned quote.
+        """
+        if not symbols:
+            return {}
         if len(symbols) > 10:
             logger.warning("Twelve Data API supports maximum 10 symbols per request")
             symbols = symbols[:10]
-        
-        params = {
-            "symbol": ",".join(symbols)
-        }
-        data = self._make_request("quote", params)
-        return data
+
+        data = self._make_request("quote", {"symbol": ",".join(symbols)})
+        if not data:
+            return {}
+
+        # Single-symbol requests return the quote object itself; multi-symbol
+        # requests return a mapping of symbol -> quote.
+        if len(symbols) == 1 and "symbol" in data:
+            data = {symbols[0]: data}
+
+        quotes = {}
+        for symbol in symbols:
+            quote = data.get(symbol)
+            if not isinstance(quote, dict) or quote.get("status") == "error":
+                continue
+            if quote.get("mic_code") and quote.get("mic_code") != JSE_MIC_CODE:
+                logger.warning(
+                    f"Twelve Data quote for '{symbol}' resolved to {quote.get('exchange')} "
+                    f"({quote.get('mic_code')}), not JSE - discarding."
+                )
+                continue
+            quotes[symbol] = quote
+        return quotes
