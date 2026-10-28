@@ -64,7 +64,7 @@ def _should_fetch_news(db: Session) -> bool:
     if latest is None:
         return True
     latest = latest if latest.tzinfo else latest.replace(tzinfo=timezone.utc)
-    return latest.date() < datetime.now(timezone.utc).date()
+    return _to_display_tz(latest).date() < _to_display_tz(datetime.now(timezone.utc)).date()
 
 
 def show_home():

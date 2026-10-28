@@ -161,7 +161,7 @@ def show_dividends(db: Session):
             amount = st.number_input("Amount per Share", min_value=0.0, step=0.01)
             currency = st.text_input("Currency", value="ZAR").upper().strip()
         with col2:
-            ex_date = st.date_input("Ex-Dividend Date", value=datetime.now(timezone.utc).date())
+            ex_date = st.date_input("Ex-Dividend Date", value=_to_display_tz(datetime.now(timezone.utc)).date())
             payment_date = st.date_input("Payment Date (optional)", value=None)
             frequency = st.selectbox(
                 "Frequency",
