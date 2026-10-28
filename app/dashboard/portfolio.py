@@ -152,7 +152,9 @@ def show_portfolio(db: Session):
         
         with col2:
             purchase_price = st.number_input("Purchase Price", min_value=0.0, step=0.01)
-            purchase_date = st.date_input("Purchase Date", value=datetime.now().date())
+            purchase_date = st.date_input(
+                "Purchase Date", value=_to_display_tz(datetime.now(timezone.utc)).date()
+            )
         
         flash = st.session_state.pop("portfolio_add_flash", None)
         if flash:

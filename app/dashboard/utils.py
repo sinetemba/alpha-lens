@@ -74,6 +74,17 @@ def get_latest_market_data_timestamp(
             return None
         query = query.filter(StockPrice.symbol.in_(symbols))
     latest_fetched, latest_bar = query.first()
+    if latest_bar is not None:
+        # Unlike fetched_at (a UTC instant), `timestamp` is naive exchange-local
+        # midnight. Comparing it raw against fetched_at can make it look up to
+        # a UTC-offset's worth "newer" than it really is, so convert to a UTC
+        # instant first - then strip tzinfo back to naive-UTC to match
+        # fetched_at's convention (callers treat naive timestamps as UTC).
+        latest_bar = (
+            latest_bar.replace(tzinfo=ZoneInfo(settings.scheduler_timezone))
+            .astimezone(timezone.utc)
+            .replace(tzinfo=None)
+        )
     candidates = [t for t in (latest_fetched, latest_bar) if t is not None]
     return max(candidates) if candidates else None
 

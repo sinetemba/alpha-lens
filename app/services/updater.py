@@ -20,6 +20,7 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -180,6 +181,15 @@ class UpdaterService:
         finally:
             db.close()
 
+        if latest_bar is not None:
+            # `timestamp` is naive exchange-local midnight, not a UTC instant
+            # like fetched_at - convert before comparing so a recent bar can't
+            # look up to a UTC-offset's worth "newer" than it really is.
+            latest_bar = (
+                latest_bar.replace(tzinfo=ZoneInfo(settings.scheduler_timezone))
+                .astimezone(timezone.utc)
+                .replace(tzinfo=None)
+            )
         latest = max(
             (t for t in (latest_fetched, latest_bar) if t is not None), default=None
         )
