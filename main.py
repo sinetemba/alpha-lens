@@ -11,7 +11,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 import streamlit as st
 from app.dashboard.home import show_home
 from app.database.init_db import init_database
-from app.services.scheduler import SchedulerService
 from app.config.settings import settings
 from loguru import logger
 
@@ -39,24 +38,10 @@ try:
 except Exception as e:
     logger.error(f"Error initializing database: {e}")
 
-# Start background scheduler (in production, this would run in a separate process)
-# st.cache_resource keeps this to a single instance across Streamlit reruns,
-# since the whole script re-executes on every widget interaction.
-@st.cache_resource(show_spinner=False)
-def _get_scheduler():
-    if not settings.scheduler_enabled:
-        return None
-    try:
-        scheduler = SchedulerService()
-        scheduler.start()
-        logger.info("Background scheduler started")
-        return scheduler
-    except Exception as e:
-        logger.error(f"Error starting scheduler: {e}")
-        return None
-
-
-scheduler = _get_scheduler()
+# Background data fetching is handled entirely by the headless updater
+# (scripts/run_updater.py via Windows Task Scheduler) - see AGENTS.md. The
+# dashboard itself never schedules background jobs; it only reads from the
+# database and offers a manual "Refresh Prices" button on the Home page.
 
 # Run the dashboard
 if __name__ == "__main__":

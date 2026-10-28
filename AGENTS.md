@@ -27,9 +27,11 @@ Context for anyone working on this repository in the future.
   - Driver: `psycopg2-binary>=2.9.0,<3.0` is in `requirements.txt`.
   - Update `.env`: `DATABASE_URL=postgresql://<user>:<pass>@localhost:5432/<db>`
   - Tables are created automatically via `python -c "from app.database.init_db import init_database; init_database()"`.
+  - **Session timezone must be UTC.** The DateTime columns are naive and the app treats stored values as UTC; a non-UTC session timezone silently converts aware values to local wall-clock on write (showing times 2h ahead). `scripts\setup_postgres.sql` runs `ALTER DATABASE ... SET timezone = 'UTC'`, and `app\models\base.py` also passes `-c timezone=UTC` in connect_args. If timestamps were already stored shifted, run `python scripts\fix_postgres_timezone.py --apply` once.
 
 ## Windows headless updater
 
+- `scripts\run_updater.py` (via `app\services\updater.py`) is the **only** scheduler in this app - it owns all price/news/historical/dividend fetching. `main.py` (the Streamlit dashboard) does not run a background scheduler of its own; it only reads from the database and offers a manual "Refresh Prices" button. An in-process `SchedulerService` used to run inside the dashboard too (hourly, no quota/lock safeguards) - it duplicated the headless updater's work against the same shared Twelve Data quota and was removed. Do not reintroduce a scheduler inside `main.py`.
 - **Recommended:** Task Scheduler via `scripts\install_updater_task.ps1` (run PowerShell as Administrator).
 - The script prefers `.venv\Scripts\python.exe` or `venv\Scripts\python.exe`, then falls back to `python` in `PATH`.
 - Correct trigger parameter for logon is `-AtLogon`, not `-Logon`.

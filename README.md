@@ -164,20 +164,9 @@ The application has seven main sections:
 2. Select a stock from the dropdown
 3. View price charts, historical data, and company news
 
-## Background Scheduler
-
-The application includes a background scheduler that:
-
-- Updates stock prices hourly
-- Collects news from RSS feeds hourly
-- Updates historical data daily
-- Cleans up old articles weekly
-
-The scheduler is automatically started when you run the application. To disable it, set `SCHEDULER_ENABLED=false` in your `.env` file.
-
 ## Windows Headless Updater (Scheduled Task / Service)
 
-The in-process scheduler above only runs while the Streamlit dashboard is open. To keep prices, news and historical data fresh when the UI is closed, install the headless updater.
+The dashboard itself does not run any background scheduler - it only reads from the database and offers a manual "Refresh Prices" button. All price, news, historical, and dividend fetching happens in the headless updater below, so install it to keep data fresh.
 
 ### Default schedule (Africa/Johannesburg)
 

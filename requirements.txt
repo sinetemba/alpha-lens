@@ -20,7 +20,7 @@ scipy==1.14.1
 # Database
 sqlalchemy==2.0.35
 alembic==1.14.0
-psycopg2-binary>=2.9.0,<3.0
+psycopg2-binary==2.9.13
 
 # Scheduler
 apscheduler==3.10.4
@@ -41,16 +41,12 @@ apprise==1.9.0
 # Caching
 diskcache==5.6.3
 
-# HTTP
-httpx==0.27.2
-aiohttp==3.11.2
-
 # Environment Variables
 python-dotenv==1.0.1
 
 # Date/Time
 python-dateutil==2.9.0.post0
-pytz==2024.2
+tzdata==2026.2  # zoneinfo has no IANA db of its own on Windows
 
 # Testing
 pytest==8.3.3
@@ -65,7 +61,7 @@ pydantic==2.9.2
 pydantic-settings==2.6.1
 
 # Windows Service support (only installed on Windows)
-pywin32>=306; platform_system == "Windows"
+pywin32==312; platform_system == "Windows"
 
 # Data Validation
 pydantic-core==2.23.4

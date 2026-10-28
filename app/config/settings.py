@@ -55,13 +55,9 @@ class Settings(BaseSettings):
     # Company News (optional)
     newsdata_api_key: str = Field(default="", alias="NEWSDATA_API_KEY")
 
-    # Scheduler Configuration
-    scheduler_enabled: bool = Field(default=True, alias="SCHEDULER_ENABLED")
+    # Updater Service Configuration (scripts/run_updater.py - the only
+    # scheduler in this app; the dashboard process does not run one itself)
     scheduler_timezone: str = Field(default="Africa/Johannesburg", alias="SCHEDULER_TIMEZONE")
-    hourly_update_hour: str = Field(default="*", alias="HOURLY_UPDATE_HOUR")
-    hourly_update_minute: str = Field(default="0", alias="HOURLY_UPDATE_MINUTE")
-
-    # Updater Service Configuration
     updater_logon_min_interval: int = Field(default=600, alias="UPDATER_LOGON_MIN_INTERVAL")
     updater_log_file: str = Field(default="./data/logs/updater.log", alias="UPDATER_LOG_FILE")
 
