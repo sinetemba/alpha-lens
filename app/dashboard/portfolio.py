@@ -416,13 +416,16 @@ def _render_holdings_table(
         data.append({
             "Symbol": format_stock_label(holding.symbol, holding.stock.name if holding.stock else None),
             "Quantity": holding.quantity,
-            "Purchase Price": f"R {holding.purchase_price:.2f}",
-            "Current Price": f"R {holding.current_price:.2f}" if holding.current_price is not None else "N/A",
-            "Total Purchase Value": f"R {holding.quantity * holding.purchase_price:.2f}",
-            "Current Value": f"R {holding.current_value:.2f}" if holding.current_value is not None else "N/A",
-            "Gain/Loss": f"R {holding.gain_loss:.2f}" if holding.gain_loss is not None else "N/A",
-            "Gain/Loss %": f"{holding.gain_loss_percentage:.2f}%" if holding.gain_loss_percentage is not None else "N/A",
-            "Dividends": f"R {holding.total_dividends_received:.2f}",
+            # Keep these numeric (not pre-formatted strings) so the
+            # interactive table sorts them by value, not lexicographically -
+            # NumberColumn below handles the "R "/"%" display formatting.
+            "Purchase Price": holding.purchase_price,
+            "Current Price": holding.current_price,
+            "Total Purchase Value": holding.quantity * holding.purchase_price,
+            "Current Value": holding.current_value,
+            "Gain/Loss": holding.gain_loss,
+            "Gain/Loss %": holding.gain_loss_percentage,
+            "Dividends": holding.total_dividends_received,
             "_gain_loss": holding.gain_loss,
         })
 
@@ -456,13 +459,13 @@ def _render_holdings_table(
             column_config={
                 "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
                 "Quantity": st.column_config.NumberColumn("Quantity", help="Number of shares currently held."),
-                "Purchase Price": st.column_config.TextColumn("Purchase Price", help="Average price paid per share."),
-                "Current Price": st.column_config.TextColumn("Current Price", help="Latest market price per share from EasyEquities."),
-                "Total Purchase Value": st.column_config.TextColumn("Total Purchase Value", help="Quantity multiplied by the average purchase price."),
-                "Current Value": st.column_config.TextColumn("Current Value", help="Current market value of the holding."),
-                "Gain/Loss": st.column_config.TextColumn("Gain/Loss", help="Current value less total purchase value."),
-                "Gain/Loss %": st.column_config.TextColumn("Gain/Loss %", help="Gain or loss as a percentage of total purchase value."),
-                "Dividends": st.column_config.TextColumn("Dividends", help="Total dividends recorded for this holding."),
+                "Purchase Price": st.column_config.NumberColumn("Purchase Price", format="R %.2f", help="Average price paid per share."),
+                "Current Price": st.column_config.NumberColumn("Current Price", format="R %.2f", help="Latest market price per share from EasyEquities."),
+                "Total Purchase Value": st.column_config.NumberColumn("Total Purchase Value", format="R %.2f", help="Quantity multiplied by the average purchase price."),
+                "Current Value": st.column_config.NumberColumn("Current Value", format="R %.2f", help="Current market value of the holding."),
+                "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format="R %.2f", help="Current value less total purchase value."),
+                "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", format="%.2f%%", help="Gain or loss as a percentage of total purchase value."),
+                "Dividends": st.column_config.NumberColumn("Dividends", format="R %.2f", help="Total dividends recorded for this holding."),
             },
         )
     else:
