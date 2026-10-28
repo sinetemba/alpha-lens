@@ -146,27 +146,44 @@ def show_watchlist(db: Session):
 
         # Include the row even with no price data - silently dropping it makes
         # the item count disagree with the table and hides unresolvable symbols.
+        # Keep these numeric (not pre-formatted strings) so the interactive
+        # table sorts them by value, not lexicographically - NumberColumn
+        # below handles the "R "/"%" display formatting.
         data.append({
             "Symbol": format_stock_label(item.symbol, item.stock.name if item.stock else None),
-            "Current Price": f"R {current_price:.2f}" if current_price is not None else "N/A",
-            "Daily Change": f"{daily_change:+.2f}%" if daily_change is not None else "N/A",
-            "Purchase Price": f"R {purchase_price:.2f}" if purchase_price else "N/A",
-            "Target Price": f"R {item.target_price:.2f}" if item.target_price else "N/A",
-            "Stop Loss": f"R {item.stop_loss:.2f}" if item.stop_loss else "N/A",
-            "Gain/Loss": f"R {gain_loss:.2f}" if gain_loss is not None else "N/A",
-            "Gain/Loss %": f"{gain_loss_pct:+.2f}%" if gain_loss_pct is not None else "N/A",
+            "Current Price": current_price,
+            "Daily Change": daily_change,
+            "Purchase Price": purchase_price if purchase_price else None,
+            "Target Price": item.target_price,
+            "Stop Loss": item.stop_loss,
+            "Gain/Loss": gain_loss,
+            "Gain/Loss %": gain_loss_pct,
             "_gain_loss": gain_loss,
         })
 
     if watchlist_updated:
         db.commit()
-    
+
     if data:
         watchlist_table = pd.DataFrame(data)
         styled_table = watchlist_table.style.apply(style_gain_loss_row, axis=1).hide(
             axis="columns", subset=["_gain_loss"]
         )
-        st.dataframe(styled_table, use_container_width=True, hide_index=True)
+        st.dataframe(
+            styled_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
+                "Current Price": st.column_config.NumberColumn("Current Price", format="R %.2f", help="Latest market price per share."),
+                "Daily Change": st.column_config.NumberColumn("Daily Change", format="%+.2f%%", help="Change since the previous close."),
+                "Purchase Price": st.column_config.NumberColumn("Purchase Price", format="R %.2f", help="Average price paid per share, if held."),
+                "Target Price": st.column_config.NumberColumn("Target Price", format="R %.2f", help="Price target for this stock."),
+                "Stop Loss": st.column_config.NumberColumn("Stop Loss", format="R %.2f", help="Stop loss price for this stock."),
+                "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format="R %.2f", help="Current price less purchase price."),
+                "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", format="%+.2f%%", help="Gain or loss as a percentage of purchase price."),
+            },
+        )
     
     st.markdown("---")
 
