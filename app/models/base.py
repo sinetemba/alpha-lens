@@ -2,10 +2,16 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from app.config.settings import settings
 
-# Create SQLAlchemy engine
+# Create SQLAlchemy engine. For Postgres, pin the session timezone to UTC:
+# the DateTime columns are naive, and a non-UTC session timezone silently
+# converts aware values to local wall-clock on write.
 engine = create_engine(
     settings.database_url,
-    connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {},
+    connect_args=(
+        {"check_same_thread": False}
+        if "sqlite" in settings.database_url
+        else {"options": "-c timezone=UTC"}
+    ),
     echo=False,
 )
 
