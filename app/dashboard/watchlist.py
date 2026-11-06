@@ -70,6 +70,7 @@ def show_watchlist(db: Session):
     
     # Summary metrics
     prices = _get_latest_and_previous_prices(db, [item.symbol for item in watchlist_items])
+    prices = _backfill_missing_prices(db, watchlist_items, prices)
 
     above_target = 0
     below_stop = 0
@@ -159,6 +160,9 @@ def show_watchlist(db: Session):
             "Gain/Loss": gain_loss,
             "Gain/Loss %": gain_loss_pct,
             "_gain_loss": gain_loss,
+            "_above_target": bool(
+                item.target_price and current_price is not None and current_price >= item.target_price
+            ),
         })
 
     if watchlist_updated:
@@ -166,8 +170,8 @@ def show_watchlist(db: Session):
 
     if data:
         watchlist_table = pd.DataFrame(data)
-        styled_table = watchlist_table.style.apply(style_gain_loss_row, axis=1).hide(
-            axis="columns", subset=["_gain_loss"]
+        styled_table = watchlist_table.style.apply(_style_watchlist_row, axis=1).hide(
+            axis="columns", subset=["_gain_loss", "_above_target"]
         )
         st.dataframe(
             styled_table,
@@ -183,6 +187,14 @@ def show_watchlist(db: Session):
                 "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format="R %.2f", help="Current price less purchase price."),
                 "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", format="%+.2f%%", help="Gain or loss as a percentage of purchase price."),
             },
+        )
+        st.markdown(
+            "**Legend:** "
+            '<span style="background-color: darkgreen; color: white; padding: 2px 8px; border-radius: 4px;">At/above target</span> '
+            '<span style="background-color: #dcfce7; padding: 2px 8px; border-radius: 4px;">Gain</span> '
+            '<span style="background-color: #fee2e2; padding: 2px 8px; border-radius: 4px;">Loss</span> '
+            '<span style="background-color: #fef3c7; padding: 2px 8px; border-radius: 4px;">No data / break-even</span>',
+            unsafe_allow_html=True,
         )
     
     st.markdown("---")
@@ -325,6 +337,61 @@ def _edit_watchlist_item(db: Session, symbol: str, target_price: float, stop_los
     item.target_price = target_price if target_price > 0 else None
     item.stop_loss = stop_loss if stop_loss > 0 else None
     db.commit()
+
+
+def _backfill_missing_prices(db: Session, watchlist_items: list, prices: dict) -> dict:
+    """Fetch history for watchlist symbols that have no price data.
+
+    Runs at most once per session per symbol (tracked in session state) so a
+    bad ticker doesn't re-trigger network calls on every page rerun. Returns
+    a refreshed price map when anything was fetched.
+    """
+    missing = [
+        item.symbol for item in watchlist_items
+        if (latest := prices.get(item.symbol, (None, None))[0]) is None
+        or latest.close_price is None
+    ]
+    if not missing:
+        return prices
+
+    attempted = st.session_state.get("watchlist_backfill_attempted") or set()
+    to_fetch = [s for s in missing if s not in attempted]
+    if not to_fetch:
+        return prices
+
+    attempted.update(to_fetch)
+    st.session_state["watchlist_backfill_attempted"] = attempted
+
+    from app.services.data_service import DataService
+    data_service = DataService(db)
+    fetched_any = False
+    for symbol in to_fetch:
+        try:
+            with st.spinner(f"Fetching price history for {symbol}..."):
+                saved = data_service.update_historical_data(symbol)
+            if saved:
+                fetched_any = True
+                st.success(f"Fetched {saved} price points for {symbol}.")
+            else:
+                st.warning(f"No price data found for {symbol} - check that the ticker is correct.")
+        except Exception as e:
+            logger.error(f"Failed to backfill price data for {symbol}: {e}")
+            st.warning(f"Failed to fetch price data for {symbol}.")
+
+    if not fetched_any:
+        return prices
+
+    # The price map is cached on (session, symbols), so clear it before
+    # re-querying or the just-saved bars won't show up.
+    _get_latest_and_previous_prices.clear()
+    return _get_latest_and_previous_prices(db, [item.symbol for item in watchlist_items])
+
+
+def _style_watchlist_row(row: pd.Series) -> list[str]:
+    """Colour a watchlist row darkgreen when the current price is at/above target."""
+    if row["_above_target"]:
+        return ["background-color: darkgreen; color: white"] * len(row)
+    return style_gain_loss_row(row)
 
 
 
