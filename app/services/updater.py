@@ -9,6 +9,8 @@ Schedule defaults (all Africa/Johannesburg):
 - 09:00, 13:00, 17:00 : stock prices + news
 - 18:00 daily          : historical prices
 - Sunday 02:00         : clean old news
+- every 7 days         : database backup (checked each minute, so a sleeping
+                         machine catches up on wake - see services/backup.py)
 """
 
 import os
@@ -48,6 +50,7 @@ from app.models.updater_run import UpdaterRun
 from app.services.data_service import DataService
 from app.scrapers.news import NewsScraper
 from app.collectors.twelve_data import TwelveDataCollector
+from app.services import backup
 
 
 def _run_notification_checks(db: Session) -> None:
@@ -207,6 +210,8 @@ class UpdaterService:
     # run itself, and how long to wait before retrying a failed catch-up.
     CATCH_UP_MAX_AGE = timedelta(hours=4)
     CATCH_UP_RETRY_SECONDS = 30 * 60
+    # A failed backup (e.g. Postgres down) is retried at most this often.
+    BACKUP_RETRY_SECONDS = 60 * 60
 
     def __init__(self):
         self.scheduler = BackgroundScheduler(timezone=settings.scheduler_timezone)
@@ -215,6 +220,7 @@ class UpdaterService:
         # one-shots so they can never overlap.
         self._job_lock = threading.Lock()
         self._last_catch_up_attempt: Optional[datetime] = None
+        self._last_backup_attempt: Optional[datetime] = None
 
     def _on_job_error(self, event):
         logger.error(f"Scheduler job {event.job_id} failed: {event.exception}")
@@ -389,6 +395,44 @@ class UpdaterService:
             finally:
                 db.close()
 
+    def _run_backup(self) -> bool:
+        """Back up the database and record the run."""
+        logger.info("Running database backup")
+        ok = False
+        detail = None
+        try:
+            path = backup.backup_database()
+            detail = path.name
+            ok = True
+            return True
+        except Exception as e:
+            detail = str(e)[:200]
+            logger.error(f"Database backup failed: {e}")
+            return False
+        finally:
+            db = SessionLocal()
+            try:
+                _record_run(db, "database_backup", ok, detail)
+            finally:
+                db.close()
+
+    def _backup_if_due(self) -> None:
+        """Take a backup when the newest one is older than the interval."""
+        now = datetime.now(timezone.utc)
+        if (
+            self._last_backup_attempt is not None
+            and (now - self._last_backup_attempt).total_seconds() < self.BACKUP_RETRY_SECONDS
+        ):
+            return
+        try:
+            if not backup.backup_due():
+                return
+        except Exception as e:
+            logger.warning(f"Backup due check failed: {e}")
+            return
+        self._last_backup_attempt = now
+        self._run_backup()
+
     def configure(self):
         """Register the default 3x/day + logon schedule."""
         self.scheduler.add_job(
@@ -463,6 +507,7 @@ class UpdaterService:
                 elif stop_event is None:
                     time.sleep(60)
                 self._catch_up_if_stale()
+                self._backup_if_due()
         except KeyboardInterrupt:
             logger.info("Shutting down updater service (keyboard interrupt)")
         finally:
@@ -476,6 +521,7 @@ class UpdaterService:
           - price_news: run the 3x-daily price + news job and exit.
           - full: run the 3x-daily job plus historical data and dividends, then exit.
           - logon: run the 3x-daily job only if it has not run recently, then exit.
+          - backup: back up the database now and exit.
 
         One-shot modes exit non-zero on failure so Task Scheduler surfaces the
         run as failed instead of silently succeeding.
@@ -496,6 +542,9 @@ class UpdaterService:
             logger.info("Running price + news update")
             ok = self._update_prices_and_news()
             sys.exit(0 if ok else 1)
+
+        if mode == "backup":
+            sys.exit(0 if self._run_backup() else 1)
 
         if mode == "full":
             logger.info("Running full update")
@@ -519,6 +568,7 @@ def main():
     group.add_argument("--price-news", action="store_true", help="Run the price + news job and exit")
     group.add_argument("--full", action="store_true", help="Run the full update (prices, news, history, dividends) and exit")
     group.add_argument("--logon", action="store_true", help="Run a lightweight logon update and exit")
+    group.add_argument("--backup", action="store_true", help="Back up the database now and exit")
     args = parser.parse_args()
 
     mode = "daemon"
@@ -528,6 +578,8 @@ def main():
         mode = "full"
     elif args.logon:
         mode = "logon"
+    elif args.backup:
+        mode = "backup"
 
     service = UpdaterService()
     service.start(mode=mode)

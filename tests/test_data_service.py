@@ -210,3 +210,30 @@ def test_update_technical_indicators_populates_columns(db_session):
     latest = db_session.query(StockPrice).filter_by(symbol="SOL").order_by(StockPrice.timestamp.desc()).first()
     assert latest.sma_20 is not None
     assert latest.rsi is not None
+
+
+def test_bulk_save_ignores_zero_prices_and_heals_adjusted_close(db_session):
+    """Yahoo history (auto_adjust=True) has no "Adj Close"; a 0 placeholder
+    must never be stored, and legacy 0.0 rows heal to close on refresh."""
+    stock = Stock(symbol="AXX", name="Araxi")
+    db_session.add(stock)
+    db_session.commit()
+    legacy = StockPrice(
+        stock_id=stock.id, symbol="AXX", timestamp=datetime(2024, 1, 10),
+        open_price=1.5, close_price=1.59, adjusted_close=0.0,
+    )
+    db_session.add(legacy)
+    db_session.commit()
+
+    data_service = DataService(db_session)
+    records = [
+        {"timestamp": datetime(2024, 1, 10), "open": 0, "close": 1.6, "adjusted_close": 0},
+        {"timestamp": datetime(2024, 1, 11), "open": 1.6, "close": 1.62, "adjusted_close": None},
+    ]
+    assert data_service._bulk_save_stock_prices("AXX", records) == 1
+
+    rows = {p.timestamp.day: p for p in db_session.query(StockPrice).filter_by(symbol="AXX")}
+    assert rows[10].open_price == pytest.approx(1.5)  # 0 placeholder didn't overwrite
+    assert rows[10].close_price == pytest.approx(1.6)
+    assert rows[10].adjusted_close == pytest.approx(1.6)
+    assert rows[11].adjusted_close == pytest.approx(1.62)

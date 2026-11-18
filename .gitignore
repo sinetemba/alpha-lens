@@ -41,6 +41,9 @@ data/*.db-wal
 data/*.sqlite
 data/*.sqlite3
 
+# Database backups (contain holdings - never commit)
+data/backups/
+
 # Runtime state
 data/.twelve_data_usage
 data/.updater_last_logon

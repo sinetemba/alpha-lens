@@ -178,7 +178,9 @@ class DataService:
             ("adjusted_close", "adjusted_close"),
         ):
             value = self._to_float(record.get(key))
-            if value is not None:
+            # A zero/negative price is a provider placeholder, never a real
+            # value - writing it would overwrite a good stored price.
+            if value is not None and value > 0:
                 setattr(price, attr, value)
         volume = self._to_float(record.get("volume"))
         if volume is not None:
@@ -419,7 +421,7 @@ class DataService:
 
             if existing:
                 self._apply_price_values(existing, record)
-                if existing.adjusted_close is None:
+                if not existing.adjusted_close:
                     existing.adjusted_close = existing.close_price
                 existing.fetched_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 return True
@@ -433,7 +435,7 @@ class DataService:
                 close_price=close,
             )
             self._apply_price_values(price, record)
-            if price.adjusted_close is None:
+            if not price.adjusted_close:
                 price.adjusted_close = price.close_price
 
             self.db.add(price)
@@ -597,6 +599,8 @@ class DataService:
             record = records_by_ts.get(row.timestamp)
             if record:
                 self._apply_price_values(row, record)
+            if not row.adjusted_close:
+                row.adjusted_close = row.close_price
             row.fetched_at = now
 
         existing = {row.timestamp for row in existing_rows}
@@ -621,7 +625,7 @@ class DataService:
                 close_price=close,
             )
             self._apply_price_values(price, record)
-            if price.adjusted_close is None:
+            if not price.adjusted_close:
                 price.adjusted_close = price.close_price
             new_prices.append(price)
 
@@ -923,12 +927,14 @@ class DataService:
                 timestamp = self._bar_date_timestamp(timestamp)
                 records.append({
                     "timestamp": timestamp,
-                    "open": row.get("Open", 0),
-                    "high": row.get("High", 0),
-                    "low": row.get("Low", 0),
-                    "close": row.get("Close", 0),
-                    "adjusted_close": row.get("Adj Close", 0),
-                    "volume": row.get("Volume", 0),
+                    "open": row.get("Open"),
+                    "high": row.get("High"),
+                    "low": row.get("Low"),
+                    "close": row.get("Close"),
+                    # Absent with yfinance's default auto_adjust=True (Close is
+                    # already adjusted) - falls back to close on save.
+                    "adjusted_close": row.get("Adj Close"),
+                    "volume": row.get("Volume"),
                 })
 
             saved = self._bulk_save_stock_prices(symbol, records)

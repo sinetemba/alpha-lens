@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     updater_logon_min_interval: int = Field(default=600, alias="UPDATER_LOGON_MIN_INTERVAL")
     updater_log_file: str = Field(default="./data/logs/updater.log", alias="UPDATER_LOG_FILE")
 
+    # Database backups (taken by the updater daemon; see app/services/backup.py)
+    backup_dir: str = Field(default="./data/backups", alias="BACKUP_DIR")
+    backup_keep: int = Field(default=8, alias="BACKUP_KEEP")
+    backup_interval_days: int = Field(default=7, alias="BACKUP_INTERVAL_DAYS")
+    # Blank = find pg_dump on PATH or under C:\Program Files\PostgreSQL\*\bin
+    pg_dump_path: str = Field(default="", alias="PG_DUMP_PATH")
+
     # RSS Feed URLs
     rss_moneyweb: str = Field(default="https://www.moneyweb.co.za/feed/", alias="RSS_MONEYWEB")
     rss_businesstech: str = Field(default="https://businesstech.co.za/news/feed/", alias="RSS_BUSINESSTECH")

@@ -37,14 +37,12 @@ stock-analyzer/
 │   ├── notifications/      # Notification service
 │   ├── scrapers/           # News scrapers (RSS)
 │   └── services/           # Business logic (scheduler, data service)
-├── alembic/                # Database migrations
 ├── data/                   # Data directory (database, cache, logs)
 ├── Dockerfile              # Docker image
 ├── docker-compose.yml      # Docker Compose configuration
 ├── tests/                  # Test files
 ├── main.py                 # Main application entry point
 ├── requirements.txt        # Python dependencies
-├── alembic.ini            # Alembic configuration
 └── .env.example           # Environment variables template
 ```
 
@@ -246,9 +244,30 @@ Schema changes are applied automatically on startup by
 `_migrate_schema()` for column/index additions and backfills) - there is
 nothing to run manually.
 
-An Alembic scaffold exists (`alembic.ini`, `alembic/`) but has **no revisions**
-- `alembic upgrade head` is a no-op. If you add a schema change, extend
-`_migrate_schema()` (or commit to Alembic and generate a revision).
+To add a column or index to an existing table, add an idempotent step to
+`_migrate_schema()` (inspect first, then `ALTER TABLE` / `CREATE INDEX`) -
+`create_all` never alters tables that already exist. Use SQL that works on
+both SQLite and PostgreSQL (e.g. `TIMESTAMP`, not `DATETIME`). There is no
+Alembic; it was scaffolded but never used and has been removed.
+
+## Backups
+
+The updater daemon backs up the database whenever the newest backup is more
+than `BACKUP_INTERVAL_DAYS` (default 7) old, keeping the newest `BACKUP_KEEP`
+(default 8) files in `BACKUP_DIR` (default `data/backups/`, gitignored).
+PostgreSQL uses `pg_dump -Fc` (found on `PATH` or under
+`C:\Program Files\PostgreSQL\*\bin`, or set `PG_DUMP_PATH`); SQLite uses an
+online file copy.
+
+```powershell
+python scripts\run_updater.py --backup     # back up now
+
+# Restore a PostgreSQL dump (stop the dashboard and updater first)
+& "C:\Program Files\PostgreSQL\18\bin\pg_restore.exe" --clean --if-exists -h localhost -U <user> -d <db> data\backups\alphalens_<stamp>.dump
+```
+
+`python scripts\check_stored_prices.py [--all]` is a read-only check of stored
+closes against Yahoo (unit mismatches, wrong instruments, stale feeds).
 
 ## Data Sources
 

@@ -29,6 +29,12 @@ Context for anyone working on this repository in the future.
   - Tables are created automatically via `python -c "from app.database.init_db import init_database; init_database()"`.
   - **Session timezone must be UTC.** The DateTime columns are naive and the app treats stored values as UTC; a non-UTC session timezone silently converts aware values to local wall-clock on write (showing times 2h ahead). `scripts\setup_postgres.sql` runs `ALTER DATABASE ... SET timezone = 'UTC'`, and `app\models\base.py` also passes `-c timezone=UTC` in connect_args. If timestamps were already stored shifted, run `python scripts\fix_postgres_timezone.py --apply` once.
 
+## Schema changes and backups
+
+- No Alembic. `init_database()` runs `create_all` (new tables) then `_migrate_schema()` in `app/database/init_db.py`; any column/index added to an existing model needs an idempotent inspect-then-`ALTER` step there, with SQL valid on both SQLite and PostgreSQL.
+- `app/services/backup.py`: the daemon's 60s loop calls `_backup_if_due()` - backs up when the newest file in `data/backups/` is >7 days old (survives sleep, unlike a cron slot), keeps 8, records `database_backup` in `updater_runs`. `run_updater.py --backup` forces one. Take one before any bulk data repair.
+- `scripts/check_stored_prices.py [--all]` - read-only stored-vs-Yahoo close check. As of 2026-11-18 every tracked symbol Yahoo carries agrees; SKA (R0.0085), BAT and AXX were verified correct (backlog #5 was wrong).
+
 ## Windows headless updater
 
 - `scripts\run_updater.py` (via `app\services\updater.py`) is the **only** scheduler in this app - it owns all price/news/historical/dividend fetching. `main.py` (the Streamlit dashboard) does not run a background scheduler of its own; it only reads from the database and offers a manual "Refresh Prices" button. An in-process `SchedulerService` used to run inside the dashboard too (hourly, no quota/lock safeguards) - it duplicated the headless updater's work against the same shared Twelve Data quota and was removed. Do not reintroduce a scheduler inside `main.py`.
@@ -143,6 +149,7 @@ The `strftime('%Y-%m-%d', timestamp)` function is SQLite-only. For PostgreSQL, u
 
 ## Data-write conventions
 
+- Zero/negative OHLC values are treated as missing (`_apply_price_values`) - Yahoo history uses `auto_adjust=True` and has no `Adj Close`, so `adjusted_close` falls back to `close`. 13,365 legacy `adjusted_close = 0.0` rows were repaired 2026-11-18.
 - Daily bars are keyed by naive exchange-local midnight (`YYYY-MM-DD 00:00`), not UTC instants. Re-fetches overwrite the same bar in place — never insert a duplicate row for the same `(symbol, timestamp)`; that pair has a unique index.
 - All `DateTime` columns are naive and store UTC. Use `utcnow_naive()` from `app/models/base.py` for defaults/writes — never write `datetime.now(timezone.utc)` (aware) into a naive column; SQLite would store a `+00:00` suffix and break ordering.
 - Save helpers in `data_service.py` (`_save_price_from_quote`, `_save_recent_bars`) return `bool` and roll back on error. `_save_recent_bars` writes every bar in the fetched Yahoo frame (gap-filling missed days), not just the latest. `update_stock_prices`/`update_dividends` **require** an explicit symbol list (no all-stocks fallback — that was a quota trap); they batch Twelve Data quotes 10-per-request and Yahoo fallbacks via `yf.download`. Batched quotes must carry `mic_code == XJSE` per result — same strict check as `get_quote`.
