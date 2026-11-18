@@ -74,6 +74,12 @@ class CompanyNewsService:
     def _fetch_yahoo(self, symbol: str, search_terms: List[str]) -> List[Dict]:
         try:
             raw = self.yahoo.get_news(symbol)
+            if raw is None:
+                # Fetch failed (retried inside the collector) - distinct from
+                # "Yahoo returned no articles", so the caller can tell an
+                # outage from quiet news.
+                logger.warning(f"Yahoo news unavailable for {symbol}")
+                return []
             articles = []
             for article in raw:
                 text = f"{article.get('title', '')} {article.get('summary', '')}"

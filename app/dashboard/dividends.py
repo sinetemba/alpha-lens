@@ -2,6 +2,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timedelta, timezone
 from loguru import logger
 
@@ -269,6 +270,13 @@ def show_dividends(db: Session):
                         frequency=frequency,
                     )
                     db.add(dividend)
-                    db.commit()
-                    st.success(f"Added {symbol} dividend of R {amount:.4f} per share.")
-                    st.rerun()
+                    try:
+                        db.commit()
+                    except IntegrityError:
+                        # The daily job inserted the same (symbol, ex-date,
+                        # amount) between our check and this commit.
+                        db.rollback()
+                        st.warning(f"A dividend for {symbol} on {ex_date} already exists.")
+                    else:
+                        st.success(f"Added {symbol} dividend of R {amount:.4f} per share.")
+                        st.rerun()

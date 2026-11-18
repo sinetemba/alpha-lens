@@ -1,6 +1,7 @@
 import streamlit as st
 from datetime import datetime, timezone
 from typing import Optional
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.models.base import SessionLocal
 from app.models.stock import Stock, StockPrice
@@ -147,7 +148,11 @@ def _render_home(db: Session):
     # Ensure JSE index symbol exists in the database
     if not db.query(Stock).filter(Stock.symbol == settings.jse_index_yf_symbol).first():
         db.add(Stock(symbol=settings.jse_index_yf_symbol, name="JSE All Share Index"))
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # The updater's _ensure_stock inserted it concurrently - keep theirs.
+            db.rollback()
 
     watchlist_symbols = [
         item.symbol for item in db.query(WatchlistItem).filter(WatchlistItem.is_active == True).all()

@@ -17,6 +17,16 @@ _INSTRUMENT_TYPE_MAP = {
 }
 
 
+class AuthError(Exception):
+    """Login rejected - credentials/account problem. Never retried."""
+
+
+def _is_auth_failure(e: Exception) -> bool:
+    """True when a client.login() exception smells like rejected credentials."""
+    msg = str(e).lower()
+    return any(k in msg for k in ("credential", "password", "login", "auth", "401", "403"))
+
+
 class EasyEquitiesCollector:
     """Collector for pulling real holdings from a user's EasyEquities account.
 
@@ -45,9 +55,11 @@ class EasyEquitiesCollector:
 
         Catches all Exceptions because the third-party client can raise a
         variety of transport/parsing errors. Logs are careful not to expose
-        credentials.
+        credentials. AuthErrors are NOT retried - wrong credentials can only
+        get the account locked out.
         """
         last_exception: Optional[Exception] = None
+        relogin_attempted = False
         for attempt in range(1, self.max_retries + 1):
             try:
                 result = fn()
@@ -55,9 +67,29 @@ class EasyEquitiesCollector:
                     logger.info(f"{label} succeeded on attempt {attempt}")
                 self.last_error = None
                 return result
+            except AuthError as e:
+                self.last_error = str(e)
+                logger.error(f"{label} failed: {e}")
+                return None
             except Exception as e:
                 last_exception = e
                 logger.warning(f"{label} failed on attempt {attempt}: {e}")
+                if (
+                    not relogin_attempted
+                    and label != "EasyEquities login"
+                    and self._client is not None
+                    and _is_auth_failure(e)
+                ):
+                    # The session cookie likely expired mid-run - the retry
+                    # loop alone can't fix that, so re-login once. When the
+                    # re-login itself fails the call can never succeed.
+                    relogin_attempted = True
+                    self._client_authenticated = False
+                    if self._login(self._client):
+                        logger.info(f"Re-authenticated - retrying {label}")
+                        continue
+                    self.last_error = "EasyEquities session expired and re-login failed"
+                    return None
                 if attempt < self.max_retries:
                     sleep_seconds = self.base_delay * (2 ** (attempt - 1))
                     logger.info(f"Retrying {label} in {sleep_seconds:.1f}s")
@@ -107,7 +139,12 @@ class EasyEquitiesCollector:
             return True
 
         def _do_login():
-            client.login(username=self.username, password=self.password)
+            try:
+                client.login(username=self.username, password=self.password)
+            except Exception as e:
+                if _is_auth_failure(e):
+                    raise AuthError(f"EasyEquities login rejected: {e}")
+                raise
             return True
 
         success = bool(self._call_with_retry("EasyEquities login", _do_login))

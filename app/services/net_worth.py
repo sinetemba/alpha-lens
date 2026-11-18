@@ -6,12 +6,14 @@ snapshot), so both value every asset class the same way:
 - JSE: the portfolio's revalued `current_value` (services/portfolio_valuation);
 - crypto: Luno-synced coins at Luno's ZAR bid, other coins via CoinGecko;
   a Luno Bundle is just its coins' combined value;
-- bullion: fine troy ounces x gold/silver spot (Yahoo futures x USDZAR).
+- bullion: fine troy ounces x gold/silver spot - the Krugerrands page's
+  GoldAPI-sourced stored bars when fresh, else Yahoo futures x USDZAR.
 Each part is None when it couldn't be priced, so callers can show "JSE only"
 instead of silently counting an asset class as zero.
 """
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Optional
 
 from loguru import logger
@@ -20,9 +22,11 @@ from sqlalchemy.orm import Session
 from app.collectors.coingecko import CoinGeckoCollector
 from app.collectors.luno import LunoCollector, luno_asset_for
 from app.collectors.yfinance import YFinanceCollector
+from app.models.base import utcnow_naive
 from app.models.crypto import CryptoHolding
 from app.models.krugerrand import KrugerrandHolding
 from app.models.portfolio import Portfolio
+from app.models.stock import StockPrice
 from app.services.luno_sync import LUNO_SOURCE
 
 
@@ -49,6 +53,8 @@ def crypto_price(holding, markets: dict, luno_prices: dict) -> Optional[float]:
     than showing no value.
     """
     gecko = (markets.get(holding.coin_id) or {}).get("current_price")
+    if holding.coin_id == "luno-zar":
+        return 1.0
     if holding.source == LUNO_SOURCE:
         return luno_prices.get(luno_asset_for(holding.coin_id)) or gecko
     return gecko
@@ -90,6 +96,24 @@ def fetch_crypto_prices(holdings: list) -> tuple[dict, dict]:
     return markets, luno_prices
 
 
+def _stored_metal_spots_zar(db: Session, max_age_hours: int = 48) -> dict:
+    """Latest stored XAU/XAG ZAR spot bars written by the Krugerrands page's
+    GoldAPI refreshes ({metal: ZAR/oz}) - kept only when fresh.
+
+    Using the page's own source keeps net worth and the Krugerrands page
+    agreeing; a stale/absent bar falls back to Yahoo in the caller.
+    """
+    spots = {}
+    cutoff = utcnow_naive() - timedelta(hours=max_age_hours)
+    for symbol, metal in (("XAU_ZAR", "XAU"), ("XAG_ZAR", "XAG")):
+        row = db.query(StockPrice.close_price, StockPrice.fetched_at).filter(
+            StockPrice.symbol == symbol
+        ).order_by(StockPrice.fetched_at.desc()).first()
+        if row and row.close_price and row.fetched_at and row.fetched_at >= cutoff:
+            spots[metal] = row.close_price
+    return spots
+
+
 def compute_net_worth(db: Session, jse_value: Optional[float] = None) -> NetWorth:
     """Value every asset class now. `jse_value` defaults to the stored portfolio value.
 
@@ -109,8 +133,12 @@ def compute_net_worth(db: Session, jse_value: Optional[float] = None) -> NetWort
 
     bullion = db.query(KrugerrandHolding).all()
     try:
-        spots = YFinanceCollector().get_metal_spots_zar() if bullion else None
-        bullion_total = bullion_value(bullion, spots)
+        spots = _stored_metal_spots_zar(db) if bullion else {}
+        if bullion and set(spots) < {"XAU", "XAG"}:
+            # Yahoo fills whichever metals lack a fresh stored GoldAPI spot.
+            for metal, price in (YFinanceCollector().get_metal_spots_zar() or {}).items():
+                spots.setdefault(metal, price)
+        bullion_total = bullion_value(bullion, spots or None)
     except Exception as e:
         logger.warning(f"Bullion valuation failed: {e}")
         bullion_total = None

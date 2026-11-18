@@ -1,4 +1,5 @@
 import streamlit as st
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
 from app.models.stock import Stock, StockPrice
@@ -107,7 +108,11 @@ def _save_latest_rates(db: Session, latest_rates: dict[str, float]) -> None:
         else:
             db.add(StockPrice(stock_id=stock.id, symbol=yf_symbol, timestamp=today_start, close_price=rate))
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent render wrote today's bar first - keep theirs.
+        db.rollback()
 
 
 def _ensure_commodity_stocks(db: Session) -> None:
@@ -120,7 +125,11 @@ def _ensure_commodity_stocks(db: Session) -> None:
     for api_symbol, (name, yf_symbol) in COMMODITY_SYMBOLS.items():
         if yf_symbol not in existing:
             db.add(Stock(symbol=yf_symbol, name=name))
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent render inserted the same symbols - keep theirs.
+        db.rollback()
 
 
 def _refresh_commodity_prices(db: Session) -> tuple[int, int]:

@@ -89,6 +89,18 @@ def _enforce_unique_indexes(inspector):
         ("dividends", "ix_dividends_symbol_ex_date", "symbol, ex_dividend_date, amount", None),
         ("portfolio_snapshots", "uq_portfolio_snapshots_portfolio_date", "portfolio_id, snapshot_date", None),
         ("watchlist_items", "ix_watchlist_items_active_symbol", "symbol", "is_active"),
+        # Luno sync upserts from two concurrent writers (updater + page); a
+        # duplicate row is invisible to its dedup map and double-counted.
+        ("crypto_holdings", "ix_crypto_holdings_source_coin_bundle",
+         "coin_id, source, COALESCE(bundle, '')", None),
+        # EE sync + manual adds are check-then-insert and run from page
+        # renders AND the headless sync script.
+        ("portfolio_holdings", "uq_portfolio_holdings_portfolio_symbol_account",
+         "portfolio_id, symbol, account_type", None),
+        # Exactly one Portfolio row ever: the constant key (id*0 == 0 for
+        # every row) makes a second insert collide. The dedupe keeps the
+        # most complete row should two ever co-exist.
+        ("portfolios", "uq_portfolios_singleton", "(id * 0)", None),
     ]
 
     for table, index_name, columns, soft_flag in targets:
@@ -99,8 +111,23 @@ def _enforce_unique_indexes(inspector):
         # Skip when ANY unique index (including a named UNIQUE constraint,
         # which inspectors may report under a generated name) already covers
         # exactly these columns.
-        wanted = columns.split(", ")
-        if any(
+        # Split on top-level commas only - expressions like
+        # COALESCE(bundle, '') contain their own commas.
+        wanted, depth, current = [], 0, ""
+        for ch in columns:
+            if ch == "," and depth == 0:
+                wanted.append(current.strip())
+                current = ""
+                continue
+            depth += (ch == "(") - (ch == ")")
+            current += ch
+        wanted.append(current.strip())
+        if "(" in columns:
+            # Expression index (e.g. COALESCE for nullable keys) - its
+            # column_names won't match a plain list, so gate on the name.
+            if existing and existing.get("unique"):
+                continue
+        elif any(
             ix.get("unique") and (ix.get("column_names") or []) == wanted
             for ix in indexes.values()
         ):
@@ -125,7 +152,12 @@ def _enforce_unique_indexes(inspector):
                     f"CASE WHEN {c} IS NOT NULL THEN 1 ELSE 0 END"
                     for c in all_columns if c != "id"
                 )
-                non_null_keys = " AND ".join(f"{c} IS NOT NULL" for c in wanted)
+                # Only plain columns get a NULL check - expressions like
+                # COALESCE(bundle, '') are never NULL and can't be split at
+                # their inner comma.
+                non_null_keys = " AND ".join(
+                    f"{c} IS NOT NULL" for c in wanted if "(" not in c
+                ) or "TRUE"
                 conn.execute(text(
                     f"DELETE FROM {table} WHERE {non_null_keys} AND id NOT IN ("
                     f"SELECT id FROM ("

@@ -51,8 +51,14 @@ def show_portfolio(db: Session):
     if not portfolio:
         portfolio = Portfolio(name="My Portfolio")
         db.add(portfolio)
-        db.commit()
-        st.info("Created new portfolio. Add holdings below.")
+        try:
+            db.commit()
+            st.info("Created new portfolio. Add holdings below.")
+        except IntegrityError:
+            # A concurrent first-run load inserted the single portfolio row
+            # first (uq_portfolios_singleton) - use theirs.
+            db.rollback()
+            portfolio = db.query(Portfolio).first()
 
     # Reuse the logged-in EasyEquities collector across Streamlit reruns.
     if "ee_collector" not in st.session_state:
@@ -722,15 +728,38 @@ def _sync_portfolio_from_easyequities(
                 PortfolioHolding.portfolio_id == portfolio_id,
             ).all()
         }
+        # One grouped latest-close lookup for the EE units check, instead of
+        # one ORDER BY DESC query per synced holding.
+        latest_ts = db.query(
+            StockPrice.symbol.label("symbol"),
+            func.max(StockPrice.timestamp).label("max_ts"),
+        ).filter(
+            StockPrice.symbol.in_([h["symbol"] for h in aggregated_holdings.values()])
+        ).group_by(StockPrice.symbol).subquery()
+        latest_closes = dict(db.query(StockPrice.symbol, StockPrice.close_price).join(
+            latest_ts,
+            (StockPrice.symbol == latest_ts.c.symbol)
+            & (StockPrice.timestamp == latest_ts.c.max_ts),
+        ).all())
     else:
         stocks_by_symbol = {}
         holdings_by_key = {}
+        latest_closes = {}
 
     for ee_holding in aggregated_holdings.values():
         ee_holding["purchase_price"] = ee_holding["purchase_value"] / ee_holding["shares"]
         ee_holding["current_price"] = ee_holding["current_value"] / ee_holding["shares"]
-        _sync_holding_from_easyequities(db, portfolio_id, ee_holding, stocks_by_symbol, holdings_by_key)
-    db.commit()
+        _sync_holding_from_easyequities(
+            db, portfolio_id, ee_holding, stocks_by_symbol, holdings_by_key, latest_closes,
+        )
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent sync (this page vs sync_easyequities.py / another
+        # session) upserted the same (symbol, account_type) rows first -
+        # they carry equivalent data, keep them instead of crashing.
+        db.rollback()
+        logger.warning("EasyEquities sync hit a concurrent write; keeping the other writer's rows")
 
     # EasyEquities is the source of truth: remove holdings under the account
     # types we just synced that it no longer reports (fully sold/delisted
@@ -849,7 +878,9 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
     return saved
 
 
-def _ee_reconcile_units(db: Session, ee_holding: dict, account_type: str) -> None:
+def _ee_reconcile_units(
+    db: Session, ee_holding: dict, account_type: str, latest_closes: dict | None = None
+) -> None:
     """Rescale EasyEquities amounts that look like cents, in place.
 
     The aggregated holding derives price from value/shares, so internal
@@ -857,6 +888,9 @@ def _ee_reconcile_units(db: Session, ee_holding: dict, account_type: str) -> Non
     against the stored JSE close instead (same ~100x rule as the bar unit
     check on the price-feed path). USD-denominated amounts on JSE-tracked
     accounts are flagged rather than rescaled.
+
+    `latest_closes` is an optional {symbol: latest close} map - syncs prefetch
+    it in one grouped query instead of querying per holding.
     """
     symbol = ee_holding.get("symbol", "?")
     price = ee_holding.get("current_price") or 0.0
@@ -869,18 +903,22 @@ def _ee_reconcile_units(db: Session, ee_holding: dict, account_type: str) -> Non
             f"JSE-tracked account {account_type} - skipping stored-close check"
         )
         return
-    stored = db.query(StockPrice.close_price).filter(
-        StockPrice.symbol == symbol
-    ).order_by(StockPrice.timestamp.desc()).first()
-    if not stored or not stored.close_price:
+    if latest_closes is not None:
+        stored_close = latest_closes.get(symbol)
+    else:
+        stored = db.query(StockPrice.close_price).filter(
+            StockPrice.symbol == symbol
+        ).order_by(StockPrice.timestamp.desc()).first()
+        stored_close = stored.close_price if stored else None
+    if not stored_close:
         return
-    ratio = max(price, stored.close_price) / min(price, stored.close_price)
+    ratio = max(price, stored_close) / min(price, stored_close)
     if ratio <= 3.0:
         return
-    if abs(price / 100 - stored.close_price) / stored.close_price <= 0.2:
+    if abs(price / 100 - stored_close) / stored_close <= 0.2:
         logger.warning(
             f"EasyEquities {symbol}: implied price {price:.2f} looks like cents "
-            f"vs stored close {stored.close_price:.2f} - rescaling /100"
+            f"vs stored close {stored_close:.2f} - rescaling /100"
         )
         for key in ("current_price", "purchase_price", "current_value", "purchase_value"):
             if ee_holding.get(key):
@@ -888,7 +926,7 @@ def _ee_reconcile_units(db: Session, ee_holding: dict, account_type: str) -> Non
     else:
         logger.warning(
             f"EasyEquities {symbol}: implied price {price:.2f} diverges {ratio:.0f}x "
-            f"from stored close {stored.close_price:.2f} - keeping EE values"
+            f"from stored close {stored_close:.2f} - keeping EE values"
         )
 
 
@@ -898,6 +936,7 @@ def _sync_holding_from_easyequities(
     ee_holding: dict,
     stocks_by_symbol: dict | None = None,
     holdings_by_key: dict | None = None,
+    latest_closes: dict | None = None,
 ):
     """Create or update a holding from parsed EasyEquities data.
 
@@ -914,7 +953,7 @@ def _sync_holding_from_easyequities(
     ):
         return
 
-    _ee_reconcile_units(db, ee_holding, account_type)
+    _ee_reconcile_units(db, ee_holding, account_type, latest_closes)
 
     stock = (stocks_by_symbol or {}).get(symbol)
     if stock is None:

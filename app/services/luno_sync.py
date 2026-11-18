@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.collectors.luno import FIAT_ASSETS, LUNO_ASSETS, LunoCollector, account_type, luno_coin_id
@@ -146,6 +147,10 @@ def sync_luno_holdings(db: Session, collector: Optional[LunoCollector] = None) -
         key = (asset, BUNDLE_NAME if in_bundle else None)
         held[key] = held.get(key, 0.0) + amount
     held = {key: amount for key, amount in held.items() if amount >= MIN_BALANCE}
+    # ZAR cash on Luno is a held asset too - sync it as a "luno-zar" row so
+    # net worth counts it (other fiat currencies stay caption-only).
+    if result.fiat.get("ZAR", 0.0) >= MIN_BALANCE:
+        held[("ZAR", None)] = result.fiat["ZAR"]
 
     existing = {
         (h.coin_id, h.bundle): h
@@ -185,7 +190,14 @@ def sync_luno_holdings(db: Session, collector: Optional[LunoCollector] = None) -
         if record.cost_source != "manual":
             _apply_bundle_cost(collector, record, bundle_ids, result)
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent sync (page auto-sync vs the updater's snapshot sync)
+        # wrote the same (coin_id, source, bundle) rows first - they carry
+        # equivalent data, keep them instead of crashing.
+        db.rollback()
+        logger.warning("Luno sync hit a concurrent write; keeping the other writer's rows")
     logger.info(
         f"Luno sync: {result.synced} holding(s)"
         + (f", removed {result.removed}" if result.removed else "")

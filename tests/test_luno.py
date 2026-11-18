@@ -127,12 +127,15 @@ def _fake_collector(balances, bundle=None, history=None):
 def test_sync_creates_luno_rows_and_reports_cash(db_session):
     result = sync_luno_holdings(db_session, _fake_collector({"XBT": 0.015, "ZAR": 152.3, "ETH": 0.0}))
 
-    rows = db_session.query(CryptoHolding).all()
+    # ZAR cash becomes a "luno-zar" holding row (net worth counts it);
+    # result.fiat still reports it for the page caption.
+    rows = db_session.query(CryptoHolding).order_by(CryptoHolding.id).all()
     assert [(r.coin_id, r.symbol, r.source, r.quantity) for r in rows] == [
         ("bitcoin", "BTC", "luno", pytest.approx(0.015)),
+        ("luno-zar", "ZAR", "luno", pytest.approx(152.3)),
     ]
     assert rows[0].last_synced_at is not None
-    assert result.synced == 1 and result.fiat == {"ZAR": pytest.approx(152.3)}
+    assert result.synced == 2 and result.fiat == {"ZAR": pytest.approx(152.3)}
 
 
 def test_sync_updates_quantity_but_keeps_cost_basis(db_session):

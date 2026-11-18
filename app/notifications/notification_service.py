@@ -334,7 +334,7 @@ class NotificationService:
         pending = self.db.query(Notification).filter(
             Notification.is_sent == False,
             or_(Notification.attempts.is_(None), Notification.attempts < MAX_SEND_ATTEMPTS),
-        ).all()
+        ).order_by(Notification.created_at.asc()).limit(200).all()
         
         for notification in pending:
             self.send_notification(notification)

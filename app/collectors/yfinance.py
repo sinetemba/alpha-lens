@@ -137,14 +137,21 @@ class YFinanceCollector:
             logger.error(f"Error getting info for {symbol}: {e}")
             return None
     
-    def get_news(self, symbol: str) -> List[Dict]:
-        """Get latest Yahoo Finance news for a symbol."""
+    def get_news(self, symbol: str) -> Optional[List[Dict]]:
+        """Get latest Yahoo Finance news for a symbol.
+
+        None means the fetch FAILED - callers must not treat it as "no news"
+        (an empty list means that).
+        """
         ticker = self.get_ticker(symbol)
         if not ticker:
             return []
-        
+
         try:
-            raw_news = ticker.news
+            raw_news = self._call_with_retry(
+                f"Yahoo news for {symbol}",
+                lambda: ticker.news,
+            )
             if not raw_news:
                 return []
             
@@ -189,7 +196,7 @@ class YFinanceCollector:
             return articles
         except Exception as e:
             logger.error(f"Error getting news for {symbol}: {e}")
-            return []
+            return None
     
     def get_history(
         self, 
@@ -370,8 +377,10 @@ class YFinanceCollector:
             return None
         
         try:
-            splits = ticker.splits
-            return splits
+            return self._call_with_retry(
+                f"Yahoo splits for {symbol}",
+                lambda: ticker.splits,
+            )
         except Exception as e:
             logger.error(f"Error getting splits for {symbol}: {e}")
             return None
@@ -383,8 +392,10 @@ class YFinanceCollector:
             return None
         
         try:
-            actions = ticker.actions
-            return actions
+            return self._call_with_retry(
+                f"Yahoo actions for {symbol}",
+                lambda: ticker.actions,
+            )
         except Exception as e:
             logger.error(f"Error getting actions for {symbol}: {e}")
             return None
@@ -396,12 +407,17 @@ class YFinanceCollector:
             return None
         
         try:
-            financials = {
-                "income_statement": ticker.income_stmt,
-                "balance_sheet": ticker.balance_sheet,
-                "cash_flow": ticker.cashflow,
+            return {
+                "income_statement": self._call_with_retry(
+                    f"Yahoo income statement for {symbol}", lambda: ticker.income_stmt
+                ),
+                "balance_sheet": self._call_with_retry(
+                    f"Yahoo balance sheet for {symbol}", lambda: ticker.balance_sheet
+                ),
+                "cash_flow": self._call_with_retry(
+                    f"Yahoo cash flow for {symbol}", lambda: ticker.cashflow
+                ),
             }
-            return financials
         except Exception as e:
             logger.error(f"Error getting financials for {symbol}: {e}")
             return None
@@ -413,11 +429,13 @@ class YFinanceCollector:
             return None
         
         try:
-            major_holders = ticker.major_holders
-            institutional_holders = ticker.institutional_holders
             return {
-                "major_holders": major_holders,
-                "institutional_holders": institutional_holders,
+                "major_holders": self._call_with_retry(
+                    f"Yahoo major holders for {symbol}", lambda: ticker.major_holders
+                ),
+                "institutional_holders": self._call_with_retry(
+                    f"Yahoo institutional holders for {symbol}", lambda: ticker.institutional_holders
+                ),
             }
         except Exception as e:
             logger.error(f"Error getting holders for {symbol}: {e}")
@@ -430,8 +448,10 @@ class YFinanceCollector:
             return None
         
         try:
-            recommendations = ticker.recommendations
-            return recommendations
+            return self._call_with_retry(
+                f"Yahoo recommendations for {symbol}",
+                lambda: ticker.recommendations,
+            )
         except Exception as e:
             logger.error(f"Error getting recommendations for {symbol}: {e}")
             return None
@@ -443,8 +463,10 @@ class YFinanceCollector:
             return None
         
         try:
-            calendar = ticker.calendar
-            return calendar
+            return self._call_with_retry(
+                f"Yahoo calendar for {symbol}",
+                lambda: ticker.calendar,
+            )
         except Exception as e:
             logger.error(f"Error getting calendar for {symbol}: {e}")
             return None

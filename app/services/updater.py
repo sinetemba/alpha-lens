@@ -39,7 +39,8 @@ if str(ROOT) not in sys.path:
 
 from app.config.settings import settings
 from app.database.init_db import init_database
-from app.models.base import SessionLocal
+from app.models.base import SessionLocal, utcnow_naive
+from app.models.notification import Notification
 from app.models.watchlist import WatchlistItem
 from app.models.portfolio import (
     Portfolio,
@@ -496,7 +497,7 @@ class UpdaterService:
             logger.warning("Historical catch-up did not complete successfully")
 
     def _weekly_cleanup(self) -> bool:
-        """Weekly job: delete old news articles."""
+        """Weekly job: delete old news articles and old notifications."""
         logger.info("Running weekly cleanup")
         db = SessionLocal()
         ok = False
@@ -504,7 +505,17 @@ class UpdaterService:
         try:
             news_scraper = NewsScraper(db)
             deleted = news_scraper.clean_old_articles(days=90)
-            logger.info(f"Cleaned up {deleted} old news articles")
+            # Alert rows are written unconditionally on every check run;
+            # without pruning the table grows forever.
+            notification_cutoff = utcnow_naive() - timedelta(days=90)
+            deleted_notifications = db.query(Notification).filter(
+                Notification.created_at < notification_cutoff
+            ).delete()
+            db.commit()
+            logger.info(
+                f"Cleaned up {deleted} old news articles, "
+                f"{deleted_notifications} old notifications"
+            )
             ok = True
             return True
         except Exception as e:

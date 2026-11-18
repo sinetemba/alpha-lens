@@ -9,6 +9,10 @@ from app.models.dividend import MoneywebDividendWatch
 from loguru import logger
 
 
+class AuthError(Exception):
+    """Login rejected - credentials/account problem. Never retried."""
+
+
 class MoneywebCollector:
     """Collector for scraping authenticated Moneyweb data pages.
 
@@ -59,6 +63,10 @@ class MoneywebCollector:
                     logger.info(f"{label} succeeded on attempt {attempt}")
                 self.last_error = None
                 return result
+            except AuthError as e:
+                self.last_error = str(e)
+                logger.error(f"{label} failed: {e}")
+                return None
             except Exception as e:
                 last_exception = e
                 logger.warning(f"{label} failed on attempt {attempt}: {e}")
@@ -104,11 +112,13 @@ class MoneywebCollector:
                 if any(name.startswith("wordpress_logged_in") for name in s.cookies):
                     self._authenticated = True
                     return True
-                raise Exception("Login failed: no auth cookie returned (check credentials)")
+                raise AuthError("Login failed: no auth cookie returned (check credentials)")
 
             text = r.text.lower()
             if "login_error" in text or "invalid" in text or "incorrect" in text:
-                raise Exception("Login failed: invalid credentials")
+                raise AuthError("Login failed: invalid credentials")
+            if 400 <= r.status_code < 500:
+                raise AuthError(f"Login rejected with HTTP {r.status_code}")
             if r.status_code >= 400:
                 raise Exception(f"Login failed with HTTP {r.status_code}")
             raise Exception("Login failed: unexpected response")

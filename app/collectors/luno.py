@@ -113,7 +113,10 @@ class LunoCollector:
                     ) + (f" ({code})" if code else "")
                     logger.error(self.last_error)
                     return None
-                if response.status_code < 500:
+                if response.status_code == 429:
+                    # Rate-limited - retryable, same as a 5xx.
+                    self.last_error = "Luno rate-limited (HTTP 429)"
+                elif response.status_code < 500:
                     try:
                         response.raise_for_status()
                         return response.json()
@@ -121,7 +124,8 @@ class LunoCollector:
                         self.last_error = f"Luno request failed ({e.__class__.__name__})"
                         logger.error(f"Luno {path}: {self.last_error}")
                         return None
-                self.last_error = f"Luno returned HTTP {response.status_code}"
+                else:
+                    self.last_error = f"Luno returned HTTP {response.status_code}"
             if attempt < max_retries:
                 time.sleep(0.5 * (2 ** attempt))
         logger.error(f"Luno {path}: {self.last_error}")
@@ -138,26 +142,38 @@ class LunoCollector:
     # Luno's transaction window is capped at 1000 rows per request.
     _TX_PAGE = 1000
 
+    # In-process history cache: {account_id: (max row_index seen, rows)}.
+    # row_index is monotonically increasing and rows are append-only, so
+    # repeated syncs (updater 3x/day + page) only fetch the tail.
+    _tx_cache: dict = {}
+
     def get_transactions(self, account_id: str) -> Optional[list[dict]]:
         """Full transaction history for one account, oldest first; None on failure.
 
         Needs the key's "view transactions" permission (Luno answers 403
-        without it - `last_error` then says so).
+        without it - `last_error` then says so). After the first full pull
+        only rows newer than the cached high-water mark are fetched.
         """
-        rows: list[dict] = []
-        start = 1
+        cached = self._tx_cache.get(account_id)
+        start = cached[0] + 1 if cached else 1
+        new_rows: list[dict] = []
         while True:
             data = self._get(
                 f"accounts/{account_id}/transactions", auth=True,
-                params={"min_row": start, "max_row": start + self._TX_PAGE},
+                # min_row/max_row are INCLUSIVE - request exactly _TX_PAGE rows
+                # or the boundary row would land on both pages (double-counted).
+                params={"min_row": start, "max_row": start + self._TX_PAGE - 1},
             )
             if data is None:
                 return None
             page = data.get("transactions") or []
-            rows.extend(page)
+            new_rows.extend(page)
             if len(page) < self._TX_PAGE:
                 break
             start += self._TX_PAGE
+        rows = (cached[1] + new_rows) if cached else new_rows
+        max_row = max((t.get("row_index") or 0) for t in rows) if rows else 0
+        self._tx_cache[account_id] = (max_row, rows)
         return sorted(rows, key=lambda t: t.get("row_index", 0))
 
     def get_account_balances(self) -> Optional[list[tuple[str, str, float]]]:

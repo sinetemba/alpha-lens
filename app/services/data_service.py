@@ -735,12 +735,24 @@ class DataService:
             for r in rows if r.ex_dividend_date
         }
 
-    def _price_closes(self, symbol: str) -> list:
-        """(timestamp, close) pairs for a symbol, ascending - loaded once per symbol."""
-        return self.db.query(StockPrice.timestamp, StockPrice.close_price).filter(
+    def _price_closes(
+        self, symbol: str, since: Optional[datetime] = None, until: Optional[datetime] = None
+    ) -> list:
+        """(timestamp, close) pairs for a symbol, ascending - loaded once per symbol.
+
+        `since`/`until` bound the scan to the window a caller can possibly
+        need (dividend unit checks only look ±730 days around ex-dates, so a
+        full-history load per symbol was wasted work).
+        """
+        query = self.db.query(StockPrice.timestamp, StockPrice.close_price).filter(
             StockPrice.symbol == symbol,
             StockPrice.close_price.isnot(None),
-        ).order_by(StockPrice.timestamp.asc()).all()
+        )
+        if since is not None:
+            query = query.filter(StockPrice.timestamp >= since)
+        if until is not None:
+            query = query.filter(StockPrice.timestamp <= until)
+        return query.order_by(StockPrice.timestamp.asc()).all()
 
     @staticmethod
     def _close_near(closes: list, ts: datetime, max_age_days: int = 730) -> Optional[float]:
@@ -800,7 +812,15 @@ class DataService:
                         self.db.flush()
 
                     existing_by_key = self._existing_dividends_by_key(symbol)
-                    closes = self._price_closes(symbol)
+                    td_ex_dates = [
+                        datetime.strptime(r["ex_date"], "%Y-%m-%d")
+                        for r in td_dividends if r.get("ex_date")
+                    ]
+                    closes = self._price_closes(
+                        symbol,
+                        since=min(td_ex_dates) - timedelta(days=730) if td_ex_dates else None,
+                        until=max(td_ex_dates) + timedelta(days=730) if td_ex_dates else None,
+                    )
 
                     for record in td_dividends:
                         ex_date_str = record.get("ex_date")
@@ -865,7 +885,15 @@ class DataService:
                     self.db.flush()
 
                 existing_by_key = self._existing_dividends_by_key(symbol)
-                closes = self._price_closes(symbol)
+                yf_ex_dates = []
+                for d in dividends.index:
+                    dt = d.to_pydatetime() if hasattr(d, "to_pydatetime") else d
+                    yf_ex_dates.append(datetime(dt.year, dt.month, dt.day))
+                closes = self._price_closes(
+                    symbol,
+                    since=min(yf_ex_dates) - timedelta(days=730) if yf_ex_dates else None,
+                    until=max(yf_ex_dates) + timedelta(days=730) if yf_ex_dates else None,
+                )
 
                 for date, amount in dividends.items():
                     ex_date = date.to_pydatetime() if hasattr(date, "to_pydatetime") else date

@@ -1,4 +1,5 @@
 import streamlit as st
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 from app.models.krugerrand import KrugerrandHolding
@@ -18,6 +19,8 @@ from loguru import logger
 # GoldAPI live symbols.
 GOLD_USD_LIVE_SYMBOL = "XAU_USD"
 GOLD_LIVE_SYMBOL = "XAU_ZAR"
+SILVER_USD_LIVE_SYMBOL = "XAG_USD"
+SILVER_LIVE_SYMBOL = "XAG_ZAR"
 
 TROY_OZ_GRAMS = 31.1034768
 
@@ -68,7 +71,7 @@ def show_krugerrands(db: Session):
     st.markdown("Track gold and silver Krugerrands and minted bars at live spot prices, plus your own holdings.")
     render_last_fetch_caption(db, [GOLD_USD_LIVE_SYMBOL, GOLD_LIVE_SYMBOL])
 
-    _ensure_gold_symbols(db)
+    _ensure_spot_symbols(db)
 
     # Feedback from the post-action rerun (price refresh, add/remove
     # holding): messages rendered in the same run as st.rerun() are
@@ -120,12 +123,17 @@ def show_krugerrands(db: Session):
     # display toggle is off - the toggle only controls the metric section.
     silver_usd_data, silver_zar_data = _get_silver_spot()
     silver_zar = float(silver_zar_data["price"]) if silver_zar_data and "price" in silver_zar_data else 0.0
+    silver_usd = float(silver_usd_data["price"]) if silver_usd_data and "price" in silver_usd_data else 0.0
+    if silver_usd and silver_zar:
+        _save_spot_prices(db, [
+            (SILVER_USD_LIVE_SYMBOL, silver_usd),
+            (SILVER_LIVE_SYMBOL, silver_zar),
+        ])
 
     if show_silver:
         if silver_usd_data and silver_zar_data:
             st.markdown("---")
             st.subheader("Silver Spot")
-            silver_usd = float(silver_usd_data["price"]) if "price" in silver_usd_data else 0.0
 
             sc1, sc2 = st.columns(2)
             with sc1:
@@ -164,18 +172,24 @@ def _get_silver_spot() -> tuple:
     )
 
 
-def _ensure_gold_symbols(db: Session) -> None:
-    """Ensure live gold spot symbols exist as Stock records."""
+def _ensure_spot_symbols(db: Session) -> None:
+    """Ensure live metal spot symbols exist as Stock records."""
     symbols = {
         GOLD_USD_LIVE_SYMBOL: "Gold Spot USD (Live)",
         GOLD_LIVE_SYMBOL: "Gold Spot ZAR (Live)",
+        SILVER_USD_LIVE_SYMBOL: "Silver Spot USD (Live)",
+        SILVER_LIVE_SYMBOL: "Silver Spot ZAR (Live)",
     }
     for symbol, name in symbols.items():
         stock = db.query(Stock).filter(Stock.symbol == symbol).first()
         if not stock:
             stock = Stock(symbol=symbol, name=name)
             db.add(stock)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent render inserted the same symbols - keep theirs.
+        db.rollback()
 
 
 def _get_api_gold_prices(gold_api: GoldAPICollector) -> tuple[float, float]:
@@ -195,15 +209,18 @@ def _get_api_gold_prices(gold_api: GoldAPICollector) -> tuple[float, float]:
     return gold_usd, gold_zar
 
 
-def _save_gold_prices(db: Session, gold_usd: float, gold_zar: float) -> None:
-    """Persist today's live gold spot snapshots so they can be reused without refetching."""
+def _save_spot_prices(db: Session, prices: list) -> None:
+    """Persist today's live metal spot snapshots so they can be reused
+    without refetching (including by net worth, which prefers these
+    GoldAPI-sourced bars over its Yahoo fallback)."""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    for symbol, price in ((GOLD_USD_LIVE_SYMBOL, gold_usd), (GOLD_LIVE_SYMBOL, gold_zar)):
+    for symbol, price in prices:
         stock = db.query(Stock).filter(Stock.symbol == symbol).first()
         if not stock:
-            stock = Stock(symbol=symbol, name=f"Gold Spot {symbol.split('_')[-1]} (Live)")
+            metal = "Gold" if "XAU" in symbol else "Silver"
+            stock = Stock(symbol=symbol, name=f"{metal} Spot {symbol.split('_')[-1]} (Live)")
             db.add(stock)
             db.flush()
 
@@ -219,7 +236,11 @@ def _save_gold_prices(db: Session, gold_usd: float, gold_zar: float) -> None:
             existing_today.fetched_at = now
         else:
             db.add(StockPrice(stock_id=stock.id, symbol=symbol, timestamp=today_start, close_price=price))
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent render wrote today's bar first - keep theirs.
+        db.rollback()
 
 
 def _get_or_refresh_gold_prices(
@@ -241,7 +262,10 @@ def _get_or_refresh_gold_prices(
 
     gold_usd, gold_zar = _get_api_gold_prices(gold_api)
     if gold_usd and gold_zar:
-        _save_gold_prices(db, gold_usd, gold_zar)
+        _save_spot_prices(db, [
+            (GOLD_USD_LIVE_SYMBOL, gold_usd),
+            (GOLD_LIVE_SYMBOL, gold_zar),
+        ])
         return gold_usd, gold_zar
 
     return _stored()
@@ -463,24 +487,54 @@ def _render_holdings(db: Session, gold_zar: float, silver_zar: float):
 
 
 @st.cache_data(ttl=2592000, show_spinner=False)
-def _get_cached_goldapi_year_end(metal: str = "XAU") -> dict[int, float]:
-    """Year-end ZAR prices for the last 10 years from GoldAPI (30-day cache)."""
+def _get_cached_goldapi_year_price(metal: str, year: int) -> float | None:
+    """One year's end ZAR price from GoldAPI (30-day cache per year).
+
+    Raises on fetch failure (exceptions aren't cached - a transient outage
+    can't poison the month-long entry); returns None only when the API
+    responded but had no price for that year.
+    """
     gold_api = GoldAPICollector()
     if not gold_api.enabled:
-        return {}
+        return None
+    data = gold_api.get_historical_price(metal, "ZAR", f"{year}1231")
+    if data is None:
+        raise RuntimeError(f"GoldAPI year-end fetch failed for {metal} {year}")
+    return float(data["price"]) if "price" in data else None
 
+
+def _get_goldapi_year_end(metal: str = "XAU") -> dict[int, float]:
+    """Year-end ZAR prices for the last 10 years from GoldAPI.
+
+    Years are fetched and cached individually so a failed year doesn't lose
+    the others or get retried as one 10-call block. Raises when every year
+    fails - a total failure is an outage, not "no data".
+    """
+    if not GoldAPICollector().enabled:
+        return {}
     current_year = datetime.now(timezone.utc).year
     prices: dict[int, float] = {}
-    for year in range(current_year - 10, current_year):
-        data = gold_api.get_historical_price(metal, "ZAR", f"{year}1231")
-        if data and "price" in data:
-            prices[year] = float(data["price"])
+    failures = 0
+    years = list(range(current_year - 10, current_year))
+    for year in years:
+        try:
+            price = _get_cached_goldapi_year_price(metal, year)
+        except Exception:
+            failures += 1
+            continue
+        if price is not None:
+            prices[year] = price
+    if failures == len(years):
+        raise RuntimeError(f"GoldAPI returned no year-end {metal} prices - likely an outage or bad key")
     return prices
 
 
 @st.cache_data(ttl=2592000, show_spinner=False)
 def _get_cached_av_year_end(metal: str = "XAU") -> dict[int, float]:
-    """Year-end USD prices for the last 10 years from Alpha Vantage (fallback)."""
+    """Year-end USD prices for the last 10 years from Alpha Vantage (fallback).
+
+    Raises on fetch failure - see _get_cached_goldapi_year_end.
+    """
     av = AlphaVantageCollector()
     if not av.enabled:
         return {}
@@ -488,7 +542,7 @@ def _get_cached_av_year_end(metal: str = "XAU") -> dict[int, float]:
     commodity = "gold" if metal == "XAU" else "silver"
     history = av.get_commodity_history(commodity)
     if not history:
-        return {}
+        raise RuntimeError(f"Alpha Vantage returned no {commodity} history - likely an outage or bad key")
 
     current_year = datetime.now(timezone.utc).year
     prices: dict[int, float] = {}
@@ -502,14 +556,23 @@ def _get_cached_av_year_end(metal: str = "XAU") -> dict[int, float]:
 
 def _get_year_end_prices_zar(metal: str, usd_zar: float) -> dict[int, float]:
     """Year-end ZAR price per year: GoldAPI direct, else Alpha Vantage USD converted."""
-    prices = _get_cached_goldapi_year_end(metal)
+    try:
+        prices = _get_goldapi_year_end(metal)
+    except Exception as e:
+        logger.warning(f"GoldAPI year-end fetch failed for {metal}: {e}")
+        prices = {}
     if prices:
         return prices
     if usd_zar <= 0:
         return {}
     # The USD/ZAR conversion is applied *after* the cache so the live cross
     # never forms part of the cache key (it changes on every refresh).
-    return {year: price * usd_zar for year, price in _get_cached_av_year_end(metal).items()}
+    try:
+        av_prices = _get_cached_av_year_end(metal)
+    except Exception as e:
+        logger.warning(f"Alpha Vantage year-end fetch failed for {metal}: {e}")
+        return {}
+    return {year: price * usd_zar for year, price in av_prices.items()}
 
 
 def _build_year_end_rows(prices: dict[int, float], sizes: dict) -> list[dict]:
