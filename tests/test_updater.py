@@ -110,14 +110,26 @@ def test_deactivates_only_long_stale_symbols(db, age_days, expect_active):
     assert stock.is_active is expect_active
 
 
-def test_symbol_with_no_bars_is_left_active(db):
+def test_new_symbol_with_no_bars_is_left_active(db):
+    stock = _stock(db, "NEW")
+    db.commit()
+
+    _maybe_deactivate_dead_symbol(db, "NEW")
+
+    db.refresh(stock)
+    assert stock.is_active is True
+
+
+def test_long_unpriced_symbol_is_deactivated(db):
+    """SGP: held on EasyEquities, never on any price feed in 4 months."""
     stock = _stock(db, "SGP")
+    stock.created_at = _utcnow() - timedelta(days=120)
     db.commit()
 
     _maybe_deactivate_dead_symbol(db, "SGP")
 
     db.refresh(stock)
-    assert stock.is_active is True
+    assert stock.is_active is False
 
 
 def test_estimate_api_calls_counts_credits_per_symbol(monkeypatch):

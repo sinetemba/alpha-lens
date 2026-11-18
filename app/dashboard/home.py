@@ -21,6 +21,7 @@ from app.dashboard.utils import (
     _to_display_tz,
 )
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES, EXCLUDED_PORTFOLIO_SYMBOLS
+from app.services.net_worth import compute_net_worth
 from app.services.price_queries import get_latest_and_previous_prices
 
 
@@ -30,7 +31,7 @@ _MARKET_DATA = "Twelve Data, Yahoo Finance" if settings.twelve_data_enabled else
 
 # Data sources shown per page in the top-right header.
 PAGE_DATA_SOURCES = {
-    "Home": f"Moneyweb (top movers), {_MARKET_DATA}",
+    "Home": f"Moneyweb (top movers), {_MARKET_DATA}, Luno",
     "Watchlist": _MARKET_DATA,
     "Portfolio": f"EasyEquities, {_MARKET_DATA}",
     "Dividends": "Yahoo Finance, Moneyweb",
@@ -39,7 +40,7 @@ PAGE_DATA_SOURCES = {
     "Penny Stocks": "Yahoo Finance, RSS feeds",
     "Commodities": "Metals.dev, Yahoo Finance",
     "Krugerrands": "GoldAPI",
-    "Crypto": "CoinGecko",
+    "Crypto": "Luno, CoinGecko",
     "Settings": "Local configuration",
 }
 
@@ -130,6 +131,17 @@ def show_home():
         db.close()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _net_worth(jse_value: float):
+    """JSE + crypto + bullion (services/net_worth), cached 5 min - the crypto
+    and metal prices are network calls, and the JSE value keys the cache."""
+    db = SessionLocal()
+    try:
+        return compute_net_worth(db, jse_value=jse_value)
+    finally:
+        db.close()
+
+
 def _render_home(db: Session):
     """Render the home page content."""
     # Ensure JSE index symbol exists in the database
@@ -151,7 +163,7 @@ def _render_home(db: Session):
     _render_home_refresh_control(db, refresh_symbols)
 
     # Get latest market data
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         st.metric(
@@ -181,6 +193,19 @@ def _render_home(db: Session):
             )
         else:
             st.metric(label="Daily Gain", value="—")
+
+    with col4:
+        jse_value = _holdings_market_value(db, holdings) if holdings else 0.0
+        worth = _net_worth(round(jse_value, 2))
+        parts = [("JSE", worth.jse), ("Crypto", worth.crypto), ("Bullion", worth.bullion)]
+        st.metric(
+            label="Net Worth",
+            value=f"R {worth.total:,.2f}" if worth.total else "—",
+            help=" · ".join(f"{name} R {v:,.2f}" for name, v in parts if v)
+            or "Add holdings on the Portfolio, Crypto or Krugerrands pages.",
+        )
+        if worth.missing:
+            st.caption(f"Excludes {' and '.join(worth.missing)} (prices unavailable right now).")
 
     st.markdown("---")
 

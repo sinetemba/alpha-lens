@@ -116,9 +116,14 @@ def _today() -> "datetime.date":
 
 
 def record_snapshot(
-    db: Session, portfolio_id: int, total_value: float, total_cost: float, day=None
+    db: Session, portfolio_id: int, total_value: float, total_cost: float, day=None,
+    crypto_value: Optional[float] = None, bullion_value: Optional[float] = None,
 ) -> None:
-    """Upsert the (portfolio, day) snapshot. Best-effort: never fails the caller."""
+    """Upsert the (portfolio, day) snapshot. Best-effort: never fails the caller.
+
+    `crypto_value`/`bullion_value` are only written when given - None means
+    "not measured this time", not zero.
+    """
     day = day or _today()
     for attempt in range(2):
         try:
@@ -126,14 +131,15 @@ def record_snapshot(
                 PortfolioSnapshot.portfolio_id == portfolio_id,
                 PortfolioSnapshot.snapshot_date == day,
             ).first()
-            if row:
-                row.total_value = total_value
-                row.total_cost = total_cost
-            else:
-                db.add(PortfolioSnapshot(
-                    portfolio_id=portfolio_id, snapshot_date=day,
-                    total_value=total_value, total_cost=total_cost,
-                ))
+            if row is None:
+                row = PortfolioSnapshot(portfolio_id=portfolio_id, snapshot_date=day)
+                db.add(row)
+            row.total_value = total_value
+            row.total_cost = total_cost
+            if crypto_value is not None:
+                row.crypto_value = crypto_value
+            if bullion_value is not None:
+                row.bullion_value = bullion_value
             db.commit()
             return
         except IntegrityError:

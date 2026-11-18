@@ -42,6 +42,7 @@ from app.database.init_db import init_database
 from app.models.base import SessionLocal
 from app.models.watchlist import WatchlistItem
 from app.models.portfolio import (
+    Portfolio,
     PortfolioHolding,
     EXCLUDED_ACCOUNT_TYPES as PORTFOLIO_EXCLUDED_ACCOUNT_TYPES,
     is_jse_tracked_account,
@@ -52,7 +53,10 @@ from app.services.data_service import DataService
 from app.scrapers.news import NewsScraper
 from app.collectors.twelve_data import TwelveDataCollector
 from app.services import backup
-from app.services.portfolio_valuation import revalue_portfolio
+from app.services.portfolio_valuation import record_snapshot, revalue_portfolio, valued_holdings
+from app.services.luno_sync import sync_luno_holdings
+from app.services.net_worth import compute_net_worth
+from app.collectors.luno import LunoCollector
 
 
 def _run_notification_checks(db: Session) -> None:
@@ -73,15 +77,40 @@ def _run_notification_checks(db: Session) -> None:
 
 
 def _snapshot_portfolio(db: Session) -> None:
-    """Revalue the portfolio from fresh prices and record today's snapshot.
+    """Sync Luno, revalue everything and record today's net-worth snapshot.
 
-    Keeps the Portfolio page's value-history chart filling in on days the
-    dashboard is never opened. Failures must never fail the update run.
+    Keeps the Portfolio page's value-history chart (JSE + crypto + bullion)
+    filling in on days the dashboard is never opened, and keeps crypto
+    balances current without a Crypto page visit. Each step is
+    best-effort: failures must never fail the update run.
     """
+    luno = LunoCollector()
+    if luno.enabled:
+        try:
+            if sync_luno_holdings(db, luno) is None:
+                logger.warning(f"Luno sync failed: {luno.last_error}")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Luno sync failed: {e}")
+
     try:
         value = revalue_portfolio(db)
-        if value is not None:
-            logger.info(f"Portfolio snapshot recorded: R {value:,.2f}")
+        if value is None:
+            return
+        worth = compute_net_worth(db, jse_value=value)
+        portfolio = db.query(Portfolio).first()
+        record_snapshot(
+            db, portfolio.id, portfolio.current_value,
+            sum(h.quantity * h.purchase_price for h in valued_holdings(db, portfolio.id)),
+            crypto_value=worth.crypto, bullion_value=worth.bullion,
+        )
+        logger.info(
+            f"Net worth snapshot: R {worth.total:,.2f} (JSE R {value:,.2f}"
+            + (f", crypto R {worth.crypto:,.2f}" if worth.crypto else "")
+            + (f", bullion R {worth.bullion:,.2f}" if worth.bullion else "")
+            + (f"; unpriced: {', '.join(worth.missing)}" if worth.missing else "")
+            + ")"
+        )
     except Exception as e:
         db.rollback()
         logger.error(f"Portfolio snapshot failed: {e}")
@@ -154,27 +183,38 @@ def _record_run(db: Session, job_name: str, success: bool, detail: str = None) -
 def _maybe_deactivate_dead_symbol(db: Session, symbol: str) -> None:
     """Deactivate a Stock whose feed produces no recent bars.
 
-    Called when a historical update saves nothing. The >45d staleness guard
-    means transient feed outages and healthy up-to-date symbols (which also
-    save 0 rows) are never affected. Symbols with no bars at all are left
-    alone - the user is warned at add time.
+    Called when a historical update saves nothing. The >45d guard means
+    transient feed outages and healthy up-to-date symbols (which also save 0
+    rows) are never affected:
+    - with bars: the newest bar must be >45d old;
+    - with no bars ever: the Stock must have existed for >45d. A brand-new
+      symbol is left alone (the user is warned at add time); one that has
+      never priced in 45 days is not on any feed (e.g. a suspended share held
+      on EasyEquities) and only produces errors every run.
+    Deactivation only stops price fetching - holdings keep their last
+    EasyEquities-synced values.
     """
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    if not stock or not stock.is_active:
+        return
     latest = db.query(func.max(StockPrice.timestamp)).filter(
         StockPrice.symbol == symbol
     ).scalar()
-    if latest is None:
-        return
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    if now - latest <= STALE_SYMBOL_MAX_AGE:
-        return
-    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
-    if stock and stock.is_active:
-        stock.is_active = False
-        db.commit()
-        logger.warning(
-            f"Deactivated {symbol}: newest stored bar is {latest:%Y-%m-%d} "
-            f"(>{STALE_SYMBOL_MAX_AGE.days}d old) - likely delisted or invalid ticker"
-        )
+    if latest is not None:
+        if now - latest <= STALE_SYMBOL_MAX_AGE:
+            return
+        reason = f"newest stored bar is {latest:%Y-%m-%d}"
+    else:
+        if stock.created_at is None or now - stock.created_at <= STALE_SYMBOL_MAX_AGE:
+            return
+        reason = f"never priced since it was added on {stock.created_at:%Y-%m-%d}"
+    stock.is_active = False
+    db.commit()
+    logger.warning(
+        f"Deactivated {symbol}: {reason} (>{STALE_SYMBOL_MAX_AGE.days}d) - "
+        "likely delisted, suspended or an invalid ticker"
+    )
 
 
 def _estimate_api_calls(symbols: list, include_historical: bool = False) -> int:

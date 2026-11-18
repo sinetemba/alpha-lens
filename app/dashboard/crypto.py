@@ -4,11 +4,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.collectors.coingecko import CoinGeckoCollector
-from app.collectors.luno import LunoCollector, luno_asset_for
+from app.collectors.luno import LunoCollector
 from app.dashboard.utils import _to_display_tz, holding_totals, price_column_format, render_holding_totals
 from app.models.base import utcnow_naive
 from app.models.crypto import CryptoBundle, CryptoHolding
 from app.services.luno_sync import LUNO_SOURCE, last_luno_sync, sync_luno_holdings
+from app.services.net_worth import crypto_price
 
 # Luno balances are re-synced on page load when the last sync is older than this.
 LUNO_SYNC_MAX_AGE = timedelta(minutes=15)
@@ -153,15 +154,8 @@ def _holding_valuation(holding: CryptoHolding, price: Optional[float]) -> tuple:
 
 
 def _holding_price(holding: CryptoHolding, markets: dict, luno_prices: dict) -> Optional[float]:
-    """ZAR price per coin: Luno's bid for Luno rows, CoinGecko otherwise.
-
-    A Luno coin with no Luno ZAR route at all falls back to CoinGecko rather
-    than showing no value.
-    """
-    gecko = (markets.get(holding.coin_id) or {}).get("current_price")
-    if holding.source == LUNO_SOURCE:
-        return luno_prices.get(luno_asset_for(holding.coin_id)) or gecko
-    return gecko
+    """ZAR price per coin - shared rule in services/net_worth.crypto_price."""
+    return crypto_price(holding, markets, luno_prices)
 
 
 def _bundle_value(coins: list, markets: dict, luno_prices: dict) -> Optional[float]:

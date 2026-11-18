@@ -68,6 +68,30 @@ class YFinanceCollector:
 
         return hist
     
+    def get_metal_spots_zar(self) -> Optional[Dict[str, float]]:
+        """Gold/silver ZAR per troy oz: COMEX futures x USDZAR; None on failure.
+
+        Free and quota-less, so the headless updater can value bullion
+        without spending GoldAPI's 100 requests/month (the Krugerrands page
+        keeps using GoldAPI; the two agree to ~0.01% for gold).
+        """
+        if not self.enabled:
+            return None
+        try:
+            closes = self._call_with_retry(
+                "Yahoo metal spots",
+                lambda: yf.download(
+                    ["GC=F", "SI=F", "ZAR=X"], period="5d", progress=False, auto_adjust=False
+                )["Close"],
+            )
+            latest = closes.ffill().iloc[-1]
+            usd_zar = float(latest["ZAR=X"])
+            spots = {"XAU": float(latest["GC=F"]) * usd_zar, "XAG": float(latest["SI=F"]) * usd_zar}
+        except Exception as e:
+            logger.error(f"Yahoo metal spot fetch failed: {e}")
+            return None
+        return {k: v for k, v in spots.items() if v and v == v and v > 0} or None
+
     def search_jse(self, query: str, limit: int = 8) -> Optional[List[Dict]]:
         """Search Yahoo for JSE listings by company name or ticker.
 

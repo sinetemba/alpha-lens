@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 from app.models.portfolio import (
     Portfolio,
@@ -27,7 +28,7 @@ from app.dashboard.utils import (
 from app.collectors.easyequities import EasyEquitiesCollector
 from app.services.portfolio_valuation import update_holding_values, update_portfolio_totals
 from app.services.price_queries import get_latest_and_previous_prices
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from loguru import logger
 
 
@@ -145,6 +146,7 @@ def show_portfolio(db: Session):
     with col5:
         st.metric("Holdings", len(holdings))
 
+    _render_unpriced_notice(db, holdings, portfolio)
     _render_value_history(db, portfolio.id)
 
     st.markdown("---")
@@ -328,6 +330,40 @@ def show_portfolio(db: Session):
                 st.rerun()
 
 
+# A JSE holding with no stored bar newer than this is flagged as not live.
+UNPRICED_AFTER_DAYS = 7
+
+
+def _render_unpriced_notice(db: Session, holdings: list, portfolio: Portfolio) -> None:
+    """Name JSE holdings whose value isn't live (suspended/delisted/unknown to the feeds).
+
+    Their value stays whatever EasyEquities last reported, which is easy to
+    mistake for a live price.
+    """
+    symbols = sorted({h.symbol for h in holdings if is_jse_tracked_account(h.account_type)})
+    if not symbols:
+        return
+    latest = dict(
+        db.query(StockPrice.symbol, func.max(StockPrice.timestamp))
+        .filter(StockPrice.symbol.in_(symbols)).group_by(StockPrice.symbol).all()
+    )
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=UNPRICED_AFTER_DAYS)
+    stale = [
+        f"{s} (last price {latest[s]:%Y-%m-%d})" if latest.get(s) else f"{s} (never priced)"
+        for s in symbols if not latest.get(s) or latest[s] < cutoff
+    ]
+    if not stale:
+        return
+    synced = (
+        _to_display_tz(portfolio.last_easyequities_sync).strftime("%Y-%m-%d %H:%M")
+        if portfolio.last_easyequities_sync else "never"
+    )
+    st.caption(
+        f"⚠️ No live JSE price for {', '.join(stale)} - likely suspended or delisted. "
+        f"Their values are EasyEquities' last figures (synced {synced} SAST)."
+    )
+
+
 def _render_value_history(db: Session, portfolio_id: int) -> None:
     """Total value vs cost basis over time, from the daily snapshots."""
     rows = db.query(PortfolioSnapshot).filter(
@@ -343,9 +379,17 @@ def _render_value_history(db: Session, portfolio_id: int) -> None:
             return
         fig = go.Figure()
         dates = [r.snapshot_date for r in rows]
-        fig.add_trace(go.Scatter(x=dates, y=[r.total_value for r in rows], name="Value", mode="lines+markers"))
+        if any(r.crypto_value or r.bullion_value for r in rows):
+            # Net worth adds crypto and bullion (recorded by the updater);
+            # days before they were tracked show JSE only.
+            fig.add_trace(go.Scatter(
+                x=dates,
+                y=[r.total_value + (r.crypto_value or 0) + (r.bullion_value or 0) for r in rows],
+                name="Net worth (JSE + crypto + bullion)", mode="lines+markers",
+            ))
+        fig.add_trace(go.Scatter(x=dates, y=[r.total_value for r in rows], name="JSE value", mode="lines+markers"))
         fig.add_trace(go.Scatter(
-            x=dates, y=[r.total_cost for r in rows], name="Cost basis",
+            x=dates, y=[r.total_cost for r in rows], name="JSE cost basis",
             mode="lines", line={"dash": "dash"},
         ))
         fig.update_layout(

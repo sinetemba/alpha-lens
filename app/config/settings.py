@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     # RSS Feed URLs
     rss_moneyweb: str = Field(default="https://www.moneyweb.co.za/feed/", alias="RSS_MONEYWEB")
     rss_businesstech: str = Field(default="https://businesstech.co.za/news/feed/", alias="RSS_BUSINESSTECH")
-    rss_news24_business: str = Field(default="https://www.news24.com/Services/Site/Feeds/24/Article/TopStories?sectionId=3", alias="RSS_NEWS24_BUSINESS")
+    rss_news24_business: str = Field(default="https://feeds.capi24.com/v1/Search/articles/news24/Business/rss", alias="RSS_NEWS24_BUSINESS")
     rss_daily_investor: str = Field(default="https://www.dailyinvestor.com/feed/", alias="RSS_DAILY_INVESTOR")
     rss_iol_business: str = Field(default="https://iol.co.za/rss/iol/business", alias="RSS_IOL_BUSINESS")
 
