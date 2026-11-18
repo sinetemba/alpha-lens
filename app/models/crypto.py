@@ -32,6 +32,9 @@ class CryptoHolding(Base):
     notes = Column(Text)
     source = Column(String(20), nullable=False, default="manual", server_default=text("'manual'"))
     bundle = Column(String(60))                    # Luno Bundle name; NULL = held directly
+    # Where purchase_price came from: "luno" (derived from transaction
+    # history on each sync) or "manual" (user-entered - syncs never touch it).
+    cost_source = Column(String(10))
     last_synced_at = Column(DateTime)              # Luno rows: last balance sync (UTC)
     created_at = Column(DateTime, default=utcnow_naive)
     updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
@@ -50,5 +53,7 @@ class CryptoBundle(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(60), nullable=False, unique=True)
     purchase_cost = Column(Float)                  # total ZAR paid for the bundle
+    cost_source = Column(String(10))               # "luno" (derived) | "manual"
+    label = Column(String(80))                     # Luno's own name, e.g. "LLC bundle"
     created_at = Column(DateTime, default=utcnow_naive)
     updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)

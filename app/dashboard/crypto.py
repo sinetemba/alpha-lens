@@ -102,6 +102,7 @@ def _render_luno_sync(db: Session) -> None:
             st.error(f"Luno sync failed: {collector.last_error}")
         else:
             st.session_state["luno_fiat"] = result.fiat
+            st.session_state["luno_cost_error"] = result.cost_error
             _get_luno_prices.clear()
             if manual:
                 st.success(
@@ -118,6 +119,12 @@ def _render_luno_sync(db: Session) -> None:
         fiat = st.session_state.get("luno_fiat") or {}
         cash = ", ".join(f"{cur} {amount:,.2f}" for cur, amount in sorted(fiat.items()))
         st.caption(f"Luno: last synced {when}" + (f" · cash on Luno: {cash}" if cash else ""))
+    cost_error = st.session_state.get("luno_cost_error")
+    if cost_error:
+        st.warning(
+            f"Couldn't read your Luno transaction history, so purchase costs weren't "
+            f"updated: {cost_error}. Costs you entered by hand are unaffected."
+        )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -222,9 +229,11 @@ def _render_holdings(db: Session, holdings: list, markets: dict, luno_prices: di
             _render_bundle(db, name, coins, bundle_records.get(name), markets, luno_prices)
         if any(h.source == LUNO_SOURCE and not h.purchase_price for h in direct):
             st.caption(
-                "Luno doesn't report what you paid - set a cost per coin below to see "
-                "gain/loss for Luno holdings."
+                "Some Luno holdings have no purchase cost in their Luno history (e.g. coins "
+                "received rather than bought) - set a cost per coin below to see their gain/loss."
             )
+        if any(h.cost_source == "luno" for h in direct):
+            st.caption("Paid per coin = average cost of the coins you hold, from your Luno trade history.")
     else:
         st.info("No crypto holdings yet - connect Luno or record a purchase below.")
 
@@ -265,10 +274,15 @@ def _render_bundle(
     total = sum(v for _, _, v in priced if v is not None)
     cost = record.purchase_cost if record else None
 
-    st.markdown(f"**📦 {name}**")
+    title = (record.label if record and record.label else name)
+    st.markdown(f"**📦 {title}**")
     c1, c2, c3 = st.columns(3)
     c1.metric("Bundle value", f"R {total:,.2f}" if total else "N/A")
-    c2.metric("Paid for bundle", f"R {cost:,.2f}" if cost else "Not set")
+    c2.metric(
+        "Paid for bundle", f"R {cost:,.2f}" if cost else "Not set",
+        help="Net Rand invested, from your Luno transaction history"
+        if record and record.cost_source == "luno" else "Entered by you",
+    )
     if cost and total:
         gain = total - cost
         c3.metric("Gain/Loss", f"R {gain:+,.2f}", delta=f"{gain / cost * 100:+.1f}%")
@@ -308,15 +322,24 @@ def _render_bundle(
             help="The Rand amount you invested in the bundle (Luno's Transactions history "
                  "shows it). Top-ups: enter the running total. Set 0 to clear.",
         )
-        if st.button("Save bundle cost", key=f"bundle_cost_save_{name}"):
+        save_col, reset_col = st.columns(2)
+        if save_col.button("Save bundle cost", key=f"bundle_cost_save_{name}"):
             record = record or db.query(CryptoBundle).filter_by(name=name).first()
             if record is None:
                 record = CryptoBundle(name=name)
                 db.add(record)
             record.purchase_cost = paid or None
+            # Manual entries win over the Luno-history figure on later syncs.
+            record.cost_source = "manual" if paid else None
             db.commit()
-            st.session_state["crypto_flash"] = ("success", f"Saved cost for {name}.")
+            st.session_state["crypto_flash"] = ("success", f"Saved cost for {title}.")
             st.rerun()
+        if record and record.cost_source == "manual" and reset_col.button(
+            "Use Luno history instead", key=f"bundle_cost_reset_{name}"
+        ):
+            record.cost_source = None
+            db.commit()
+            _resync_costs(db)
 
 
 def _render_remove_manual(db: Session, manual: list) -> None:
@@ -380,13 +403,35 @@ def _render_luno_cost_basis(db: Session, luno_holdings: list) -> None:
             help="Your average buy price. Luno's Transactions history shows what you paid. "
                  "Set 0 to clear.",
         )
-        if st.button("Save cost", key="luno_cost_save"):
+        save_col, reset_col = st.columns(2)
+        if reset_col.button(
+            "Use Luno history instead", key="luno_cost_reset",
+            disabled=by_id[holding_id].cost_source != "manual",
+        ):
+            by_id[holding_id].cost_source = None
+            db.commit()
+            _resync_costs(db)
+        if save_col.button("Save cost", key="luno_cost_save"):
             by_id[holding_id].purchase_price = price or None
+            # Manual entries win over the Luno-history figure on later syncs.
+            by_id[holding_id].cost_source = "manual" if price else None
             db.commit()
             st.session_state["crypto_flash"] = (
                 "success", f"Saved cost basis for {by_id[holding_id].symbol}."
             )
             st.rerun()
+
+
+def _resync_costs(db: Session) -> None:
+    """Re-derive costs from Luno history now (after clearing a manual override)."""
+    result = sync_luno_holdings(db, LunoCollector())
+    if result is None or result.cost_error:
+        st.session_state["crypto_flash"] = (
+            "warning", "Couldn't read Luno history - the cost will refresh on the next sync."
+        )
+    else:
+        st.session_state["crypto_flash"] = ("success", "Cost restored from your Luno history.")
+    st.rerun()
 
 
 def _resolve_coin(selection: str, custom_id: str) -> Optional[dict]:

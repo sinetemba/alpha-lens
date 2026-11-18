@@ -51,6 +51,11 @@ def luno_coin_id(asset: str) -> str:
     return known[2] if known else f"luno-{asset.lower()}"
 
 
+def account_type(account: dict) -> str:
+    """"BUNDLE" for Luno Bundle accounts, "TRANSACTIONAL" for normal wallets."""
+    return (account.get("account_type") or "TRANSACTIONAL").upper()
+
+
 def luno_asset_for(coin_id: str) -> str:
     """Inverse of `luno_coin_id`: the Luno asset code behind a holding key."""
     for asset, (_, _, gecko_id) in LUNO_ASSETS.items():
@@ -78,7 +83,7 @@ class LunoCollector:
     def enabled(self) -> bool:
         return bool(self.key_id and self.secret)
 
-    def _get(self, path: str, auth: bool, max_retries: int = 2) -> Optional[dict]:
+    def _get(self, path: str, auth: bool, max_retries: int = 2, params: Optional[dict] = None) -> Optional[dict]:
         """GET a Luno endpoint; None on failure with `last_error` set.
 
         Auth errors are not retried. Messages never include the credentials
@@ -90,6 +95,7 @@ class LunoCollector:
                 response = requests.get(
                     f"{self.BASE_URL}/{path}",
                     auth=(self.key_id, self.secret) if auth else None,
+                    params=params,
                     timeout=20,
                 )
             except requests.exceptions.RequestException as e:
@@ -102,8 +108,9 @@ class LunoCollector:
                         code = ""
                     self.last_error = (
                         "Luno rejected the API key - check LUNO_API_KEY_ID / LUNO_API_SECRET"
-                        + (f" ({code})" if code else "")
-                    )
+                        if response.status_code == 401 else
+                        "The Luno API key lacks permission for this (enable it on the key)"
+                    ) + (f" ({code})" if code else "")
                     logger.error(self.last_error)
                     return None
                 if response.status_code < 500:
@@ -120,6 +127,39 @@ class LunoCollector:
         logger.error(f"Luno {path}: {self.last_error}")
         return None
 
+    def get_accounts(self) -> Optional[list[dict]]:
+        """Raw Luno accounts (account_id, asset, account_type, balance, ...)."""
+        if not self.enabled:
+            self.last_error = "Luno API key not configured"
+            return None
+        data = self._get("balance", auth=True)
+        return None if data is None else list(data.get("balance") or [])
+
+    # Luno's transaction window is capped at 1000 rows per request.
+    _TX_PAGE = 1000
+
+    def get_transactions(self, account_id: str) -> Optional[list[dict]]:
+        """Full transaction history for one account, oldest first; None on failure.
+
+        Needs the key's "view transactions" permission (Luno answers 403
+        without it - `last_error` then says so).
+        """
+        rows: list[dict] = []
+        start = 1
+        while True:
+            data = self._get(
+                f"accounts/{account_id}/transactions", auth=True,
+                params={"min_row": start, "max_row": start + self._TX_PAGE},
+            )
+            if data is None:
+                return None
+            page = data.get("transactions") or []
+            rows.extend(page)
+            if len(page) < self._TX_PAGE:
+                break
+            start += self._TX_PAGE
+        return sorted(rows, key=lambda t: t.get("row_index", 0))
+
     def get_account_balances(self) -> Optional[list[tuple[str, str, float]]]:
         """(asset, account_type, balance) per Luno account; None on failure.
 
@@ -128,14 +168,11 @@ class LunoCollector:
         each. `balance` already includes funds reserved in open orders. Zero
         balances are kept so callers can tell "sold out" from "missing".
         """
-        if not self.enabled:
-            self.last_error = "Luno API key not configured"
-            return None
-        data = self._get("balance", auth=True)
-        if data is None:
+        raw = self.get_accounts()
+        if raw is None:
             return None
         accounts = []
-        for account in data.get("balance") or []:
+        for account in raw:
             asset = (account.get("asset") or "").upper()
             if not asset:
                 continue
@@ -143,7 +180,7 @@ class LunoCollector:
                 amount = float(account.get("balance") or 0)
             except (TypeError, ValueError):
                 continue
-            accounts.append((asset, (account.get("account_type") or "TRANSACTIONAL").upper(), amount))
+            accounts.append((asset, account_type(account), amount))
         return accounts
 
     def get_balances(self) -> Optional[dict[str, float]]:

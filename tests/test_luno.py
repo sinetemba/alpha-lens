@@ -10,7 +10,7 @@ from app.collectors.luno import LunoCollector, luno_asset_for, luno_coin_id
 from app.config.settings import settings
 from app.dashboard.crypto import _holding_price
 from app.models.crypto import CryptoBundle, CryptoHolding
-from app.services.luno_sync import BUNDLE_NAME, sync_luno_holdings
+from app.services.luno_sync import BUNDLE_NAME, bundle_invested, sync_luno_holdings, wallet_cost, zar_amount
 
 
 def _response(status, payload):
@@ -102,14 +102,27 @@ def test_asset_key_round_trip():
 
 # --- sync ----------------------------------------------------------------
 
-def _fake_collector(balances, bundle=None):
-    """Wallet balances {asset: amount}, optional bundle {asset: amount}; None = fetch failed."""
-    if balances is None:
-        return SimpleNamespace(get_account_balances=lambda: None, last_error="down")
-    accounts = [(a, "TRANSACTIONAL", v) for a, v in balances.items()]
-    accounts += [(a, "BUNDLE", v) for a, v in (bundle or {}).items()]
-    return SimpleNamespace(get_account_balances=lambda: accounts, last_error=None)
+def _fake_collector(balances, bundle=None, history=None):
+    """Wallet {asset: amount}, bundle {asset: amount}; None = balance fetch failed.
 
+    `history` maps account ids ("W-<asset>" wallet, "B-<asset>" bundle) to
+    transaction lists; the string "fail" makes every history call fail.
+    """
+    if balances is None:
+        return SimpleNamespace(get_accounts=lambda: None, last_error="down")
+    accounts = [{"account_id": f"W-{a}", "asset": a, "account_type": "TRANSACTIONAL", "balance": str(v)}
+                for a, v in balances.items()]
+    accounts += [{"account_id": f"B-{a}", "asset": a, "account_type": "BUNDLE", "balance": str(v)}
+                 for a, v in (bundle or {}).items()]
+    fake = SimpleNamespace(get_accounts=lambda: accounts, last_error=None)
+    if history == "fail":
+        def _fail(account_id):
+            fake.last_error = "The Luno API key lacks permission for this"
+            return None
+        fake.get_transactions = _fail
+    else:
+        fake.get_transactions = lambda account_id: list((history or {}).get(account_id, []))
+    return fake
 
 def test_sync_creates_luno_rows_and_reports_cash(db_session):
     result = sync_luno_holdings(db_session, _fake_collector({"XBT": 0.015, "ZAR": 152.3, "ETH": 0.0}))
@@ -237,3 +250,90 @@ def test_bundle_value_sums_coins():
     ]
     value = _bundle_value(coins, markets={}, luno_prices={"XBT": 1_000_000.0, "BNB": 9_500.0})
     assert value == pytest.approx(600.0 + 38.0)
+
+
+
+# --- cost basis from transaction history ---------------------------------
+# Shapes copied from real Luno responses (amounts use non-breaking spaces).
+
+def _tx(row, kind, delta, description, approx=None):
+    return {"row_index": row, "kind": kind, "balance_delta": delta, "description": description,
+            "timestamp": 1742402104041, "details": {"Approximate value": approx} if approx else {}}
+
+
+def test_zar_amount_parsing():
+    assert zar_amount(_tx(1, "EXCHANGE", 1, "Bought XLM 180.91912435 for R 1,000.00")) == 1000.0
+    assert zar_amount(_tx(1, "EXCHANGE", -1, "Sold BTC 0.00458216 for ZAR 563.55")) == 563.55
+    # Crypto-for-crypto: fall back to Luno's approximate Rand value.
+    assert zar_amount(_tx(1, "EXCHANGE", 1, "Bought ETH 0.012 for BTC 0.001",
+                          approx="~R 245.10 (20,300 ZAR/ETH)")) == 245.10
+
+
+def test_wallet_cost_averages_buys():
+    txs = [_tx(1, "EXCHANGE", 33.829151, "Bought XRP 33.829151 for ZAR 500.00"),
+           _tx(2, "EXCHANGE", 37.426788, "Bought XRP 37.426788 for ZAR 1,000.00")]
+    cost, qty, first = wallet_cost(txs)
+    assert cost == pytest.approx(1500.0)
+    assert qty == pytest.approx(71.255939)
+    assert first is not None
+
+
+def test_wallet_cost_sells_release_cost_and_fees_do_not():
+    txs = [_tx(1, "EXCHANGE", 2.0, "Bought ETH 2 for R 1,000.00"),
+           _tx(2, "FEE", -0.1, "Withdrawal fee"),               # coins gone, cost stays
+           _tx(3, "EXCHANGE", -0.95, "Sold ETH 0.95 for R 600.00")]  # half of 1.9 left
+    cost, qty, _ = wallet_cost(txs)
+    assert qty == pytest.approx(0.95)
+    assert cost == pytest.approx(500.0)
+
+
+def test_bundle_invested_ignores_rebalances_and_fees():
+    txs = [_tx(1, "EXCHANGE", 0.0004061, "Bought BTC 0.0004061 for R 790.82 as part of LLC bundle"),
+           _tx(2, "EXCHANGE", 0.0024, "Bought ETH 0.0024 for R 111.93 as part of LLC bundle"),
+           _tx(3, "TRANSFER", 1.1e-06, "BundleRebalanceCredit", approx="~R 1.43"),
+           _tx(4, "TRANSFER", -2e-06, "BundleTrackingFeeDebit")]
+    invested, label = bundle_invested(txs)
+    assert invested == pytest.approx(902.75)
+    assert label == "LLC bundle"
+
+
+def test_sync_derives_costs_from_history(db_session):
+    history = {
+        "W-XLM": [_tx(1, "EXCHANGE", 180.91912435, "Bought XLM 180.91912435 for R 1,000.00")],
+        "B-XBT": [_tx(1, "EXCHANGE", 0.0004061, "Bought BTC 0.0004061 for R 790.82 as part of LLC bundle")],
+        # Emptied by a rebalance but its purchase still counts as money in.
+        "B-ADA": [_tx(1, "EXCHANGE", 0.74, "Bought ADA 0.74 for R 7.64 as part of LLC bundle"),
+                  _tx(2, "TRANSFER", -0.74, "BundleRebalanceDebit")],
+    }
+    result = sync_luno_holdings(db_session, _fake_collector(
+        {"XLM": 180.91912435}, bundle={"XBT": 0.0004061, "ADA": 0.0}, history=history))
+
+    xlm = db_session.query(CryptoHolding).filter_by(symbol="XLM").one()
+    assert xlm.purchase_price == pytest.approx(1000 / 180.91912435)
+    assert xlm.cost_source == "luno" and xlm.purchase_date is not None
+    record = db_session.query(CryptoBundle).one()
+    assert record.purchase_cost == pytest.approx(798.46)
+    assert record.label == "LLC bundle"
+    assert result.cost_error is None
+
+
+def test_manual_cost_is_never_overwritten(db_session):
+    history = {"W-XLM": [_tx(1, "EXCHANGE", 100.0, "Bought XLM 100 for R 500.00")]}
+    sync_luno_holdings(db_session, _fake_collector({"XLM": 100.0}, history=history))
+    row = db_session.query(CryptoHolding).one()
+    row.purchase_price, row.cost_source = 9.0, "manual"
+    db_session.commit()
+
+    sync_luno_holdings(db_session, _fake_collector({"XLM": 100.0}, history=history))
+
+    assert db_session.query(CryptoHolding).one().purchase_price == pytest.approx(9.0)
+
+
+def test_unreadable_history_keeps_existing_costs(db_session):
+    history = {"W-XLM": [_tx(1, "EXCHANGE", 100.0, "Bought XLM 100 for R 500.00")]}
+    sync_luno_holdings(db_session, _fake_collector({"XLM": 100.0}, history=history))
+
+    result = sync_luno_holdings(db_session, _fake_collector({"XLM": 100.0}, history="fail"))
+
+    assert result is not None and "permission" in result.cost_error
+    assert db_session.query(CryptoHolding).one().purchase_price == pytest.approx(5.0)
