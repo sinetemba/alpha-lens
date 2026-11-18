@@ -135,7 +135,7 @@ announced so they can subscribe during the offer window (before listing day).
   - `NotificationService.create_notification(type="ipo", ...)` — dedup and
     delivery (email/ntfy/Discord/Telegram) come free; add icon to
     `_TYPE_ICONS` in `app/dashboard/notifications.py`.
-  - Page `app/dashboard/upcoming_ipos.py` + radio label, `elif` dispatch and
+  - Page `app/dashboard/upcoming_ipos.py` + a `_PAGES` entry and a
     `PAGE_DATA_SOURCES` entry in `app/dashboard/home.py`.
   - On listing day: probe `<symbol>.JO` via `yf.download` (penny-stocks batch
     pattern); first bars -> status "listed", create `Stock` row via
@@ -160,6 +160,7 @@ The `strftime('%Y-%m-%d', timestamp)` function is SQLite-only. For PostgreSQL, u
 - Yahoo JSE dividend amounts may be cents or Rand per ticker; `update_dividends` rescales amounts >50% of the contemporaneous share price (within 730 days of ex-date) to Rand. Dividend dedup is per calendar day, not exact timestamp — `scripts/fix_dividend_amounts.py --apply` already repaired legacy duplicates/cent amounts once; don't re-run it blindly.
 - Alert Notification rows are created on every check run regardless of `notification_enabled` (the dashboard page is an in-app channel); only external delivery via Apprise is gated on the setting.
 - `get_latest_and_previous_prices` (`services/price_queries.py`) scopes its window CTE to 92 days back from each symbol's own latest bar — don't widen it without a reason; symbols suspended longer than that simply get no previous-day snapshot.
+- Portfolio value history: `portfolio_snapshots` holds one row per portfolio per SAST day (unique), upserted by `services/portfolio_valuation.update_portfolio_totals` - called by the Portfolio page and, via `revalue_portfolio`, after every updater price run, so the series fills in even when the dashboard isn't opened. Revaluation lives in that Streamlit-free module; the page's `_update_holding_values` is a thin wrapper passing its cached price lookup.
 - `_ensure_stock` backfills sector/industry/market_cap/shares/description/website from Yahoo `get_info` once per stock (skipped once `sector` is set) — new stocks get fundamentals for free.
 - RSI/ATR use Wilder smoothing (`ewm(alpha=1/n)`). All stored history was recomputed (`full=True`) on 2026-11-18, so it is uniformly Wilder. Commodity snapshot series (`AV_*`, `XAU_*`) are close-only, so high/low indicators (ADX etc.) log a calculation error for them - expected.
 - USD-account portfolio holdings (`is_jse_tracked_account` == False) are never priced/valued from JSE bars — `_update_holding_values` and Home's metrics only apply stored JSE closes to JSE-tracked accounts; EE-synced USD values pass through untouched. Holdings priced from `account_type` appear in Rand totals everywhere.
@@ -176,6 +177,13 @@ The `strftime('%Y-%m-%d', timestamp)` function is SQLite-only. For PostgreSQL, u
 - Crypto holdings (`crypto_holdings` table) are keyed by **CoinGecko id** (`coin_id`, e.g. "bitcoin"), not ticker — `symbol` is display-only. `CoinGeckoCollector` needs no API key (public tier, ~30 req/min); the page caches market data 60s and search results 1h. Prices are ZAR via `vs_currency=zar`.
 
 ## Dashboard/UI conventions
+
+- **Navigation:** pages are `st.navigation` entries in `_PAGES` (`app/dashboard/home.py`) - `(title, icon, url_path, renderer(db))`, so each page has its own URL (`/portfolio`, `/settings`, ...). Icons must be real emoji: Streamlit rejects symbols like `₿` and the whole app fails to start. Add a page with one `_PAGES` line (lazy-imported via `_lazy(module, function)`) plus a `PAGE_DATA_SOURCES` entry.
+- **Prices:** per-share Rand prices go through `format_price()` (text) or `price_column_format()` (NumberColumn) in `utils.py` - 4 decimals below R1, so penny stocks like SKA (R0.0085) don't render as R0.01. Totals/values stay at 2 decimals.
+- **Row colours:** `style_gain_loss_row` sets an explicit dark text colour with its pastel backgrounds; without it dark mode renders white text on pale green.
+- **Tables:** keep numbers numeric (format via `column_config`, not f-strings) so they sort by value and export cleanly; `render_csv_download(df, name, key)` adds the CSV button and drops `_`-prefixed helper columns.
+- **Adding a stock:** use `render_symbol_search(db, key)` - stored stocks plus Yahoo's JSE listings (`YFinanceCollector.search_jse`, filtered to exchange `JNB`), so users can type a company name; an exact typed ticker still works.
+- **Settings page** (`settings_status.py`) is read-only: it shows which `.env` values are set (never the values), updater heartbeats, backups and data sources, and can send a test notification. It never writes `.env`.
 
 - **Post-rerun flash:** `st.success()`/`st.warning()` called immediately before `st.rerun()` is never seen. Store `("success"|"warning"|"info", message)` in `st.session_state` before the rerun and pop/render it near the top of the form on the next run (`watchlist_add_flash`, `portfolio_add_flash`, `dividends_fetch_flash` are the existing examples).
 - **Refresh control:** pages use the shared `render_market_data_refresh_control(db, key=..., symbols=..., include_news=...)` — blocking spinner + result feedback + quota caption. Don't reintroduce fire-and-forget thread refreshes (the old Home one gave no feedback).

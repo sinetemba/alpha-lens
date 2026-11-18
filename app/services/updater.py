@@ -52,6 +52,7 @@ from app.services.data_service import DataService
 from app.scrapers.news import NewsScraper
 from app.collectors.twelve_data import TwelveDataCollector
 from app.services import backup
+from app.services.portfolio_valuation import revalue_portfolio
 
 
 def _run_notification_checks(db: Session) -> None:
@@ -69,6 +70,21 @@ def _run_notification_checks(db: Session) -> None:
         notifier.send_pending_notifications()
     except Exception as e:
         logger.error(f"Notification checks failed: {e}")
+
+
+def _snapshot_portfolio(db: Session) -> None:
+    """Revalue the portfolio from fresh prices and record today's snapshot.
+
+    Keeps the Portfolio page's value-history chart filling in on days the
+    dashboard is never opened. Failures must never fail the update run.
+    """
+    try:
+        value = revalue_portfolio(db)
+        if value is not None:
+            logger.info(f"Portfolio snapshot recorded: R {value:,.2f}")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Portfolio snapshot failed: {e}")
 
 
 # Track the last time a logon update ran so a user can log on/off repeatedly
@@ -329,6 +345,7 @@ class UpdaterService:
             logger.info(f"Collected {len(articles)} news articles")
 
             _run_notification_checks(db)
+            _snapshot_portfolio(db)
             ok = True
             return True
         except Exception as e:

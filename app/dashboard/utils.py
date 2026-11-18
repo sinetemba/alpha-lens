@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import json
+import re
 from pathlib import Path
 from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
@@ -9,7 +10,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.config.settings import settings
 from app.models.news import NewsArticle
-from app.models.stock import StockPrice
+from app.models.stock import Stock, StockPrice
+from app.collectors.yfinance import YFinanceCollector
 from app.models.updater_run import UpdaterRun
 from app.services.data_service import COMPANY_NAME_OVERRIDES, DataService
 # Re-exported from the Streamlit-free module so non-UI consumers (the headless
@@ -75,6 +77,82 @@ def render_holding_totals(totals: dict) -> None:
             st.metric("Gain/Loss", "N/A")
 
 
+# Shape of a typed JSE ticker (stored without the ".JO" suffix). JSE codes
+# are 3 characters, ETFs up to ~6 (e.g. STXNDQ).
+_TICKER_RE = re.compile(r"^[A-Z0-9]{2,6}$")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _search_jse(query: str) -> Optional[list[dict]]:
+    """Cached Yahoo JSE search - None when the search itself failed."""
+    return YFinanceCollector().search_jse(query)
+
+
+def match_symbols(db: Session, query: str, remote: Optional[list[dict]]) -> dict[str, str]:
+    """Ordered {symbol: name} candidates for a symbol-or-name query.
+
+    An exact ticker comes first (typing "NPN" keeps working as before), then
+    stored stocks matching the symbol or name, then Yahoo's JSE results.
+    """
+    q = query.strip()
+    if not q:
+        return {}
+    candidates: dict[str, str] = {}
+    exact = db.query(Stock).filter(Stock.symbol == q.upper()).first()
+    if exact:
+        candidates[exact.symbol] = exact.name
+    for stock in db.query(Stock).filter(
+        (Stock.symbol.ilike(f"{q}%")) | (Stock.name.ilike(f"%{q}%"))
+    ).order_by(Stock.symbol).limit(8):
+        candidates.setdefault(stock.symbol, stock.name)
+    for row in remote or []:
+        candidates.setdefault(row["symbol"], row["name"])
+    if _TICKER_RE.match(q.upper()) and q.upper() not in candidates:
+        # Unknown ticker typed verbatim - still allow it (validated on add),
+        # but after real matches: "sasol" is a name search, not ticker SASOL.
+        candidates[q.upper()] = "use as typed"
+    return candidates
+
+
+def render_symbol_search(db: Session, key: str) -> str:
+    """Symbol-or-company-name input with a matches picker; returns the chosen ticker."""
+    query = st.text_input(
+        "Symbol or company name", placeholder="e.g. NPN or Naspers", key=f"{key}_query"
+    )
+    if not query.strip():
+        return ""
+    remote = _search_jse(query.strip())
+    candidates = match_symbols(db, query, remote)
+    if remote is None:
+        st.caption("Company search is unavailable right now - enter the exact ticker.")
+    if not candidates:
+        st.caption(f"No JSE listings match '{query.strip()}'.")
+        return ""
+    return st.selectbox(
+        "Matches",
+        list(candidates),
+        format_func=lambda s: f"{s} - {candidates[s]}" if candidates[s] else s,
+        key=f"{key}_match",
+    )
+
+
+def render_csv_download(table: pd.DataFrame, name: str, key: str) -> None:
+    """'Download CSV' button for a table; `_`-prefixed helper columns are dropped.
+
+    The file name carries today's date (display timezone) so repeated exports
+    don't overwrite each other.
+    """
+    export = table[[c for c in table.columns if not str(c).startswith("_")]]
+    stamp = _to_display_tz(datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+    st.download_button(
+        "⬇️ Download CSV",
+        data=export.to_csv(index=False).encode("utf-8-sig"),  # BOM: Excel reads UTF-8
+        file_name=f"alphalens_{name}_{stamp}.csv",
+        mime="text/csv",
+        key=key,
+    )
+
+
 def style_gain_loss_row(row: pd.Series) -> list[str]:
     """Colour a table row green/red/yellow based on its '_gain_loss' value.
 
@@ -90,7 +168,37 @@ def style_gain_loss_row(row: pd.Series) -> list[str]:
         color = "#fee2e2"
     else:
         color = "#fef3c7"
-    return [f"background-color: {color}"] * len(row)
+    # Explicit dark text: the dark theme's default white text is unreadable
+    # on these pastel backgrounds.
+    return [f"background-color: {color}; color: #1f2937"] * len(row)
+
+
+# Prices below this are shown with 4 decimals - "R 0.01" for a R0.0085
+# penny stock hides the price entirely.
+SUB_RAND = 1.0
+
+
+def format_price(value: Optional[float], na: str = "N/A") -> str:
+    """Per-share Rand price: 2 decimals, or 4 for sub-Rand prices."""
+    if value is None or pd.isna(value):
+        return na
+    if 0 < abs(value) < SUB_RAND:
+        return f"R {value:,.4f}"
+    return f"R {value:,.2f}"
+
+
+def price_column_format(*columns: Iterable[Optional[float]], signed: bool = False) -> str:
+    """NumberColumn printf format for per-share price columns.
+
+    Column formats apply to every row, so one sub-Rand price anywhere in the
+    given columns switches the whole set to 4 decimals.
+    """
+    sub_rand = any(
+        v is not None and not pd.isna(v) and 0 < abs(v) < SUB_RAND
+        for column in columns for v in column
+    )
+    sign = "+" if signed else ""
+    return f"R %{sign}.4f" if sub_rand else f"R %{sign}.2f"
 
 
 def get_latest_market_data_timestamp(

@@ -3,6 +3,7 @@ from .stock import Stock, StockPrice
 from .news import NewsArticle
 from .watchlist import WatchlistItem
 from .portfolio import Portfolio, PortfolioHolding
+from .portfolio_snapshot import PortfolioSnapshot
 from .dividend import Dividend, MoneywebDividendWatch
 from .notification import Notification
 from .updater_run import UpdaterRun
@@ -17,6 +18,7 @@ __all__ = [
     "WatchlistItem",
     "Portfolio",
     "PortfolioHolding",
+    "PortfolioSnapshot",
     "Dividend",
     "MoneywebDividendWatch",
     "Notification",

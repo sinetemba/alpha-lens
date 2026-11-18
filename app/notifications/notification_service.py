@@ -75,6 +75,37 @@ class NotificationService:
             self.appr.add(telegram_url, tag="telegram")
             logger.info("Telegram notification channel configured")
     
+    @staticmethod
+    def channel_status() -> dict[str, bool]:
+        """Which delivery channels have their required settings filled in."""
+        return {
+            "email": bool(settings.notification_email_from and settings.notification_email_password),
+            "ntfy": bool(settings.notification_ntfy_topic),
+            "discord": bool(settings.notification_discord_webhook_url),
+            "telegram": bool(
+                settings.notification_telegram_bot_token and settings.notification_telegram_chat_id
+            ),
+        }
+
+    def send_test(self, channel: Optional[str] = None) -> tuple[bool, str]:
+        """Send a test message without creating a Notification row."""
+        if not self.enabled:
+            return False, "Delivery is disabled (NOTIFICATION_ENABLED=false)."
+        if not any(self.channel_status().values()):
+            return False, "No delivery channel is configured in .env."
+        try:
+            ok = self.appr.notify(
+                title="AlphaLens test notification",
+                body="If you can read this, alert delivery works.",
+                tag=channel or apprise.common.MATCH_ALL_TAG,
+            )
+        except Exception as e:
+            logger.error(f"Test notification failed: {e}")
+            return False, "Sending failed - see logs for details."
+        return (True, "Test notification sent.") if ok else (
+            False, "The channel rejected the message - check its settings in .env."
+        )
+
     def create_notification(
         self,
         notification_type: str,

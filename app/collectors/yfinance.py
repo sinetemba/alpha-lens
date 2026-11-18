@@ -68,6 +68,36 @@ class YFinanceCollector:
 
         return hist
     
+    def search_jse(self, query: str, limit: int = 8) -> Optional[List[Dict]]:
+        """Search Yahoo for JSE listings by company name or ticker.
+
+        Returns [{"symbol": "SOL", "name": "Sasol Limited"}] with the ".JO"
+        suffix stripped (the app's storage convention), or None on failure so
+        callers can tell "search failed" from "no matches".
+        """
+        if not self.enabled or not query.strip():
+            return []
+        try:
+            search = self._call_with_retry(
+                f"Yahoo search '{query}'",
+                lambda: yf.Search(query.strip(), max_results=20, news_count=0),
+            )
+        except Exception as e:
+            logger.error(f"Yahoo search failed for '{query}': {e}")
+            return None
+        results = []
+        for quote in search.quotes or []:
+            symbol = quote.get("symbol") or ""
+            if quote.get("exchange") != "JNB" or not symbol.endswith(".JO"):
+                continue
+            results.append({
+                "symbol": symbol[:-3],
+                "name": (quote.get("longname") or quote.get("shortname") or symbol[:-3]).strip(),
+            })
+            if len(results) >= limit:
+                break
+        return results
+
     def get_info(self, symbol: str) -> Optional[Dict]:
         """Get company information for a symbol."""
         ticker = self.get_ticker(symbol)

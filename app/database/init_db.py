@@ -1,5 +1,5 @@
 from app.models.base import Base, engine, SessionLocal
-from app.models import Stock, StockPrice, NewsArticle, WatchlistItem, Portfolio, PortfolioHolding, Dividend, Notification, UpdaterRun, KrugerrandHolding, CryptoHolding
+from app.models import Stock, StockPrice, NewsArticle, WatchlistItem, Portfolio, PortfolioHolding, PortfolioSnapshot, Dividend, Notification, UpdaterRun, KrugerrandHolding, CryptoHolding
 from app.config.settings import settings
 import os
 

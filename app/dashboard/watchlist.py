@@ -5,7 +5,14 @@ from sqlalchemy.orm import Session, joinedload
 from app.models.stock import Stock, StockPrice
 from app.models.watchlist import WatchlistItem
 from app.models.portfolio import PortfolioHolding
-from app.dashboard.utils import format_stock_label, render_market_data_refresh_control, style_gain_loss_row
+from app.dashboard.utils import (
+    format_stock_label,
+    price_column_format,
+    render_csv_download,
+    render_market_data_refresh_control,
+    render_symbol_search,
+    style_gain_loss_row,
+)
 from app.dashboard.home import _get_latest_and_previous_prices
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 from loguru import logger
@@ -26,7 +33,7 @@ def show_watchlist(db: Session):
         col1, col2 = st.columns(2)
         
         with col1:
-            symbol = st.text_input("Symbol", placeholder="e.g., NPN").upper()
+            symbol = render_symbol_search(db, key="watchlist_add")
         
         with col2:
             target_price = st.number_input("Target Price", min_value=0.0, step=0.01)
@@ -203,30 +210,37 @@ def show_watchlist(db: Session):
         styled_table = watchlist_table.style.apply(_style_watchlist_row, axis=1).hide(
             axis="columns", subset=[c for c in watchlist_table.columns if c.startswith("_")]
         )
+        price_fmt = price_column_format(
+            *(watchlist_table[c] for c in ("Current Price", "Purchase Price", "Target Price", "Stop Loss"))
+        )
+        change_fmt = price_column_format(
+            watchlist_table["Change"], watchlist_table["Gain/Loss"], signed=True
+        )
         st.dataframe(
             styled_table,
             use_container_width=True,
             hide_index=True,
             column_config={
                 "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
-                "Current Price": st.column_config.NumberColumn("Current Price", format="R %.2f", help="Latest market price per share."),
-                "Change": st.column_config.NumberColumn("Change", format="R %+.2f", help="Rand change since the previous close."),
+                "Current Price": st.column_config.NumberColumn("Current Price", format=price_fmt, help="Latest market price per share."),
+                "Change": st.column_config.NumberColumn("Change", format=change_fmt, help="Rand change since the previous close."),
                 "Change %": st.column_config.NumberColumn("Change %", format="%+.2f%%", help="Percentage change since the previous close."),
-                "Purchase Price": st.column_config.NumberColumn("Purchase Price", format="R %.2f", help="Average price paid per share, if held."),
-                "Target Price": st.column_config.NumberColumn("Target Price", format="R %.2f", help="Price target for this stock."),
-                "Stop Loss": st.column_config.NumberColumn("Stop Loss", format="R %.2f", help="Stop loss price for this stock."),
-                "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format="R %.2f", help="Current price less purchase price."),
+                "Purchase Price": st.column_config.NumberColumn("Purchase Price", format=price_fmt, help="Average price paid per share, if held."),
+                "Target Price": st.column_config.NumberColumn("Target Price", format=price_fmt, help="Price target for this stock."),
+                "Stop Loss": st.column_config.NumberColumn("Stop Loss", format=price_fmt, help="Stop loss price for this stock."),
+                "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format=change_fmt, help="Current price less purchase price."),
                 "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", format="%+.2f%%", help="Gain or loss as a percentage of purchase price."),
             },
         )
         st.markdown(
             "**Legend:** "
             '<span style="background-color: darkgreen; color: white; padding: 2px 8px; border-radius: 4px;">At/above target</span> '
-            '<span style="background-color: #dcfce7; padding: 2px 8px; border-radius: 4px;">Gain</span> '
-            '<span style="background-color: #fee2e2; padding: 2px 8px; border-radius: 4px;">Loss</span> '
-            '<span style="background-color: #fef3c7; padding: 2px 8px; border-radius: 4px;">No data / break-even</span>',
+            '<span style="background-color: #dcfce7; color: #1f2937; padding: 2px 8px; border-radius: 4px;">Gain</span> '
+            '<span style="background-color: #fee2e2; color: #1f2937; padding: 2px 8px; border-radius: 4px;">Loss</span> '
+            '<span style="background-color: #fef3c7; color: #1f2937; padding: 2px 8px; border-radius: 4px;">No data / break-even</span>',
             unsafe_allow_html=True,
         )
+        render_csv_download(watchlist_table, "watchlist", key="watchlist_csv")
     else:
         st.info(f"No stocks match the '{filter_choice}' filter.")
 

@@ -1,3 +1,4 @@
+import pandas as pd
 import streamlit as st
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
@@ -10,7 +11,7 @@ from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
 from app.services.data_service import DataService
 from app.collectors.moneyweb import MoneywebCollector
-from app.dashboard.utils import format_stock_label, render_last_fetch_caption, _to_display_tz
+from app.dashboard.utils import format_stock_label, render_csv_download, render_last_fetch_caption, _to_display_tz
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 
 
@@ -167,7 +168,7 @@ def show_dividends(db: Session):
         for d in dividends:
             data.append({
                 "Symbol": format_stock_label(d.symbol, d.stock.name if d.stock else None),
-                "Amount (per share)": f"R {d.amount:,.4f}",
+                "Amount (per share)": d.amount,
                 "Ex-Dividend Date": d.ex_dividend_date.strftime("%Y-%m-%d") if d.ex_dividend_date else "N/A",
                 "Payment Date": d.payment_date.strftime("%Y-%m-%d") if d.payment_date else "N/A",
                 "Frequency": d.frequency or "N/A",
@@ -175,7 +176,16 @@ def show_dividends(db: Session):
             })
 
         st.subheader("All Dividends")
-        st.dataframe(data, use_container_width=True)
+        dividends_table = pd.DataFrame(data)
+        st.dataframe(
+            dividends_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Amount (per share)": st.column_config.NumberColumn("Amount (per share)", format="R %.4f"),
+            },
+        )
+        render_csv_download(dividends_table, "dividends", key="dividends_csv")
     else:
         st.info("No dividend records found yet. Fetch from Yahoo Finance or add one manually below.")
 
@@ -190,11 +200,21 @@ def show_dividends(db: Session):
                 "Symbol": format_stock_label(h.symbol, h.stock.name if h.stock else None),
                 "Account": h.account_type or "ZAR",
                 "Quantity": h.quantity,
-                "Dividends per Share": f"R {per_share:,.4f}",
-                "Estimated Income": f"R {income:,.2f}",
+                "Dividends per Share": per_share,
+                "Estimated Income": income,
             })
 
-        st.dataframe(holdings_data, use_container_width=True)
+        income_table = pd.DataFrame(holdings_data)
+        st.dataframe(
+            income_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Dividends per Share": st.column_config.NumberColumn("Dividends per Share", format="R %.4f"),
+                "Estimated Income": st.column_config.NumberColumn("Estimated Income", format="R %.2f"),
+            },
+        )
+        render_csv_download(income_table, "dividend_income", key="dividend_income_csv")
     else:
         st.info("No holdings found. Add holdings on the Portfolio page first.")
 

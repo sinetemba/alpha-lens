@@ -7,7 +7,7 @@ from typing import List, Dict, Optional
 from app.models.base import SessionLocal
 from app.models.news import NewsArticle
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_stock_label, render_last_fetch_caption, _to_display_tz
+from app.dashboard.utils import format_price, format_stock_label, render_last_fetch_caption, _to_display_tz
 from app.services.company_news import CompanyNewsService
 from datetime import datetime, timedelta, timezone
 from loguru import logger
@@ -35,7 +35,10 @@ def show_company(db: Session):
     stock_names = {s[0]: s[1] for s in all_stocks}
 
     if not stock_symbols:
-        st.warning("No stocks available in database.")
+        st.info(
+            "No stocks tracked yet. Add one on the **Watchlist** or **Portfolio** page "
+            "(search by ticker or company name) and it will appear here."
+        )
         return
 
     selected_symbol = st.selectbox(
@@ -72,7 +75,7 @@ def show_company(db: Session):
         ).order_by(StockPrice.timestamp.desc()).first()
         
         if latest_price:
-            st.metric("Current Price", f"R {latest_price.close_price:.2f}")
+            st.metric("Current Price", format_price(latest_price.close_price))
             if latest_price.volume:
                 st.metric("Volume", f"{latest_price.volume:,}")
     
@@ -248,15 +251,15 @@ def _render_price_chart(db: Session, symbol: str):
     
     with ma_col1:
         if prices and prices[-1].sma_20:
-            st.metric("SMA 20", f"R {prices[-1].sma_20:.2f}")
+            st.metric("SMA 20", format_price(prices[-1].sma_20))
     
     with ma_col2:
         if prices and prices[-1].sma_50:
-            st.metric("SMA 50", f"R {prices[-1].sma_50:.2f}")
+            st.metric("SMA 50", format_price(prices[-1].sma_50))
     
     with ma_col3:
         if prices and prices[-1].sma_200:
-            st.metric("SMA 200", f"R {prices[-1].sma_200:.2f}")
+            st.metric("SMA 200", format_price(prices[-1].sma_200))
 
 
 def _render_historical_data(db: Session, symbol: str):
@@ -282,10 +285,10 @@ def _render_historical_data(db: Session, symbol: str):
     for price in prices:
         data.append({
             "Date": price.timestamp.strftime("%Y-%m-%d"),
-            "Open": f"R {price.open_price:.2f}" if price.open_price else "N/A",
-            "High": f"R {price.high_price:.2f}" if price.high_price else "N/A",
-            "Low": f"R {price.low_price:.2f}" if price.low_price else "N/A",
-            "Close": f"R {price.close_price:.2f}",
+            "Open": format_price(price.open_price),
+            "High": format_price(price.high_price),
+            "Low": format_price(price.low_price),
+            "Close": format_price(price.close_price),
             "Volume": f"{price.volume:,}" if price.volume else "N/A",
         })
 

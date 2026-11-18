@@ -12,6 +12,7 @@ from app.config.settings import settings
 from app.collectors.moneyweb import MoneywebCollector
 from app.dashboard.utils import (
     format_stock_label,
+    price_column_format,
     PriceSnapshot,
     get_latest_news_timestamp,
     render_market_data_refresh_control,
@@ -24,18 +25,22 @@ from app.services.price_queries import get_latest_and_previous_prices
 
 
 
+# Market-data providers behind JSE prices/history; Twelve Data only when enabled.
+_MARKET_DATA = "Twelve Data, Yahoo Finance" if settings.twelve_data_enabled else "Yahoo Finance"
+
 # Data sources shown per page in the top-right header.
 PAGE_DATA_SOURCES = {
-    "Home": "Moneyweb (top movers), Twelve Data, Yahoo Finance",
-    "Watchlist": "Twelve Data, Yahoo Finance",
-    "Portfolio": "EasyEquities, Twelve Data, Yahoo Finance",
+    "Home": f"Moneyweb (top movers), {_MARKET_DATA}",
+    "Watchlist": _MARKET_DATA,
+    "Portfolio": f"EasyEquities, {_MARKET_DATA}",
     "Dividends": "Yahoo Finance, Moneyweb",
     "Notifications": "Updater alerts",
-    "Company View": "Twelve Data, Yahoo Finance",
+    "Company View": _MARKET_DATA,
     "Penny Stocks": "Yahoo Finance, RSS feeds",
     "Commodities": "Metals.dev, Yahoo Finance",
     "Krugerrands": "GoldAPI",
     "Crypto": "CoinGecko",
+    "Settings": "Local configuration",
 }
 
 
@@ -46,6 +51,36 @@ def _should_fetch_news(db: Session) -> bool:
         return True
     latest = latest if latest.tzinfo else latest.replace(tzinfo=timezone.utc)
     return _to_display_tz(latest).date() < _to_display_tz(datetime.now(timezone.utc)).date()
+
+
+def _lazy(module: str, function: str):
+    """Page renderer imported on first use (keeps app start-up light)."""
+    def render(db: Session):
+        from importlib import import_module
+        getattr(import_module(f"app.dashboard.{module}"), function)(db)
+    return render
+
+
+# (title, icon, url path, renderer(db)) - order is the sidebar order.
+_PAGES = [
+    ("Home", "🏠", "home", lambda db: _render_home(db)),
+    ("Watchlist", "📋", "watchlist", _lazy("watchlist", "show_watchlist")),
+    ("Portfolio", "💼", "portfolio", _lazy("portfolio", "show_portfolio")),
+    ("Dividends", "💰", "dividends", _lazy("dividends", "show_dividends")),
+    ("Notifications", "🔔", "notifications", _lazy("notifications", "show_notifications")),
+    ("Company View", "🏢", "company", _lazy("company", "show_company")),
+    ("Penny Stocks", "🪙", "penny-stocks", _lazy("penny_stocks", "show_penny_stocks")),
+    ("Commodities", "🛢️", "commodities", _lazy("commodities", "show_commodities")),
+    ("Krugerrands", "🥇", "krugerrands", _lazy("krugerrands", "show_krugerrands")),
+    ("Crypto", "💎", "crypto", _lazy("crypto", "show_crypto")),
+    ("Settings", "⚙️", "settings", _lazy("settings_status", "show_settings")),
+]
+
+
+def _page(db: Session, title: str, icon: str, url_path: str, render, default: bool = False):
+    def run():
+        render(db)
+    return st.Page(run, title=title, icon=icon, url_path=url_path, default=default)
 
 
 def show_home():
@@ -61,19 +96,21 @@ def show_home():
     db = SessionLocal()
 
     try:
-        # Sidebar navigation
-        page = st.sidebar.radio(
-            "Navigate",
-            ["Home", "Watchlist", "Portfolio", "Dividends", "Notifications", "Company View", "Penny Stocks", "Commodities", "Krugerrands", "Crypto"],
-            index=0
-        )
+        # One URL per page (e.g. /portfolio), so pages can be bookmarked and
+        # the browser back button works. Each page renders against this run's
+        # session; url_path doubles as the page identity.
+        pages = [
+            _page(db, title, icon, url_path, render, default=(url_path == "home"))
+            for title, icon, url_path, render in _PAGES
+        ]
+        current = st.navigation(pages)
 
         unread_count = db.query(Notification).filter(Notification.is_read == False).count()
         if unread_count:
             st.sidebar.caption(f"🔔 {unread_count} unread notification{'s' if unread_count != 1 else ''}")
 
         # Page-specific header with data sources
-        data_source = PAGE_DATA_SOURCES.get(page, "Multiple sources")
+        data_source = PAGE_DATA_SOURCES.get(current.title, "Multiple sources")
         header_col, source_col = st.columns([4, 1])
         with header_col:
             st.title("JSE Stock Analysis Platform")
@@ -87,35 +124,7 @@ def show_home():
         st.markdown("---")
 
         with st.spinner("Loading page..."):
-            if page == "Home":
-                _render_home(db)
-            elif page == "Watchlist":
-                from .watchlist import show_watchlist
-                show_watchlist(db)
-            elif page == "Portfolio":
-                from .portfolio import show_portfolio
-                show_portfolio(db)
-            elif page == "Dividends":
-                from .dividends import show_dividends
-                show_dividends(db)
-            elif page == "Notifications":
-                from .notifications import show_notifications
-                show_notifications(db)
-            elif page == "Company View":
-                from .company import show_company
-                show_company(db)
-            elif page == "Penny Stocks":
-                from .penny_stocks import show_penny_stocks
-                show_penny_stocks(db)
-            elif page == "Commodities":
-                from .commodities import show_commodities
-                show_commodities(db)
-            elif page == "Krugerrands":
-                from .krugerrands import show_krugerrands
-                show_krugerrands(db)
-            elif page == "Crypto":
-                from .crypto import show_crypto
-                show_crypto(db)
+            current.run()
 
     finally:
         db.close()
@@ -383,7 +392,9 @@ def _render_top_movers(db: Session):
     col_winners, col_losers = st.columns(2)
 
     column_config = {
-        "Price": st.column_config.NumberColumn("Price", format="R %.2f"),
+        "Price": st.column_config.NumberColumn(
+            "Price", format=price_column_format([m["Price"] for m in winners + losers])
+        ),
         "Move": st.column_config.NumberColumn("Move", format="%.2f"),
         "Change": st.column_config.NumberColumn("Change", format="%.2f%%"),
     }

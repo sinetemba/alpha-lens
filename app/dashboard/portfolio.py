@@ -1,8 +1,8 @@
 from collections import Counter
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from sqlalchemy.orm import Session, joinedload
-from app.models.dividend import Dividend
 from app.models.portfolio import (
     Portfolio,
     PortfolioHolding,
@@ -10,16 +10,21 @@ from app.models.portfolio import (
     EXCLUDED_PORTFOLIO_SYMBOLS,
     is_jse_tracked_account,
 )
+from app.models.portfolio_snapshot import PortfolioSnapshot
 from app.models.stock import Stock, StockPrice
 from app.dashboard.utils import (
     format_stock_label,
     is_market_data_stale,
     PriceSnapshot,
+    price_column_format,
+    render_csv_download,
     render_last_fetch_caption,
+    render_symbol_search,
     style_gain_loss_row,
     _to_display_tz,
 )
 from app.collectors.easyequities import EasyEquitiesCollector
+from app.services.portfolio_valuation import update_holding_values, update_portfolio_totals
 from app.services.price_queries import get_latest_and_previous_prices
 from datetime import datetime, timezone
 from loguru import logger
@@ -138,7 +143,9 @@ def show_portfolio(db: Session):
 
     with col5:
         st.metric("Holdings", len(holdings))
-    
+
+    _render_value_history(db, portfolio.id)
+
     st.markdown("---")
     _render_instrument_type_counts(st.session_state.get("ee_last_raw_holdings"))
     
@@ -149,7 +156,7 @@ def show_portfolio(db: Session):
         col1, col2 = st.columns(2)
         
         with col1:
-            symbol = st.text_input("Symbol", placeholder="e.g., NPN").upper()
+            symbol = render_symbol_search(db, key="portfolio_add")
             quantity = st.number_input("Quantity", min_value=0.0, step=1.0)
         
         with col2:
@@ -320,6 +327,40 @@ def show_portfolio(db: Session):
                 st.rerun()
 
 
+def _render_value_history(db: Session, portfolio_id: int) -> None:
+    """Total value vs cost basis over time, from the daily snapshots."""
+    rows = db.query(PortfolioSnapshot).filter(
+        PortfolioSnapshot.portfolio_id == portfolio_id
+    ).order_by(PortfolioSnapshot.snapshot_date).all()
+    with st.expander("📈 Value over time", expanded=len(rows) >= 2):
+        if len(rows) < 2:
+            st.info(
+                "Value history starts today - a snapshot is recorded each time prices "
+                "update (3x daily by the updater, and whenever this page loads). "
+                "The chart appears once there are two days of data."
+            )
+            return
+        fig = go.Figure()
+        dates = [r.snapshot_date for r in rows]
+        fig.add_trace(go.Scatter(x=dates, y=[r.total_value for r in rows], name="Value", mode="lines+markers"))
+        fig.add_trace(go.Scatter(
+            x=dates, y=[r.total_cost for r in rows], name="Cost basis",
+            mode="lines", line={"dash": "dash"},
+        ))
+        fig.update_layout(
+            height=320, margin={"l": 10, "r": 10, "t": 10, "b": 10},
+            yaxis_tickprefix="R ", yaxis_tickformat=",.0f", hovermode="x unified",
+            legend={"orientation": "h", "y": 1.1},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        first, last = rows[0], rows[-1]
+        change = last.total_value - first.total_value
+        st.caption(
+            f"R {change:+,.2f} since {first.snapshot_date:%Y-%m-%d} "
+            "(includes money added or withdrawn - this is value, not return)."
+        )
+
+
 @st.cache_data(
     ttl=60,
     show_spinner=False,
@@ -405,6 +446,7 @@ def _render_holdings_table(
         styled_table = visible_table.style.apply(style_gain_loss_row, axis=1).hide(
             axis="columns", subset=["_gain_loss"]
         )
+        price_fmt = price_column_format(holdings_table["Purchase Price"], holdings_table["Current Price"])
         st.dataframe(
             styled_table,
             use_container_width=True,
@@ -412,8 +454,8 @@ def _render_holdings_table(
             column_config={
                 "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
                 "Quantity": st.column_config.NumberColumn("Quantity", help="Number of shares currently held."),
-                "Purchase Price": st.column_config.NumberColumn("Purchase Price", format="R %.2f", help="Average price paid per share."),
-                "Current Price": st.column_config.NumberColumn("Current Price", format="R %.2f", help="Latest market price per share from EasyEquities."),
+                "Purchase Price": st.column_config.NumberColumn("Purchase Price", format=price_fmt, help="Average price paid per share."),
+                "Current Price": st.column_config.NumberColumn("Current Price", format=price_fmt, help="Latest market price per share from EasyEquities."),
                 "Total Purchase Value": st.column_config.NumberColumn("Total Purchase Value", format="R %.2f", help="Quantity multiplied by the average purchase price."),
                 "Current Value": st.column_config.NumberColumn("Current Value", format="R %.2f", help="Current market value of the holding."),
                 "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format="R %.2f", help="Current value less total purchase value."),
@@ -423,6 +465,11 @@ def _render_holdings_table(
         )
     else:
         st.info("Select at least one column to display the holdings table.")
+    # Export every column, not just the displayed selection.
+    render_csv_download(
+        holdings_table, f"portfolio_{account_type.lower().replace(' ', '_')}",
+        key=f"portfolio_{account_type}_csv",
+    )
 
     # Today's movement for this account group (JSE-priced symbols only -
     # USD-account holdings resolve to the wrong instrument via .JO lookups)
@@ -800,70 +847,11 @@ def _remove_holding(db: Session, portfolio_id: int, symbol: str, account_type: s
 
 
 def _update_holding_values(db: Session, holdings: list) -> None:
-    """Update current values for holdings from the latest stored prices.
-
-    One batched latest-price query plus one commit, instead of a query and a
-    commit per holding.
-
-    Only JSE-tracked accounts are priced: stored prices are JSE quotes, so a
-    USD-account holding (e.g. AAPL under a bare US symbol) would either be
-    valued with the wrong instrument or have its EasyEquities-synced values
-    wiped to None. Those holdings keep whatever the sync last set.
-    """
-    jse_holdings = [h for h in holdings if is_jse_tracked_account(h.account_type)]
-    if not jse_holdings:
-        return
-
-    symbols = [h.symbol for h in jse_holdings]
-    latest_by_symbol = {
-        symbol: snapshots[0]
-        for symbol, snapshots in _get_group_latest_and_previous_prices(db, symbols).items()
-    }
-
-    # Dividends received per share since each holding's purchase date - same
-    # rule as the Dividends page income estimate.
-    dividends_by_symbol: dict[str, list] = {}
-    for sym, amount, ex_date in db.query(
-        Dividend.symbol, Dividend.amount, Dividend.ex_dividend_date
-    ).filter(Dividend.symbol.in_(symbols)).all():
-        dividends_by_symbol.setdefault(sym, []).append((ex_date, amount or 0.0))
-
-    for holding in jse_holdings:
-        latest = latest_by_symbol.get(holding.symbol)
-        if latest and latest.close_price is not None:
-            holding.current_price = latest.close_price
-            holding.current_value = holding.quantity * latest.close_price
-            cost_basis = holding.quantity * holding.purchase_price
-            if cost_basis:
-                holding.gain_loss = holding.current_value - cost_basis
-                holding.gain_loss_percentage = (holding.gain_loss / cost_basis) * 100
-            else:
-                holding.gain_loss = holding.current_value
-                holding.gain_loss_percentage = 0.0
-        # No stored bar: keep whatever the last EasyEquities sync set - a
-        # missing/failed JSE price fetch must not wipe last-known values.
-
-        holding.total_dividends_received = (holding.quantity or 0.0) * sum(
-            amount
-            for ex_date, amount in dividends_by_symbol.get(holding.symbol, [])
-            if holding.purchase_date is None
-            or (ex_date is not None and ex_date >= holding.purchase_date)
-        )
-
-    db.commit()
+    """Revalue holdings from stored prices (see services.portfolio_valuation),
+    using this page's cached latest-price lookup."""
+    update_holding_values(db, holdings, price_lookup=_get_group_latest_and_previous_prices)
 
 
 def _update_portfolio_totals(db: Session, portfolio: Portfolio, holdings: list) -> None:
-    """Recompute portfolio-level summary metrics from its current holdings."""
-    total_value = sum(h.current_value or 0.0 for h in holdings)
-    total_cost = sum(h.quantity * h.purchase_price for h in holdings)
-
-    portfolio.current_value = total_value
-    portfolio.total_gain_loss = total_value - total_cost
-    portfolio.total_gain_loss_percentage = (
-        (portfolio.total_gain_loss / total_cost) * 100 if total_cost else 0.0
-    )
-
-    db.commit()
-
-
+    """Recompute portfolio summary metrics and record today's value snapshot."""
+    update_portfolio_totals(db, portfolio, holdings)
