@@ -4,6 +4,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 from app.models.stock import Stock, StockPrice
 from app.models.watchlist import WatchlistItem
+from sqlalchemy.exc import IntegrityError
 from app.models.portfolio import PortfolioHolding
 from app.dashboard.utils import (
     format_stock_label,
@@ -366,9 +367,17 @@ def _add_to_watchlist(
     if not stock:
         # Create stock entry
         from app.services.data_service import get_company_name
-        stock = Stock(symbol=symbol, name=get_company_name(symbol))
-        db.add(stock)
-        db.flush()
+        try:
+            stock = Stock(symbol=symbol, name=get_company_name(symbol))
+            db.add(stock)
+            db.flush()
+        except IntegrityError:
+            # The updater's _ensure_stock can insert the same symbol between
+            # our lookup and flush - take their row instead of crashing.
+            db.rollback()
+            stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+            if not stock:
+                raise
 
     # Add to watchlist
     item = WatchlistItem(
@@ -384,7 +393,14 @@ def _add_to_watchlist(
     )
 
     db.add(item)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost the race against a concurrent add of the same symbol (the
+        # partial unique index on active items rejects the second insert).
+        db.rollback()
+        logger.info(f"{symbol} was added to the watchlist concurrently")
+        return None
 
     # Backfill historical prices and technical indicators for the newly added stock
     saved = 0
@@ -409,6 +425,11 @@ def _add_to_watchlist(
     elif saved == 0 and not has_prices:
         stock.is_active = False
         db.commit()
+
+    # The Company View selector is cached for 5 min - drop it so a
+    # just-added (or reactivated) stock shows up immediately.
+    from app.dashboard.company import _get_active_stocks
+    _get_active_stocks.clear()
     return saved
 
 

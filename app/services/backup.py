@@ -55,15 +55,15 @@ def latest_backup_time() -> Optional[datetime]:
     return datetime.fromtimestamp(backups[0].stat().st_mtime)
 
 
-def _find_pg_dump() -> Optional[str]:
-    if settings.pg_dump_path:
+def _find_pg_tool(name: str) -> Optional[str]:
+    if name == "pg_dump" and settings.pg_dump_path:
         return settings.pg_dump_path
-    on_path = shutil.which("pg_dump")
+    on_path = shutil.which(name)
     if on_path:
         return on_path
     # Windows installs don't put the PostgreSQL bin dir on PATH; prefer the
     # newest version so the client is never older than the server.
-    candidates = glob.glob(r"C:\Program Files\PostgreSQL\*\bin\pg_dump.exe")
+    candidates = glob.glob(rf"C:\Program Files\PostgreSQL\*\bin\{name}.exe")
 
     def _version(path: str) -> float:
         try:
@@ -74,8 +74,34 @@ def _find_pg_dump() -> Optional[str]:
     return max(candidates, key=_version) if candidates else None
 
 
+def _verify_sqlite(target: Path) -> None:
+    """A truncated/corrupt SQLite copy must not pass as a valid backup."""
+    conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("PRAGMA integrity_check").fetchall()
+    finally:
+        conn.close()
+    if rows != [("ok",)]:
+        raise RuntimeError(f"integrity_check failed: {rows[0][0] if rows else 'no result'}")
+
+
+def _verify_postgres(target: Path) -> None:
+    """`pg_restore -l` parses the archive TOC - a truncated dump fails it."""
+    pg_restore = _find_pg_tool("pg_restore")
+    if not pg_restore:
+        logger.warning("pg_restore not found - skipping backup verification")
+        return
+    result = subprocess.run(
+        [pg_restore, "-l", str(target)], capture_output=True, text=True, timeout=120
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"pg_restore -l failed ({result.returncode}): {result.stderr.strip()[:300]}"
+        )
+
+
 def _backup_postgres(url, target: Path) -> None:
-    pg_dump = _find_pg_dump()
+    pg_dump = _find_pg_tool("pg_dump")
     if not pg_dump:
         raise RuntimeError("pg_dump not found - set PG_DUMP_PATH in .env")
     cmd = [pg_dump, "-Fc", "--no-owner", "-f", str(target)]
@@ -143,6 +169,17 @@ def backup_database() -> Path:
     if not target.exists() or target.stat().st_size == 0:
         target.unlink(missing_ok=True)
         raise RuntimeError("Backup produced an empty file")
+
+    # A non-empty file is not enough - verify the archive actually parses
+    # before counting it as a restorable backup.
+    try:
+        if url.get_backend_name() == "postgresql":
+            _verify_postgres(target)
+        else:
+            _verify_sqlite(target)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
 
     removed = _prune(settings.backup_keep)
     logger.info(

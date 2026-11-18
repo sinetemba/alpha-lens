@@ -39,7 +39,7 @@ def show_settings(db: Session):
     st.markdown("---")
     _render_updater_status(db)
     st.markdown("---")
-    _render_backups()
+    _render_backups(db)
     st.markdown("---")
     _render_data_sources()
 
@@ -139,8 +139,35 @@ def _render_updater_status(db: Session):
     )
 
 
-def _render_backups():
+def _render_backups(db: Session):
     st.subheader("💾 Database backups")
+
+    flash = st.session_state.pop("settings_backup_flash", None)
+    if flash:
+        level, message = flash
+        getattr(st, level)(message)
+
+    if st.button("💾 Back up now", key="settings_backup_now"):
+        with st.spinner("Backing up the database..."):
+            try:
+                path = backup.backup_database()
+                # Heartbeat row so the status table above reflects the manual
+                # backup too, not just the daemon's weekly run.
+                db.add(UpdaterRun(
+                    job_name="database_backup", success=True,
+                    detail=f"manual: {path.name}",
+                ))
+                db.commit()
+                st.session_state["settings_backup_flash"] = (
+                    "success", f"Backup written to {path.name}."
+                )
+            except Exception as e:
+                db.rollback()
+                st.session_state["settings_backup_flash"] = (
+                    "error", f"Backup failed: {e}"
+                )
+        st.rerun()
+
     backups = backup.list_backups()
     if backups:
         newest = backups[0]

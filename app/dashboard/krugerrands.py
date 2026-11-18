@@ -70,6 +70,14 @@ def show_krugerrands(db: Session):
 
     _ensure_gold_symbols(db)
 
+    # Feedback from the post-action rerun (price refresh, add/remove
+    # holding): messages rendered in the same run as st.rerun() are
+    # discarded before the user sees them.
+    flash = st.session_state.pop("krug_flash", None)
+    if flash:
+        level, message = flash
+        getattr(st, level)(message)
+
     gold_api = GoldAPICollector()
     if not gold_api.enabled:
         st.warning(
@@ -81,9 +89,11 @@ def show_krugerrands(db: Session):
         with st.spinner("Fetching gold and USD/ZAR data..."):
             refreshed = _refresh_gold_prices(db, gold_api)
         if refreshed:
-            st.success("Prices refreshed.")
+            st.session_state["krug_flash"] = ("success", "Prices refreshed.")
         else:
-            st.warning("Could not refresh prices - check your GoldAPI key/configuration.")
+            st.session_state["krug_flash"] = (
+                "warning", "Could not refresh prices - check your GoldAPI key/configuration."
+            )
         st.rerun()
 
     show_silver = st.toggle("Show Silver Spot", value=False)
@@ -333,11 +343,6 @@ def _render_holdings(db: Session, gold_zar: float, silver_zar: float):
     """Persistent record of purchased bullion with live valuation."""
     st.subheader("My Holdings")
 
-    flash = st.session_state.pop("krug_flash", None)
-    if flash:
-        level, message = flash
-        getattr(st, level)(message)
-
     holdings = db.query(KrugerrandHolding).order_by(KrugerrandHolding.purchase_date).all()
     spots = {"XAU": gold_zar, "XAG": silver_zar}
 
@@ -352,16 +357,25 @@ def _render_holdings(db: Session, gold_zar: float, silver_zar: float):
                 "Product": PRODUCT_CATALOG.get(h.product, {}).get("name", h.product),
                 "Size": h.label,
                 "Qty": h.quantity,
-                "Paid per item": f"R {h.purchase_price:,.2f}" if h.purchase_price else "-",
-                "Current value": f"R {current_value:,.2f}" if current_value is not None else "N/A",
-                "Gain/Loss": (
-                    f"R {gain:+,.2f} ({gain / cost * 100:+.1f}%)" if gain is not None else "-"
-                ),
+                "Paid per item": h.purchase_price,
+                "Current value": current_value,
+                "Gain/Loss": gain,
+                "Gain %": gain / cost * 100 if gain is not None else None,
                 "Purchased": h.purchase_date.strftime("%Y-%m-%d") if h.purchase_date else "-",
             })
 
         render_holding_totals(holding_totals(valued))
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        # Numeric cells (not "R x" strings) so column sorting works.
+        st.dataframe(
+            rows, use_container_width=True, hide_index=True,
+            column_config={
+                "Qty": st.column_config.NumberColumn(format="%g"),
+                "Paid per item": st.column_config.NumberColumn(format="R %.2f"),
+                "Current value": st.column_config.NumberColumn(format="R %.2f"),
+                "Gain/Loss": st.column_config.NumberColumn(format="R %+.2f"),
+                "Gain %": st.column_config.NumberColumn(format="%+.1f%%"),
+            },
+        )
     else:
         st.info("No bullion recorded yet - log a purchase below.")
 
@@ -421,14 +435,31 @@ def _render_holdings(db: Session, gold_zar: float, silver_zar: float):
                 list(remove_options.keys()),
                 key="krug_remove_select",
             )
+            remove_key = "krug_remove_pending"
             if st.button("Remove selected", key="krug_remove_btn", disabled=not to_remove):
-                ids = {remove_options[k] for k in to_remove}
-                for h in holdings:
-                    if h.id in ids:
-                        db.delete(h)
-                db.commit()
-                st.session_state["krug_flash"] = ("success", f"Removed {len(ids)} holding(s).")
-                st.rerun()
+                st.session_state[remove_key] = tuple(to_remove)
+
+            pending = st.session_state.get(remove_key)
+            if pending:
+                st.warning(
+                    f"Remove {len(pending)} holding(s) ({', '.join(pending)})? "
+                    "This deletes the purchase record(s)."
+                )
+                confirm_col, cancel_col = st.columns(2)
+                with confirm_col:
+                    if st.button("Yes, remove", key="krug_confirm_remove"):
+                        ids = {remove_options[k] for k in pending if k in remove_options}
+                        for h in holdings:
+                            if h.id in ids:
+                                db.delete(h)
+                        db.commit()
+                        st.session_state[remove_key] = None
+                        st.session_state["krug_flash"] = ("success", f"Removed {len(ids)} holding(s).")
+                        st.rerun()
+                with cancel_col:
+                    if st.button("Cancel", key="krug_cancel_remove"):
+                        st.session_state[remove_key] = None
+                        st.rerun()
 
 
 @st.cache_data(ttl=2592000, show_spinner=False)

@@ -1,3 +1,4 @@
+import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -7,7 +8,7 @@ from typing import List, Dict, Optional
 from app.models.base import SessionLocal
 from app.models.news import NewsArticle
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_price, format_stock_label, render_last_fetch_caption, _to_display_tz
+from app.dashboard.utils import format_price, format_stock_label, price_column_format, render_csv_download, render_last_fetch_caption, _to_display_tz
 from app.services.company_news import CompanyNewsService
 from datetime import datetime, timedelta, timezone
 from loguru import logger
@@ -111,6 +112,11 @@ def _render_manage_stocks(db: Session):
     re-adding it on the Watchlist or Portfolio page.
     """
     with st.expander("🗑️ Manage tracked stocks"):
+        flash = st.session_state.pop("company_flash", None)
+        if flash:
+            level, message = flash
+            getattr(st, level)(message)
+
         active = _get_active_stocks()
         names = {s[0]: s[1] for s in active}
         to_deactivate = st.multiselect(
@@ -119,27 +125,66 @@ def _render_manage_stocks(db: Session):
             format_func=lambda s: format_stock_label(s, names.get(s)),
             key="deactivate_stocks",
         )
+
+        deactivate_key = "deactivate_pending"
         if st.button("Deactivate selected", disabled=not to_deactivate):
-            db.query(Stock).filter(
-                Stock.symbol.in_(to_deactivate)
-            ).update({"is_active": False}, synchronize_session=False)
-            db.commit()
-            _get_active_stocks.clear()
-            st.success(f"Deactivated {len(to_deactivate)} stock(s).")
-            st.rerun()
+            st.session_state[deactivate_key] = tuple(to_deactivate)
+
+        pending = st.session_state.get(deactivate_key)
+        if pending:
+            st.warning(
+                f"Deactivate {len(pending)} stock(s) ({', '.join(pending)})? "
+                "Their history is kept but the updater stops fetching them."
+            )
+            confirm_col, cancel_col = st.columns(2)
+            with confirm_col:
+                if st.button("Yes, deactivate", key="deactivate_confirm"):
+                    db.query(Stock).filter(
+                        Stock.symbol.in_(list(pending))
+                    ).update({"is_active": False}, synchronize_session=False)
+                    db.commit()
+                    _get_active_stocks.clear()
+                    st.session_state[deactivate_key] = None
+                    st.session_state["company_flash"] = (
+                        "success", f"Deactivated {len(pending)} stock(s)."
+                    )
+                    st.rerun()
+            with cancel_col:
+                if st.button("Cancel", key="deactivate_cancel"):
+                    st.session_state[deactivate_key] = None
+                    st.rerun()
+
+
+_CHART_FIELDS = (
+    "timestamp", "open_price", "high_price", "low_price", "close_price",
+    "volume", "sma_20", "sma_50", "sma_200", "rsi", "macd", "macd_signal",
+    "macd_hist", "bollinger_upper", "bollinger_middle", "bollinger_lower",
+)
+
+
+@st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
+def _get_chart_prices(db: Session, symbol: str, days: int) -> List[Dict]:
+    """Price rows for the chart as plain dicts, cached so widget reruns don't
+    re-read (and re-ORM) up to 365 rows every interaction."""
+    start_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    prices = db.query(StockPrice).filter(
+        StockPrice.symbol == symbol,
+        StockPrice.timestamp >= start_date
+    ).order_by(StockPrice.timestamp.asc()).all()
+    return [{field: getattr(p, field) for field in _CHART_FIELDS} for p in prices]
 
 
 def _render_price_chart(db: Session, symbol: str):
     """Render price chart for a stock."""
     st.subheader("Price Chart")
-    
+
     # Time period selection
     period = st.selectbox(
         "Time Period",
         ["1 Week", "1 Month", "3 Months", "6 Months", "1 Year"],
         index=2
     )
-    
+
     days_map = {
         "1 Week": 7,
         "1 Month": 30,
@@ -147,24 +192,19 @@ def _render_price_chart(db: Session, symbol: str):
         "6 Months": 180,
         "1 Year": 365
     }
-    
+
     days = days_map[period]
-    start_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
 
     stock = db.query(Stock).filter(Stock.symbol == symbol).first()
     label = format_stock_label(symbol, stock.name if stock else None)
 
-    # Get price data
-    prices = db.query(StockPrice).filter(
-        StockPrice.symbol == symbol,
-        StockPrice.timestamp >= start_date
-    ).order_by(StockPrice.timestamp.asc()).all()
-    
+    prices = _get_chart_prices(db, symbol, days)
+
     if not prices:
         st.warning(f"No price data available for {symbol} in selected period.")
         return
-    
-    timestamps = [p.timestamp for p in prices]
+
+    timestamps = [p["timestamp"] for p in prices]
 
     fig = make_subplots(
         rows=4, cols=1,
@@ -177,38 +217,38 @@ def _render_price_chart(db: Session, symbol: str):
     # Row 1: Candlestick + Bollinger Bands
     fig.add_trace(go.Candlestick(
         x=timestamps,
-        open=[p.open_price for p in prices],
-        high=[p.high_price for p in prices],
-        low=[p.low_price for p in prices],
-        close=[p.close_price for p in prices],
+        open=[p["open_price"] for p in prices],
+        high=[p["high_price"] for p in prices],
+        low=[p["low_price"] for p in prices],
+        close=[p["close_price"] for p in prices],
         name=label
     ), row=1, col=1)
 
-    if any(p.bollinger_upper for p in prices):
+    if any(p["bollinger_upper"] for p in prices):
         fig.add_trace(go.Scatter(
-            x=timestamps, y=[p.bollinger_upper for p in prices],
+            x=timestamps, y=[p["bollinger_upper"] for p in prices],
             name="Bollinger Upper", line=dict(color="rgba(173,204,255,0.8)", width=1)
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
-            x=timestamps, y=[p.bollinger_middle for p in prices],
+            x=timestamps, y=[p["bollinger_middle"] for p in prices],
             name="Bollinger Middle", line=dict(color="rgba(150,150,150,0.8)", width=1, dash="dot")
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
-            x=timestamps, y=[p.bollinger_lower for p in prices],
+            x=timestamps, y=[p["bollinger_lower"] for p in prices],
             name="Bollinger Lower", line=dict(color="rgba(173,204,255,0.8)", width=1),
             fill="tonexty", fillcolor="rgba(173,204,255,0.15)"
         ), row=1, col=1)
 
     # Row 2: Volume
     fig.add_trace(go.Bar(
-        x=timestamps, y=[p.volume for p in prices],
+        x=timestamps, y=[p["volume"] for p in prices],
         name="Volume", marker_color="rgba(100,149,237,0.7)"
     ), row=2, col=1)
 
     # Row 3: RSI
-    if any(p.rsi for p in prices):
+    if any(p["rsi"] for p in prices):
         fig.add_trace(go.Scatter(
-            x=timestamps, y=[p.rsi for p in prices],
+            x=timestamps, y=[p["rsi"] for p in prices],
             name="RSI", line=dict(color="orange", width=1.5)
         ), row=3, col=1)
         fig.add_hline(y=70, line=dict(color="red", width=1, dash="dash"), row=3, col=1)
@@ -216,21 +256,21 @@ def _render_price_chart(db: Session, symbol: str):
         fig.update_yaxes(range=[0, 100], row=3, col=1)
 
     # Row 4: MACD
-    if any(p.macd for p in prices):
+    if any(p["macd"] for p in prices):
         fig.add_trace(go.Scatter(
-            x=timestamps, y=[p.macd for p in prices],
+            x=timestamps, y=[p["macd"] for p in prices],
             name="MACD", line=dict(color="blue", width=1.5)
         ), row=4, col=1)
         fig.add_trace(go.Scatter(
-            x=timestamps, y=[p.macd_signal for p in prices],
+            x=timestamps, y=[p["macd_signal"] for p in prices],
             name="Signal", line=dict(color="orange", width=1.5)
         ), row=4, col=1)
         colors = [
-            "green" if (p.macd_hist or 0) >= 0 else "red"
+            "green" if (p["macd_hist"] or 0) >= 0 else "red"
             for p in prices
         ]
         fig.add_trace(go.Bar(
-            x=timestamps, y=[p.macd_hist for p in prices],
+            x=timestamps, y=[p["macd_hist"] for p in prices],
             name="Histogram", marker_color=colors
         ), row=4, col=1)
 
@@ -250,16 +290,16 @@ def _render_price_chart(db: Session, symbol: str):
     ma_col1, ma_col2, ma_col3 = st.columns(3)
     
     with ma_col1:
-        if prices and prices[-1].sma_20:
-            st.metric("SMA 20", format_price(prices[-1].sma_20))
-    
+        if prices and prices[-1]["sma_20"]:
+            st.metric("SMA 20", format_price(prices[-1]["sma_20"]))
+
     with ma_col2:
-        if prices and prices[-1].sma_50:
-            st.metric("SMA 50", format_price(prices[-1].sma_50))
-    
+        if prices and prices[-1]["sma_50"]:
+            st.metric("SMA 50", format_price(prices[-1]["sma_50"]))
+
     with ma_col3:
-        if prices and prices[-1].sma_200:
-            st.metric("SMA 200", format_price(prices[-1].sma_200))
+        if prices and prices[-1]["sma_200"]:
+            st.metric("SMA 200", format_price(prices[-1]["sma_200"]))
 
 
 def _render_historical_data(db: Session, symbol: str):
@@ -285,15 +325,34 @@ def _render_historical_data(db: Session, symbol: str):
     for price in prices:
         data.append({
             "Date": price.timestamp.strftime("%Y-%m-%d"),
-            "Open": format_price(price.open_price),
-            "High": format_price(price.high_price),
-            "Low": format_price(price.low_price),
-            "Close": format_price(price.close_price),
-            "Volume": f"{price.volume:,}" if price.volume else "N/A",
+            "Open": price.open_price,
+            "High": price.high_price,
+            "Low": price.low_price,
+            "Close": price.close_price,
+            "Volume": price.volume,
         })
 
+    # Numeric cells so column sorting works; the "R"/grouped display comes
+    # from NumberColumn formats rather than pre-formatted strings.
+    history_table = pd.DataFrame(data)
+    price_fmt = price_column_format(
+        history_table["Open"], history_table["High"],
+        history_table["Low"], history_table["Close"],
+    )
     st.caption(f"Page {page} of {total_pages} ({total} rows, {page_size} per page)")
-    st.dataframe(data, use_container_width=True)
+    st.dataframe(
+        history_table,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Open": st.column_config.NumberColumn(format=price_fmt),
+            "High": st.column_config.NumberColumn(format=price_fmt),
+            "Low": st.column_config.NumberColumn(format=price_fmt),
+            "Close": st.column_config.NumberColumn(format=price_fmt),
+            "Volume": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+    render_csv_download(history_table, "price_history", key=f"hist_csv_{symbol}_{page}")
 
 
 @st.cache_data(ttl=600, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})

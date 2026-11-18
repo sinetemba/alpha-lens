@@ -140,22 +140,18 @@ def _render_home(db: Session):
     watchlist_symbols = [
         item.symbol for item in db.query(WatchlistItem).filter(WatchlistItem.is_active == True).all()
     ]
-    portfolio_symbols = [
-        h.symbol for h in db.query(PortfolioHolding).filter(
-            ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
-        ).all()
-        # Same guard as the headless updater: USD-account holdings are US
-        # listings under bare symbols, not JSE tickers.
-        if is_jse_tracked_account(h.account_type)
-    ]
-    refresh_symbols = sorted(set(watchlist_symbols + portfolio_symbols + [settings.jse_index_yf_symbol]))
+    # Queried once and shared by the refresh control and every metric helper -
+    # previously each helper ran the same holdings query again.
+    holdings = _portfolio_holdings(db)
+    refresh_symbols = sorted(set(
+        watchlist_symbols + [h.symbol for h in holdings] + [settings.jse_index_yf_symbol]
+    ))
 
     render_updater_status_banner(db)
     _render_home_refresh_control(db, refresh_symbols)
 
     # Get latest market data
     col1, col2, col3 = st.columns(3)
-    holdings = _portfolio_holdings(db)
 
     with col1:
         st.metric(
@@ -169,7 +165,7 @@ def _render_home(db: Session):
             st.metric(
                 label="Portfolio Value",
                 value=f"R {_holdings_market_value(db, holdings):,.2f}",
-                delta=_get_portfolio_change(db)
+                delta=_get_portfolio_change(db, holdings)
             )
         else:
             # "R 0.00" looked like a real value; make the empty state explicit.
@@ -180,8 +176,8 @@ def _render_home(db: Session):
         if holdings:
             st.metric(
                 label="Daily Gain",
-                value=f"R {_get_daily_gain(db):,.2f}",
-                delta=_get_daily_gain_percentage(db)
+                value=f"R {_get_daily_gain(db, holdings):,.2f}",
+                delta=_get_daily_gain_percentage(db, holdings)
             )
         else:
             st.metric(label="Daily Gain", value="—")
@@ -281,14 +277,8 @@ def _holdings_market_value(db: Session, holdings) -> float:
     return total
 
 
-def _get_portfolio_value(db: Session) -> float:
-    """Get total portfolio value, excluding demo account types."""
-    return _holdings_market_value(db, _portfolio_holdings(db))
-
-
-def _get_portfolio_change(db: Session) -> str:
+def _get_portfolio_change(db: Session, holdings: list) -> str:
     """Get portfolio gain/loss percentage, excluding demo account types."""
-    holdings = _portfolio_holdings(db)
     if not holdings:
         return "0.0%"
     total_value = _holdings_market_value(db, holdings)
@@ -300,9 +290,8 @@ def _get_portfolio_change(db: Session) -> str:
     return f"{pct:.2f}%"
 
 
-def _get_daily_gain(db: Session) -> float:
+def _get_daily_gain(db: Session, holdings: list) -> float:
     """Get daily portfolio gain/loss by comparing current prices to previous day's close."""
-    holdings = _portfolio_holdings(db)
     if not holdings:
         return 0.0
 
@@ -321,11 +310,11 @@ def _get_daily_gain(db: Session) -> float:
     return daily_gain
 
 
-def _get_daily_gain_percentage(db: Session) -> str:
+def _get_daily_gain_percentage(db: Session, holdings: list) -> str:
     """Get daily gain as a percentage of portfolio value."""
-    total_value = _get_portfolio_value(db)
+    total_value = _holdings_market_value(db, holdings)
     if total_value > 0:
-        daily_gain = _get_daily_gain(db)
+        daily_gain = _get_daily_gain(db, holdings)
         pct = (daily_gain / total_value) * 100
         return f"{pct:+.2f}%"
     return "0.0%"
@@ -435,7 +424,11 @@ def _render_news_feed(db: Session):
         return
 
     for article in recent_news:
+        published = (
+            _to_display_tz(article.published_at).strftime("%Y-%m-%d %H:%M")
+            if article.published_at else "Unknown"
+        )
         with st.expander(f"**{article.title}** - {article.source}"):
-            st.markdown(f"*Published: {_to_display_tz(article.published_at).strftime('%Y-%m-%d %H:%M')}*")
+            st.markdown(f"*Published: {published}*")
             st.markdown(article.summary)
             st.markdown(f"[Read more]({article.url})")

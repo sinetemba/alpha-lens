@@ -163,6 +163,8 @@ def show_dividends(db: Session):
     dividends = db.query(Dividend).options(joinedload(Dividend.stock)).order_by(
         Dividend.ex_dividend_date.desc()
     ).limit(200).all()
+    if len(dividends) >= 200 and total_dividends > len(dividends):
+        st.caption(f"Showing the {len(dividends)} most recent of {total_dividends} dividend records.")
     if dividends:
         data = []
         for d in dividends:
@@ -246,14 +248,15 @@ def show_dividends(db: Session):
                     db.flush()
 
                 ex_dt = datetime.combine(ex_date, datetime.min.time())
-                # Match on calendar day, not exact timestamp - legacy rows
-                # stored non-midnight ex-dates would slip past an == check.
-                existing = db.query(Dividend).filter(
+                # Match on calendar day + amount: a special dividend can
+                # share an ex-date with an interim, so day-only matching
+                # would wrongly block it (the unique index is 3-column too).
+                same_day = db.query(Dividend).filter(
                     Dividend.symbol == symbol,
                     Dividend.ex_dividend_date >= ex_dt,
                     Dividend.ex_dividend_date < ex_dt + timedelta(days=1),
-                ).first()
-                if existing:
+                ).all()
+                if any(abs((d.amount or 0.0) - amount) < 1e-6 for d in same_day):
                     st.warning(f"A dividend for {symbol} on {ex_date} already exists.")
                 else:
                     dividend = Dividend(

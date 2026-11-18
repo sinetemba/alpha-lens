@@ -2,6 +2,7 @@ from collections import Counter
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 from app.models.portfolio import (
     Portfolio,
@@ -656,6 +657,7 @@ def _sync_portfolio_from_easyequities(
             "symbol": symbol,
             "name": ee_holding.get("name") or symbol,
             "account_name": account_name,
+            "currency": ee_holding.get("currency"),
             "shares": 0.0,
             "purchase_value": 0.0,
             "current_value": 0.0,
@@ -697,14 +699,28 @@ def _sync_portfolio_from_easyequities(
             PortfolioHolding.portfolio_id == portfolio_id,
             PortfolioHolding.account_type.in_(seen_account_types),
         ).all()
-        removed = 0
+        removed = []
         for holding in stale_holdings:
             if (holding.symbol, holding.account_type) not in aggregated_holdings:
                 db.delete(holding)
-                removed += 1
+                removed.append(f"{holding.symbol} ({holding.account_type})")
         if removed:
             db.commit()
-            logger.info(f"Removed {removed} stale holding(s) no longer reported by EasyEquities")
+            logger.info(f"Removed {len(removed)} stale holding(s) no longer reported by EasyEquities")
+            # Removed positions used to vanish with no trace - an in-app
+            # notification records what was dropped (deduped per symbol set).
+            try:
+                from app.notifications.notification_service import NotificationService
+                NotificationService(db).create_notification(
+                    notification_type="system",
+                    title=f"EasyEquities sync removed {len(removed)} holding(s)",
+                    message=(
+                        "No longer reported by EasyEquities (sold, transferred or "
+                        f"delisted) and removed from the portfolio: {', '.join(sorted(removed))}"
+                    ),
+                )
+            except Exception as e:
+                logger.warning(f"Could not record holding-removal notification: {e}")
 
     return len(aggregated_holdings)
 
@@ -723,9 +739,17 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
     
     if not stock:
         from app.services.data_service import get_company_name
-        stock = Stock(symbol=symbol, name=get_company_name(symbol))
-        db.add(stock)
-        db.flush()
+        try:
+            stock = Stock(symbol=symbol, name=get_company_name(symbol))
+            db.add(stock)
+            db.flush()
+        except IntegrityError:
+            # The updater's _ensure_stock can insert the same symbol between
+            # our lookup and flush - take their row instead of crashing.
+            db.rollback()
+            stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+            if not stock:
+                raise
     
     # Create holding. account_type="Manual" deliberately: EasyEquities
     # reconciliation deletes every holding under an account type it synced
@@ -744,7 +768,14 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
     )
     
     db.add(holding)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent writer created a conflicting row between our checks
+        # and the commit - treat as "not added" rather than crashing.
+        db.rollback()
+        logger.warning(f"{symbol} holding insert hit a concurrent write")
+        return None
 
     # Backfill historical prices and technical indicators for the newly added stock
     saved = 0
@@ -766,7 +797,55 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
     elif saved == 0 and not has_prices:
         stock.is_active = False
         db.commit()
+
+    # The Company View selector is cached for 5 min - drop it so a
+    # just-added (or reactivated) stock shows up immediately.
+    from app.dashboard.company import _get_active_stocks
+    _get_active_stocks.clear()
     return saved
+
+
+def _ee_reconcile_units(db: Session, ee_holding: dict, account_type: str) -> None:
+    """Rescale EasyEquities amounts that look like cents, in place.
+
+    The aggregated holding derives price from value/shares, so internal
+    consistency can't detect a units glitch - compare the implied price
+    against the stored JSE close instead (same ~100x rule as the bar unit
+    check on the price-feed path). USD-denominated amounts on JSE-tracked
+    accounts are flagged rather than rescaled.
+    """
+    symbol = ee_holding.get("symbol", "?")
+    price = ee_holding.get("current_price") or 0.0
+    if price <= 0 or not is_jse_tracked_account(account_type):
+        return
+    currency = (ee_holding.get("currency") or "").upper()
+    if currency and currency != "ZAR":
+        logger.warning(
+            f"EasyEquities {symbol}: {currency}-denominated amount on "
+            f"JSE-tracked account {account_type} - skipping stored-close check"
+        )
+        return
+    stored = db.query(StockPrice.close_price).filter(
+        StockPrice.symbol == symbol
+    ).order_by(StockPrice.timestamp.desc()).first()
+    if not stored or not stored.close_price:
+        return
+    ratio = max(price, stored.close_price) / min(price, stored.close_price)
+    if ratio <= 3.0:
+        return
+    if abs(price / 100 - stored.close_price) / stored.close_price <= 0.2:
+        logger.warning(
+            f"EasyEquities {symbol}: implied price {price:.2f} looks like cents "
+            f"vs stored close {stored.close_price:.2f} - rescaling /100"
+        )
+        for key in ("current_price", "purchase_price", "current_value", "purchase_value"):
+            if ee_holding.get(key):
+                ee_holding[key] /= 100
+    else:
+        logger.warning(
+            f"EasyEquities {symbol}: implied price {price:.2f} diverges {ratio:.0f}x "
+            f"from stored close {stored.close_price:.2f} - keeping EE values"
+        )
 
 
 def _sync_holding_from_easyequities(
@@ -790,6 +869,8 @@ def _sync_holding_from_easyequities(
         or ee_holding["shares"] <= 0
     ):
         return
+
+    _ee_reconcile_units(db, ee_holding, account_type)
 
     stock = (stocks_by_symbol or {}).get(symbol)
     if stock is None:

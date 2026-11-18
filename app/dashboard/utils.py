@@ -119,11 +119,15 @@ def render_symbol_search(db: Session, key: str) -> str:
     query = st.text_input(
         "Symbol or company name", placeholder="e.g. NPN or Naspers", key=f"{key}_query"
     )
-    if not query.strip():
+    q = query.strip()
+    if not q:
         return ""
-    remote = _search_jse(query.strip())
-    candidates = match_symbols(db, query, remote)
-    if remote is None:
+    # Every keystroke reruns this function, and each new query is a fresh
+    # cache key = a live Yahoo call. Below 3 chars the local prefix/name
+    # matches are enough; JSE tickers are 3+ chars anyway.
+    remote = _search_jse(q) if len(q) >= 3 else None
+    candidates = match_symbols(db, q, remote)
+    if len(q) >= 3 and remote is None:
         st.caption("Company search is unavailable right now - enter the exact ticker.")
     if not candidates:
         st.caption(f"No JSE listings match '{query.strip()}'.")
@@ -352,6 +356,24 @@ def render_updater_status_banner(db: Session) -> None:
             )
         return
 
+    # A failed backup used to be invisible outside the Settings page -
+    # surface it here too since holdings history is hand-entered data.
+    latest_backup = (
+        db.query(UpdaterRun)
+        .filter(UpdaterRun.job_name == "database_backup")
+        .order_by(UpdaterRun.finished_at.desc())
+        .first()
+    )
+    if latest_backup is not None and not latest_backup.success:
+        backup_display = _to_display_tz(
+            _ensure_aware(latest_backup.finished_at)
+        ).strftime("%d %b %H:%M")
+        st.warning(
+            f"⚠️ The last database backup ({backup_display} SAST) failed"
+            f"{': ' + latest_backup.detail if latest_backup.detail else ''} - "
+            "check data/logs/updater.log."
+        )
+
     finished = _ensure_aware(latest.finished_at)
     display = _to_display_tz(finished).strftime("%d %b %H:%M")
     if not latest.success:
@@ -394,7 +416,15 @@ def render_market_data_refresh_control(
     """
     symbol_list = list(symbols) if symbols is not None else None
     latest_timestamp = get_latest_market_data_timestamp(db, symbol_list)
-    needs_auto_refresh = auto_refresh and is_market_data_stale(latest_timestamp)
+    # Auto-refresh at most once per session per key - re-running the fetch on
+    # every page load/navigation makes the dashboard feel broken when the
+    # provider is slow or unreachable.
+    auto_key = f"{key}_auto_refreshed"
+    needs_auto_refresh = (
+        auto_refresh
+        and is_market_data_stale(latest_timestamp)
+        and not st.session_state.get(auto_key)
+    )
 
     _, refresh_column = st.columns([3, 1])
     with refresh_column:
@@ -408,6 +438,8 @@ def render_market_data_refresh_control(
                 data_service = DataService(db)
                 updated_prices = data_service.update_stock_prices(symbol_list or [])
                 new_articles = data_service.collect_news() if include_news else 0
+            if needs_auto_refresh:
+                st.session_state[auto_key] = True
             if data_service.quota_message:
                 st.warning(
                     f"{data_service.quota_message} "

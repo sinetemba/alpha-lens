@@ -228,6 +228,10 @@ class YFinanceCollector:
             logger.error(f"Error batch downloading prices: {e}")
             return {}
 
+        return self._split_frames(data, yf_symbols)
+
+    def _split_frames(self, data, yf_symbols: Dict[str, str]) -> Dict[str, "object"]:
+        """Split a grouped yf.download frame into {original symbol: DataFrame}."""
         if data is None or data.empty:
             return {}
 
@@ -247,6 +251,45 @@ class YFinanceCollector:
                 continue
             result[symbol] = self._to_rand(frame, symbol)
         return result
+
+    def get_history_batch(
+        self,
+        symbols: List[str],
+        start_date: str,
+        end_date: str,
+        interval: str = "1d",
+    ) -> Dict[str, "object"]:
+        """Batch-download a date range of daily bars for many symbols.
+
+        One yf.download call covers every symbol, matching the semantics of
+        per-symbol get_history_date_range (auto_adjust=True, so Close is
+        already adjusted and there is no Adj Close column). Each caller then
+        slices its own frame to the window it needs.
+        """
+        if not self.enabled or not symbols:
+            return {}
+
+        yf_symbols = {s: (s if "." in s else f"{s}.JO") for s in symbols}
+
+        try:
+            data = self._call_with_retry(
+                f"Yahoo batch history ({len(yf_symbols)} symbols)",
+                lambda: yf.download(
+                    list(yf_symbols.values()),
+                    start=start_date,
+                    end=end_date,
+                    interval=interval,
+                    group_by="ticker",
+                    threads=True,
+                    progress=False,
+                    auto_adjust=True,
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Error batch downloading history: {e}")
+            return {}
+
+        return self._split_frames(data, yf_symbols)
 
     def get_history_date_range(
         self,

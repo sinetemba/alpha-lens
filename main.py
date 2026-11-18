@@ -19,7 +19,7 @@ from loguru import logger
 # script re-executes on every widget interaction (Streamlit's rerun model), so
 # logger.add / create_all at module level would add a duplicate log sink and
 # fire ~a dozen table-existence checks on every single rerun.
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner="Initializing database...")
 def _init_database_once():
     logger.add(
         settings.log_file,
@@ -36,7 +36,14 @@ try:
     _init_database_once()
     logger.info("Database initialized successfully")
 except Exception as e:
+    # Stop before any page renders: every page would otherwise crash later on
+    # an unhandled SQLAlchemy error, with no hint that init itself failed.
     logger.error(f"Error initializing database: {e}")
+    st.error(
+        "Database initialization failed - the app cannot start. "
+        f"Error: {e}. Check the log file for details."
+    )
+    st.stop()
 
 # Background data fetching is handled entirely by the headless updater
 # (scripts/run_updater.py via Windows Task Scheduler) - see AGENTS.md. The

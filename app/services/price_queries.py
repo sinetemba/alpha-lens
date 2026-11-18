@@ -22,6 +22,8 @@ class PriceSnapshot(NamedTuple):
     rsi: Optional[float] = None
     macd: Optional[float] = None
     macd_signal: Optional[float] = None
+    high_price: Optional[float] = None
+    low_price: Optional[float] = None
 
 
 def day_of(db: Session, col):
@@ -81,6 +83,8 @@ def get_latest_and_previous_prices(
         StockPrice.rsi,
         StockPrice.macd,
         StockPrice.macd_signal,
+        StockPrice.high_price,
+        StockPrice.low_price,
         func.dense_rank().over(
             partition_by=StockPrice.symbol,
             order_by=day_of(db, StockPrice.timestamp).desc(),
@@ -99,6 +103,8 @@ def get_latest_and_previous_prices(
         ranked.c.rsi,
         ranked.c.macd,
         ranked.c.macd_signal,
+        ranked.c.high_price,
+        ranked.c.low_price,
         ranked.c.day_rank,
     ).filter(or_(
         and_(ranked.c.day_rank == 1, ranked.c.intra_rank == 1),
@@ -116,6 +122,8 @@ def get_latest_and_previous_prices(
             rsi=row.rsi,
             macd=row.macd,
             macd_signal=row.macd_signal,
+            high_price=row.high_price,
+            low_price=row.low_price,
         )
         if row.day_rank == 1:
             latest = snapshot

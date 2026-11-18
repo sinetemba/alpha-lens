@@ -273,16 +273,19 @@ class EasyEquitiesCollector:
         """Convert a raw holding dict (string amounts, image-derived contract code) into numeric fields."""
         from easy_equities_client.accounts.parsers import get_amount_and_currency_from_string
 
-        def parse_amount(value: str) -> float:
+        def parse_amount(value: str) -> tuple:
+            """(amount, currency_code) - the parser resolves the currency
+            symbol ("R" -> ZAR, "$" -> USD); it was previously discarded."""
             if not value:
-                return 0.0
+                return 0.0, None
             try:
                 parsed = get_amount_and_currency_from_string(value)
                 numeric = parsed[2] if len(parsed) > 2 and parsed[2] is not None else None
-                return float(numeric) if numeric is not None else 0.0
+                currency = parsed[1] if len(parsed) > 1 else None
+                return (float(numeric) if numeric is not None else 0.0), currency
             except Exception as e:
                 logger.warning(f"Could not parse EasyEquities amount '{value}': {e}")
-                return 0.0
+                return 0.0, None
 
         contract_code = holding.get("contract_code", "")
         # Contract codes look like "EQU.ZA.NPN" - the JSE ticker is usually the last segment.
@@ -297,9 +300,9 @@ class EasyEquitiesCollector:
             logger.warning(f"Could not parse EasyEquities shares '{shares_str}'")
             shares = 0.0
 
-        purchase_value = parse_amount(holding.get("purchase_value", ""))
-        current_price = parse_amount(holding.get("current_price", ""))
-        current_value = parse_amount(holding.get("current_value", ""))
+        purchase_value, _pv_currency = parse_amount(holding.get("purchase_value", ""))
+        current_price, price_currency = parse_amount(holding.get("current_price", ""))
+        current_value, value_currency = parse_amount(holding.get("current_value", ""))
 
         return {
             "symbol": symbol,
@@ -312,4 +315,5 @@ class EasyEquitiesCollector:
             "purchase_price": (purchase_value / shares) if shares else 0.0,
             "current_price": current_price,
             "current_value": current_value,
+            "currency": value_currency or price_currency,
         }

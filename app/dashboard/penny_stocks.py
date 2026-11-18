@@ -82,6 +82,13 @@ def show_penny_stocks(db: Session):
     st.caption("⚠️ Screening is heuristic and speculative — not financial advice.")
     render_last_fetch_caption(db)
 
+    # Feedback from the post-add rerun (Add to Watchlist below): messages
+    # rendered in the same run as st.rerun() are discarded.
+    flash = st.session_state.pop("penny_flash", None)
+    if flash:
+        level, message = flash
+        getattr(st, level)(message)
+
     # Merge the curated list with active DB stocks so user-tracked small caps
     # are scanned too. Index/forex symbols (containing '.' or '^') and
     # synthetic pseudo-symbols (commodity rows like AV_*/XAU_*, which would
@@ -351,7 +358,7 @@ def _render_penny_detail(db: Session, row: dict):
     elif st.button("➕ Add to Watchlist", key=f"penny_watch_{symbol}"):
         from app.dashboard.watchlist import _add_to_watchlist
         _add_to_watchlist(db, symbol, 0.0, 0.0, 0.0, "Added from Penny Stocks screen")
-        st.success(f"Added {symbol} to watchlist.")
+        st.session_state["penny_flash"] = ("success", f"Added {symbol} to watchlist.")
         st.rerun()
 
     tab_projection, tab_chart, tab_news = st.tabs(["Outlook & Influences", "Price Chart", "News"])

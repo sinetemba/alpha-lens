@@ -89,19 +89,30 @@ def _render_holdings(db: Session, holdings: list, markets: dict):
             gain = (current_value - cost) if current_value is not None and cost else None
             rows.append({
                 "Coin": f"{h.symbol} — {h.name or h.coin_id}",
-                "Qty": f"{h.quantity:g}",
-                "Price (ZAR)": f"R {price:,.2f}" if price else "N/A",
-                "24h": f"{change_24h:+.1f}%" if change_24h is not None else "-",
-                "Paid per coin": f"R {h.purchase_price:,.2f}" if h.purchase_price else "-",
-                "Current value": f"R {current_value:,.2f}" if current_value is not None else "N/A",
-                "Gain/Loss": (
-                    f"R {gain:+,.2f} ({gain / cost * 100:+.1f}%)" if gain is not None else "-"
-                ),
+                "Qty": h.quantity,
+                "Price (ZAR)": price,
+                "24h %": change_24h,
+                "Paid per coin": h.purchase_price,
+                "Current value": current_value,
+                "Gain/Loss": gain,
+                "Gain %": gain / cost * 100 if gain is not None else None,
                 "Purchased": h.purchase_date.strftime("%Y-%m-%d") if h.purchase_date else "-",
             })
 
         render_holding_totals(holding_totals(valued))
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        # Numeric cells (not "R x" strings) so column sorting works.
+        st.dataframe(
+            rows, use_container_width=True, hide_index=True,
+            column_config={
+                "Qty": st.column_config.NumberColumn(format="%g"),
+                "Price (ZAR)": st.column_config.NumberColumn(format="R %.2f"),
+                "24h %": st.column_config.NumberColumn(format="%+.1f%%"),
+                "Paid per coin": st.column_config.NumberColumn(format="R %.2f"),
+                "Current value": st.column_config.NumberColumn(format="R %.2f"),
+                "Gain/Loss": st.column_config.NumberColumn(format="R %+.2f"),
+                "Gain %": st.column_config.NumberColumn(format="%+.1f%%"),
+            },
+        )
     else:
         st.info("No crypto holdings yet - record a purchase below.")
 
@@ -118,14 +129,31 @@ def _render_holdings(db: Session, holdings: list, markets: dict):
                 list(remove_options.keys()),
                 key="crypto_remove_select",
             )
+            remove_key = "crypto_remove_pending"
             if st.button("Remove selected", key="crypto_remove_btn", disabled=not to_remove):
-                ids = {remove_options[k] for k in to_remove}
-                for h in holdings:
-                    if h.id in ids:
-                        db.delete(h)
-                db.commit()
-                st.session_state["crypto_flash"] = ("success", f"Removed {len(ids)} holding(s).")
-                st.rerun()
+                st.session_state[remove_key] = tuple(to_remove)
+
+            pending = st.session_state.get(remove_key)
+            if pending:
+                st.warning(
+                    f"Remove {len(pending)} holding(s) ({', '.join(pending)})? "
+                    "This deletes the purchase record(s)."
+                )
+                confirm_col, cancel_col = st.columns(2)
+                with confirm_col:
+                    if st.button("Yes, remove", key="crypto_confirm_remove"):
+                        ids = {remove_options[k] for k in pending if k in remove_options}
+                        for h in holdings:
+                            if h.id in ids:
+                                db.delete(h)
+                        db.commit()
+                        st.session_state[remove_key] = None
+                        st.session_state["crypto_flash"] = ("success", f"Removed {len(ids)} holding(s).")
+                        st.rerun()
+                with cancel_col:
+                    if st.button("Cancel", key="crypto_cancel_remove"):
+                        st.session_state[remove_key] = None
+                        st.rerun()
 
 
 def _resolve_coin(selection: str, custom_id: str) -> Optional[dict]:
@@ -236,15 +264,15 @@ def _render_market_snapshot(markets: dict, held_ids: tuple):
     st.dataframe(
         [{
             "Coin": f"{(row.get('symbol') or coin_id).upper()} — {row.get('name', coin_id)}",
-            "Price (ZAR)": f"R {row['current_price']:,.2f}" if row.get("current_price") else "N/A",
-            "24h": (
-                f"{row['price_change_percentage_24h']:+.1f}%"
-                if row.get("price_change_percentage_24h") is not None else "-"
-            ),
-            "Market cap": (
-                f"R {row['market_cap'] / 1e9:,.1f}bn" if row.get("market_cap") else "-"
-            ),
+            "Price (ZAR)": row.get("current_price"),
+            "24h %": row.get("price_change_percentage_24h"),
+            "Market cap (R bn)": row["market_cap"] / 1e9 if row.get("market_cap") else None,
         } for coin_id, row in snapshot.items()],
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "Price (ZAR)": st.column_config.NumberColumn(format="R %.2f"),
+            "24h %": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Market cap (R bn)": st.column_config.NumberColumn(format="%.1f"),
+        },
     )

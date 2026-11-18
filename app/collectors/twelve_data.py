@@ -52,14 +52,18 @@ class TwelveDataCollector:
     def __init__(self):
         self.api_key = settings.twelve_data_api_key
         self.base_url = settings.twelve_data_base_url
+        # One-shot kill switch for a single run: the updater sets this when
+        # the day's remaining quota can't cover the planned calls, so the run
+        # goes straight to Yahoo instead of burning the remainder into 429s.
+        self.force_disabled = False
 
         if settings.twelve_data_enabled and not self.api_key:
             logger.warning("Twelve Data API key not configured. Collector will not function.")
 
     @property
     def enabled(self) -> bool:
-        """False when switched off (TWELVE_DATA_ENABLED=false) or keyless."""
-        return settings.twelve_data_enabled and bool(self.api_key)
+        """False when switched off, keyless, or force-disabled for this run."""
+        return settings.twelve_data_enabled and bool(self.api_key) and not self.force_disabled
 
     @classmethod
     def max_batch_size(cls) -> int:
@@ -209,7 +213,7 @@ class TwelveDataCollector:
 
     def _make_request(self, endpoint: str, params: Dict, credits: int = 1) -> Optional[Dict]:
         """Make a request to the Twelve Data API, costing `credits` per attempt."""
-        if not settings.twelve_data_enabled:
+        if not settings.twelve_data_enabled or self.force_disabled:
             return None
         if not self.api_key:
             logger.error("Twelve Data API key not configured")

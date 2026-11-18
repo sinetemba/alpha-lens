@@ -1,5 +1,5 @@
 from app.models.base import Base, engine, SessionLocal
-from app.models import Stock, StockPrice, NewsArticle, WatchlistItem, Portfolio, PortfolioHolding, PortfolioSnapshot, Dividend, Notification, UpdaterRun, KrugerrandHolding, CryptoHolding
+from app.models import Stock, StockPrice, NewsArticle, WatchlistItem, Portfolio, PortfolioHolding, PortfolioSnapshot, Dividend, Notification, UpdaterRun, KrugerrandHolding, CryptoHolding, SchemaMeta
 from app.config.settings import settings
 import os
 
@@ -27,55 +27,43 @@ def _migrate_schema():
     """Apply lightweight schema migrations for existing databases.
 
     SQLAlchemy ``create_all`` only creates *new* tables; it will not add
-    columns to tables that already exist.  This function fills that gap by
-    running simple ``ALTER TABLE`` statements when needed.
+    columns to tables that already exist. Rather than a hand-maintained
+    ALTER list (which drifted - several model columns were never migrated,
+    breaking old databases with OperationalError: no such column), this
+    diffs every mapped table against the live schema and ADDs the missing
+    columns generically.
     """
     from sqlalchemy import inspect, text
 
     inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    compiler = engine.dialect.ddl_compiler(engine.dialect, None)
 
-    # --- portfolio_holdings.account_type (added to track ZAR / TFSA / USD) ---
-    if "portfolio_holdings" in inspector.get_table_names():
-        columns = [col["name"] for col in inspector.get_columns("portfolio_holdings")]
-        if "account_type" not in columns:
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+        existing_columns = {c["name"] for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing_columns:
+                continue
+            spec = compiler.get_column_specification(column)
+            # A NOT NULL column with no server default can't be added to a
+            # non-empty table - leave it NULL-capable (same outcome the old
+            # hand-written migrations produced).
+            if column.server_default is None:
+                spec = spec.replace(" NOT NULL", "")
             with engine.begin() as conn:
-                conn.execute(
-                    text("ALTER TABLE portfolio_holdings ADD COLUMN account_type VARCHAR(50) DEFAULT 'ZAR'")
-                )
-            print("Migration: added 'account_type' column to portfolio_holdings.")
+                conn.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {spec}"))
+            print(f"Migration: added '{column.name}' column to {table.name}.")
 
-    # --- portfolios.last_easyequities_sync (added to persist sync staleness tracking) ---
-    if "portfolios" in inspector.get_table_names():
-        columns = [col["name"] for col in inspector.get_columns("portfolios")]
-        if "last_easyequities_sync" not in columns:
-            with engine.begin() as conn:
-                conn.execute(
-                    text("ALTER TABLE portfolios ADD COLUMN last_easyequities_sync DATETIME")
-                )
-            print("Migration: added 'last_easyequities_sync' column to portfolios.")
-
-    # --- stock_prices.fetched_at (tracks last fetch time, unlike bar timestamp) ---
-    if "stock_prices" in inspector.get_table_names():
-        columns = [col["name"] for col in inspector.get_columns("stock_prices")]
-        if "fetched_at" not in columns:
-            with engine.begin() as conn:
-                conn.execute(
-                    text("ALTER TABLE stock_prices ADD COLUMN fetched_at TIMESTAMP")
-                )
-                conn.execute(
-                    text("UPDATE stock_prices SET fetched_at = COALESCE(created_at, timestamp)")
-                )
-            print("Migration: added 'fetched_at' column to stock_prices.")
-
-    # --- notifications.attempts (failed-send retry counter) ---
-    if "notifications" in inspector.get_table_names():
-        columns = [col["name"] for col in inspector.get_columns("notifications")]
-        if "attempts" not in columns:
-            with engine.begin() as conn:
-                conn.execute(
-                    text("ALTER TABLE notifications ADD COLUMN attempts INTEGER DEFAULT 0")
-                )
-            print("Migration: added 'attempts' column to notifications.")
+    # Data backfills the column diff can't express: fetched_at predates the
+    # generic migrator and rows written before it exist have NULL.
+    if "stock_prices" in existing_tables:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE stock_prices SET fetched_at = COALESCE(created_at, timestamp) "
+                "WHERE fetched_at IS NULL"
+            ))
 
     _enforce_unique_indexes(inspector)
     _ensure_plain_indexes(inspector)
@@ -92,29 +80,65 @@ def _enforce_unique_indexes(inspector):
 
     table_names = inspector.get_table_names()
 
-    # (table, index name, columns, keep-row rule)
+    # (table, index name, columns, soft-delete flag column or None).
+    # Soft targets dedupe by deactivating older rows instead of deleting
+    # them, and produce a partial unique index - used where inactive rows
+    # are kept for history (watchlist soft-delete).
     targets = [
-        ("stock_prices", "ix_stock_prices_symbol_timestamp", "symbol, timestamp"),
-        ("dividends", "ix_dividends_symbol_ex_date", "symbol, ex_dividend_date"),
+        ("stock_prices", "ix_stock_prices_symbol_timestamp", "symbol, timestamp", None),
+        ("dividends", "ix_dividends_symbol_ex_date", "symbol, ex_dividend_date, amount", None),
+        ("portfolio_snapshots", "uq_portfolio_snapshots_portfolio_date", "portfolio_id, snapshot_date", None),
+        ("watchlist_items", "ix_watchlist_items_active_symbol", "symbol", "is_active"),
     ]
 
-    for table, index_name, columns in targets:
+    for table, index_name, columns, soft_flag in targets:
         if table not in table_names:
             continue
         indexes = {ix["name"]: ix for ix in inspector.get_indexes(table)}
         existing = indexes.get(index_name)
-        if existing and existing.get("unique"):
+        # Skip when ANY unique index (including a named UNIQUE constraint,
+        # which inspectors may report under a generated name) already covers
+        # exactly these columns.
+        wanted = columns.split(", ")
+        if any(
+            ix.get("unique") and (ix.get("column_names") or []) == wanted
+            for ix in indexes.values()
+        ):
             continue
+
         with engine.begin() as conn:
-            # Keep the most recently inserted row of each duplicate group.
-            conn.execute(text(
-                f"DELETE FROM {table} WHERE id NOT IN ("
-                f"SELECT MAX(id) FROM {table} GROUP BY {columns})"
-            ))
+            if soft_flag:
+                # Deactivate all but the newest active row per key; the
+                # partial index then enforces one active row per symbol.
+                conn.execute(text(
+                    f"UPDATE {table} SET {soft_flag} = FALSE WHERE {soft_flag} AND id NOT IN ("
+                    f"SELECT MAX(id) FROM {table} WHERE {soft_flag} GROUP BY {columns})"
+                ))
+            else:
+                # Keep the most COMPLETE row per key group (most non-null
+                # fields, newest id on ties) - MAX(id) alone could keep an
+                # adjusted_close=0 placeholder over a full bar. Rows with
+                # NULL key columns are left alone: they can't collide under
+                # a unique index (NULLs compare distinct).
+                all_columns = [c["name"] for c in inspector.get_columns(table)]
+                score = " + ".join(
+                    f"CASE WHEN {c} IS NOT NULL THEN 1 ELSE 0 END"
+                    for c in all_columns if c != "id"
+                )
+                non_null_keys = " AND ".join(f"{c} IS NOT NULL" for c in wanted)
+                conn.execute(text(
+                    f"DELETE FROM {table} WHERE {non_null_keys} AND id NOT IN ("
+                    f"SELECT id FROM ("
+                    f"  SELECT id, ROW_NUMBER() OVER ("
+                    f"    PARTITION BY {columns} ORDER BY ({score}) DESC, id DESC"
+                    f"  ) AS rn FROM {table} WHERE {non_null_keys}"
+                    f") ranked WHERE rn = 1)"
+                ))
             if existing:
                 conn.execute(text(f"DROP INDEX {index_name}"))
             conn.execute(text(
                 f"CREATE UNIQUE INDEX {index_name} ON {table} ({columns})"
+                + (f" WHERE {soft_flag}" if soft_flag else "")
             ))
         print(f"Migration: deduplicated {table} and made ({columns}) unique.")
 
@@ -147,6 +171,9 @@ def _ensure_plain_indexes(inspector):
         print(f"Migration: added index {index_name} on {table}({columns}).")
 
 
+_NORMALIZE_BARS_KEY = "normalize_bar_timestamps_v1"
+
+
 def _normalize_bar_timestamps():
     """Collapse non-midnight stock_prices bars to exchange-local midnight.
 
@@ -154,20 +181,40 @@ def _normalize_bar_timestamps():
     the trading-day midnight used by every other write path. Normalise them so
     the (symbol, timestamp) dedup keeps working; drop any that would collide
     with a real midnight bar for the same day.
+
+    This is a one-time repair: the schema_meta marker short-circuits later
+    startups (dashboard AND daemon each call init_database) with a primary-key
+    lookup, instead of loading every stock_prices row on every launch.
     """
     from datetime import time as dt_time
+    from sqlalchemy import func
 
     db = SessionLocal()
     try:
-        midnight_keys = set()
-        intraday = []
-        for row in db.query(StockPrice).all():
-            if row.timestamp.time() == dt_time(0, 0):
-                midnight_keys.add((row.symbol, row.timestamp))
-            else:
-                intraday.append(row)
-        if not intraday:
+        if db.get(SchemaMeta, _NORMALIZE_BARS_KEY) is not None:
             return
+
+        # Push the non-midnight filter into SQL (dialect-aware) so the table
+        # is not loaded into Python just to find rows needing repair.
+        if db.bind.dialect.name == "sqlite":
+            non_midnight = func.strftime('%H:%M:%S', StockPrice.timestamp) != '00:00:00'
+        else:
+            non_midnight = StockPrice.timestamp > func.date_trunc('day', StockPrice.timestamp)
+
+        intraday = db.query(StockPrice).filter(non_midnight).all()
+        if not intraday:
+            db.add(SchemaMeta(key=_NORMALIZE_BARS_KEY))
+            db.commit()
+            return
+
+        symbols = {row.symbol for row in intraday}
+        midnight_keys = {
+            (symbol, ts)
+            for symbol, ts in db.query(StockPrice.symbol, StockPrice.timestamp).filter(
+                StockPrice.symbol.in_(symbols)
+            ).all()
+            if ts.time() == dt_time(0, 0)
+        }
 
         deleted = updated = 0
         for row in intraday:
@@ -179,6 +226,7 @@ def _normalize_bar_timestamps():
                 row.timestamp = midnight
                 midnight_keys.add((row.symbol, midnight))
                 updated += 1
+        db.add(SchemaMeta(key=_NORMALIZE_BARS_KEY))
         db.commit()
         print(f"Migration: normalised {updated} intraday bar(s) to midnight, removed {deleted} duplicate(s).")
     except Exception as e:

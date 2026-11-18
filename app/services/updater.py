@@ -328,29 +328,42 @@ class UpdaterService:
             logger.info(msg)
 
             data_service = DataService(db)
+            if not quota_ok:
+                # The plan exceeds today's remaining quota: go straight to
+                # Yahoo instead of burning the remainder into 429s.
+                data_service.twelve_data.force_disabled = True
             updated = data_service.update_stock_prices(symbols)
             logger.info(f"Updated {updated} tracked stock prices")
-            if symbols and updated == 0:
+            prices_ok = not symbols or updated > 0
+            if not prices_ok:
                 detail = "0 symbols updated"
-                logger.error("Price update refreshed 0 symbols - treating the run as failed")
-                return False
-            if data_service.last_failed_symbols:
+                logger.error(
+                    "Price update refreshed 0 symbols - marking the run failed "
+                    "but still collecting news/alerts/snapshot"
+                )
+            if data_service.last_failed_symbols and detail is None:
                 detail = f"no price for: {','.join(data_service.last_failed_symbols)}"[:200]
                 logger.warning(
                     f"Symbols with no fresh price this run: {data_service.last_failed_symbols}"
                 )
 
+            # A total price failure (e.g. Yahoo down) must not also stop news,
+            # alert checks or the daily portfolio snapshot - they don't depend
+            # on this run's prices.
             news_scraper = NewsScraper(db)
             articles = news_scraper.scrape_all_sources()
             logger.info(f"Collected {len(articles)} news articles")
 
             _run_notification_checks(db)
             _snapshot_portfolio(db)
-            ok = True
-            return True
+            ok = prices_ok
+            return prices_ok
         except Exception as e:
             detail = str(e)[:200]
             logger.error(f"Price + news update failed: {e}")
+            # A dirty session here would leak partial writes into
+            # _record_run's commit.
+            db.rollback()
             return False
         finally:
             try:
@@ -374,15 +387,13 @@ class UpdaterService:
             logger.info(msg)
 
             data_service = DataService(db)
-            failed = 0
+            if not quota_ok:
+                data_service.twelve_data.force_disabled = True
+            results, failed_symbols = data_service.update_historical_data_batch(symbols, days=365)
+            failed = len(failed_symbols)
             for symbol in symbols:
-                try:
-                    saved_hist = data_service.update_historical_data(symbol, days=365)
-                    if saved_hist == 0:
-                        _maybe_deactivate_dead_symbol(db, symbol)
-                except Exception as e:
-                    failed += 1
-                    logger.error(f"Historical update failed for {symbol}: {e}")
+                if symbol not in failed_symbols and results.get(symbol, 0) == 0:
+                    _maybe_deactivate_dead_symbol(db, symbol)
 
             data_service.update_dividends(symbols)
             logger.info(f"Daily historical update completed for {len(symbols)} symbols")
@@ -396,6 +407,9 @@ class UpdaterService:
         except Exception as e:
             detail = str(e)[:200]
             logger.error(f"Daily historical update failed: {e}")
+            # A dirty session here would leak partial writes into
+            # _record_run's commit.
+            db.rollback()
             return False
         finally:
             try:

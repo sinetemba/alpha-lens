@@ -18,6 +18,11 @@ class Stock(Base):
     description = Column(Text)
     website = Column(String(500))
     is_active = Column(Boolean, default=True)
+    # Set once a Yahoo get_info profile fetch has been attempted for this
+    # stock. Symbols whose profile has no sector (indexes like ^J203.JO,
+    # sector-less listings) would otherwise trigger a get_info call on every
+    # price save forever.
+    details_fetched_at = Column(DateTime)
     created_at = Column(DateTime, default=utcnow_naive)
     updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
 

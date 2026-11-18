@@ -36,33 +36,65 @@ class NewsScraper:
         logger.info("Starting news scraping from all sources")
 
         all_articles_data = self.rss_scraper.fetch_all_feeds()
-        saved_articles = []
 
+        # One query for every URL in the batch replaces a SELECT per article.
+        # `seen` also dedups inside the batch: the session runs with
+        # autoflush off, so a repeated URL (same story on two feeds) would
+        # otherwise pass the check and trip the unique index at commit.
+        urls = {a["url"] for a in all_articles_data if a.get("url")}
+        seen = (
+            {row[0] for row in self.db.query(NewsArticle.url).filter(
+                NewsArticle.url.in_(urls)
+            ).all()}
+            if urls else set()
+        )
+
+        articles = []
         for article_data in all_articles_data:
-            article = self._save_article(article_data)
+            article = self._build_article(article_data, seen)
             if article:
-                saved_articles.append(article)
+                seen.add(article_data["url"])
+                articles.append(article)
 
-        # One commit for the whole batch instead of a commit per article.
-        try:
-            self.db.commit()
-        except Exception as e:
-            logger.error(f"Error committing scraped articles: {e}")
-            self.db.rollback()
-            return []
-
+        saved_articles = self._commit_articles(articles) if articles else []
         logger.info(f"Scraped and saved {len(saved_articles)} new articles")
         return saved_articles
 
-    def _save_article(self, article_data: Dict) -> Optional[NewsArticle]:
-        """Save an article to the database if it doesn't already exist."""
-        try:
-            # Check if article already exists by URL
-            existing = self.db.query(NewsArticle).filter(
-                NewsArticle.url == article_data["url"]
-            ).first()
+    def _commit_articles(self, articles: List[NewsArticle]) -> List[NewsArticle]:
+        """Commit the batch; on failure fall back to per-article commits.
 
-            if existing:
+        One bad row must not discard the batch: a rollback-after-queue used
+        to drop every earlier article while they still counted as saved.
+        """
+        try:
+            self.db.add_all(articles)
+            self.db.commit()
+            return articles
+        except Exception as e:
+            logger.error(f"Batch article commit failed ({e}); retrying per-article")
+            self.db.rollback()
+
+        saved = []
+        for article in articles:
+            try:
+                self.db.add(article)
+                self.db.commit()
+                saved.append(article)
+            except Exception as e:
+                self.db.rollback()
+                logger.warning(f"Could not save article {article.url!r}: {e}")
+        return saved
+
+    def _build_article(
+        self, article_data: Dict, existing_urls: set
+    ) -> Optional[NewsArticle]:
+        """Construct a NewsArticle, or None when the URL is already known.
+
+        Never touches the session - a construction error must not roll back
+        work queued by this or earlier runs.
+        """
+        try:
+            if article_data["url"] in existing_urls:
                 return None
 
             # Extract stock symbol from title if possible
@@ -75,7 +107,7 @@ class NewsScraper:
             if published_at.tzinfo is not None:
                 published_at = published_at.astimezone(timezone.utc).replace(tzinfo=None)
 
-            article = NewsArticle(
+            return NewsArticle(
                 title=article_data["title"],
                 summary=article_data["summary"],
                 url=article_data["url"],
@@ -84,12 +116,8 @@ class NewsScraper:
                 stock_symbol=stock_symbol,
             )
 
-            self.db.add(article)
-            return article
-
         except Exception as e:
-            logger.error(f"Error saving article: {e}")
-            self.db.rollback()
+            logger.error(f"Error building article {article_data.get('url')!r}: {e}")
             return None
 
     def _extract_stock_symbol(self, text: str) -> Optional[str]:

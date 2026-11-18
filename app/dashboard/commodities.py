@@ -1,9 +1,9 @@
 import streamlit as st
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 from app.models.stock import Stock, StockPrice
 from app.dashboard.utils import format_stock_label, get_latest_market_data_timestamp, is_market_data_stale, render_last_fetch_caption
+from app.services.price_queries import get_latest_and_previous_prices
 from app.collectors.alpha_vantage import AlphaVantageCollector
 from app.collectors.metals_dev import MetalsDevCollector
 from loguru import logger
@@ -36,17 +36,28 @@ def show_commodities(db: Session):
     if not historical_collector.enabled:
         st.warning("Alpha Vantage API key is not configured. Set ALPHA_VANTAGE_API_KEY in .env to enable historical metal prices.")
 
+    # Feedback from the post-refresh rerun: messages rendered in the same
+    # run as st.rerun() are discarded before the user sees them.
+    flash = st.session_state.pop("commodities_refresh_flash", None)
+    if flash:
+        level, message = flash
+        getattr(st, level)(message)
+
     col1, col2 = st.columns([3, 1])
     with col2:
         if st.button("🔄 Refresh Prices"):
             with st.spinner("Fetching commodity data..."):
                 saved, failures = _refresh_commodity_prices(db)
             if failures:
-                st.warning(f"Refresh finished with {failures} failed source(s) - see logs for details.")
+                st.session_state["commodities_refresh_flash"] = (
+                    "warning", f"Refresh finished with {failures} failed source(s) - see logs for details."
+                )
             elif saved:
-                st.success(f"Prices refreshed ({saved} new data points saved).")
+                st.session_state["commodities_refresh_flash"] = (
+                    "success", f"Prices refreshed ({saved} new data points saved)."
+                )
             else:
-                st.info("No new commodity data fetched.")
+                st.session_state["commodities_refresh_flash"] = ("info", "No new commodity data fetched.")
             st.rerun()
 
     st.markdown("---")
@@ -99,22 +110,16 @@ def _save_latest_rates(db: Session, latest_rates: dict[str, float]) -> None:
     db.commit()
 
 
-def _get_previous_day_price(db: Session, symbol: str, latest_timestamp: datetime) -> Optional[StockPrice]:
-    """Get the most recent price for a symbol from a calendar day before `latest_timestamp`."""
-    latest_day_start = latest_timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
-    return db.query(StockPrice).filter(
-        StockPrice.symbol == symbol,
-        StockPrice.timestamp < latest_day_start,
-    ).order_by(StockPrice.timestamp.desc()).first()
-
-
 def _ensure_commodity_stocks(db: Session) -> None:
     """Ensure Yahoo Finance fallback symbols exist as Stock records."""
+    existing = {
+        row[0] for row in db.query(Stock.symbol).filter(
+            Stock.symbol.in_([yf for _, yf in COMMODITY_SYMBOLS.values()])
+        ).all()
+    }
     for api_symbol, (name, yf_symbol) in COMMODITY_SYMBOLS.items():
-        stock = db.query(Stock).filter(Stock.symbol == yf_symbol).first()
-        if not stock:
-            stock = Stock(symbol=yf_symbol, name=name)
-            db.add(stock)
+        if yf_symbol not in existing:
+            db.add(Stock(symbol=yf_symbol, name=name))
     db.commit()
 
 
@@ -203,69 +208,73 @@ def _save_historical_prices(db: Session, api_symbol: str, historical_prices: lis
     return saved
 
 
-def _load_cached_rates(db: Session) -> dict[str, float]:
-    """Reload the most recently persisted rate for each commodity from StockPrice."""
-    rates = {}
-    for api_symbol, (_, yf_symbol) in COMMODITY_SYMBOLS.items():
-        latest = db.query(StockPrice).filter(
-            StockPrice.symbol == yf_symbol
-        ).order_by(StockPrice.timestamp.desc()).first()
-        if latest:
-            rates[api_symbol] = latest.close_price
-    return rates
-
-
 def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
     """Render a summary table of current commodity prices."""
     st.subheader("Current Prices")
 
+    yf_symbols = [yf_symbol for _, yf_symbol in COMMODITY_SYMBOLS.values()]
+
+    fetch_attempted = False
     latest_rates = {}
     if api_collector.enabled:
-        yf_symbols = [yf_symbol for _, yf_symbol in COMMODITY_SYMBOLS.values()]
         latest_timestamp = get_latest_market_data_timestamp(db, yf_symbols)
         if is_market_data_stale(latest_timestamp):
+            fetch_attempted = True
             latest_rates = api_collector.get_latest_rates() or {}
             if latest_rates:
                 _save_latest_rates(db, latest_rates)
-        else:
-            # Reuse today's already-persisted snapshot instead of hitting the
-            # live API again on every page visit/navigation.
-            latest_rates = _load_cached_rates(db)
+
+    # Queried after any just-saved rates so `latest` reflects today's write.
+    # One batched lookup replaces a latest-bar query plus a previous-day
+    # query per commodity.
+    snapshots = get_latest_and_previous_prices(db, yf_symbols)
+
+    if api_collector.enabled and not fetch_attempted:
+        # Reuse today's already-persisted snapshot instead of hitting the
+        # live API again on every page visit/navigation.
+        for api_symbol, (_, yf_symbol) in COMMODITY_SYMBOLS.items():
+            latest, _ = snapshots.get(yf_symbol, (None, None))
+            if latest:
+                latest_rates[api_symbol] = latest.close_price
 
     latest_prices = []
     for api_symbol, (name, yf_symbol) in COMMODITY_SYMBOLS.items():
         api_rate = latest_rates.get(api_symbol)
-        latest_db = db.query(StockPrice).filter(
-            StockPrice.symbol == yf_symbol
-        ).order_by(StockPrice.timestamp.desc()).first()
+        latest_snap, prev_snap = snapshots.get(yf_symbol, (None, None))
 
-        price = api_rate if api_rate is not None else (latest_db.close_price if latest_db else None)
+        price = api_rate if api_rate is not None else (latest_snap.close_price if latest_snap else None)
         if price is None:
             continue
 
         # Compare against the last prior calendar day's stored price, whether
         # today's price came from the live Metals.dev rate or the DB fallback.
-        reference_timestamp = (
-            latest_db.timestamp if latest_db
-            else datetime.now(timezone.utc).replace(tzinfo=None)
-        )
-        prev_db = _get_previous_day_price(db, yf_symbol, reference_timestamp)
-
         change_pct = None
-        if prev_db and prev_db.close_price and prev_db.close_price > 0:
-            change_pct = ((price - prev_db.close_price) / prev_db.close_price) * 100
+        if prev_snap and prev_snap.close_price and prev_snap.close_price > 0:
+            change_pct = ((price - prev_snap.close_price) / prev_snap.close_price) * 100
 
         latest_prices.append({
             "Commodity": format_stock_label(api_symbol, name),
-            "Price": f"R {price:,.2f}/g" if api_rate is not None else f"$ {price:,.2f}",
-            "Change": f"{change_pct:+.2f}%" if change_pct is not None else "N/A",
-            "High": f"{latest_db.high_price:,.2f}" if api_rate is None and latest_db and latest_db.high_price else "N/A",
-            "Low": f"{latest_db.low_price:,.2f}" if api_rate is None and latest_db and latest_db.low_price else "N/A",
+            # Split price columns by unit - mixing "R x/g" and "$ x" strings
+            # in one column breaks numeric sorting.
+            "Price (ZAR/g)": price if api_rate is not None else None,
+            "Price (USD)": price if api_rate is None else None,
+            "Change %": change_pct,
+            "High": latest_snap.high_price if api_rate is None and latest_snap else None,
+            "Low": latest_snap.low_price if api_rate is None and latest_snap else None,
             "Source": "Metals.dev" if api_rate is not None else "Yahoo Finance",
         })
 
     if latest_prices:
-        st.dataframe(latest_prices, use_container_width=True)
+        st.dataframe(
+            latest_prices, use_container_width=True, hide_index=True,
+            column_config={
+                "Price (ZAR/g)": st.column_config.NumberColumn(format="R %.2f"),
+                "Price (USD)": st.column_config.NumberColumn(format="$ %.2f"),
+                "Change %": st.column_config.NumberColumn(format="%+.2f%%"),
+                "High": st.column_config.NumberColumn(format="%.2f"),
+                "Low": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
     else:
         st.info("No commodity price data available. Click Refresh Prices to fetch data.")
 

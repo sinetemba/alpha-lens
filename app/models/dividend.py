@@ -26,9 +26,11 @@ class Dividend(Base):
     # Relationships
     stock = relationship("Stock", back_populates="dividends")
 
-    # One dividend per (symbol, ex-date): dedup across providers.
+    # One dividend per (symbol, ex-date, amount): dedup across providers.
+    # The amount is part of the key because a special dividend can share an
+    # ex-date with an interim - a 2-column key silently dropped one of them.
     __table_args__ = (
-        Index('ix_dividends_symbol_ex_date', 'symbol', 'ex_dividend_date', unique=True),
+        Index('ix_dividends_symbol_ex_date', 'symbol', 'ex_dividend_date', 'amount', unique=True),
     )
 
     def __repr__(self):

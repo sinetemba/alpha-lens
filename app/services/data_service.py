@@ -1,9 +1,10 @@
 import pandas as pd
-from sqlalchemy import func
+from sqlalchemy import func, case
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from app.config.settings import settings
+from app.models.base import utcnow_naive
 from app.models.dividend import Dividend
 from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
@@ -498,7 +499,7 @@ class DataService:
             stock = Stock(symbol=symbol, name=get_company_name(symbol))
             self.db.add(stock)
             self.db.flush()
-        if not stock.sector:
+        if not stock.sector and stock.details_fetched_at is None:
             self._populate_stock_details(stock)
         return stock
 
@@ -506,14 +507,17 @@ class DataService:
         """Backfill sector/industry/cap/description from Yahoo's company profile.
 
         These columns were only seeded for the 10 built-in stocks, so Company
-        View showed blank metrics for everything else. Runs once per stock on
-        first sight (skipped once `sector` is set); failures are logged only -
-        a missing profile must never break a price save.
+        View showed blank metrics for everything else. Runs once per stock:
+        details_fetched_at is stamped whenever a profile comes back, even a
+        sector-less one (indexes, ETFs) - otherwise those symbols would pay a
+        get_info call on every price save forever. A failed/empty fetch leaves
+        it NULL so a transient outage retries next run.
         """
         try:
             info = self.yfinance.get_info(stock.symbol)
             if not isinstance(info, dict) or not info:
                 return
+            stock.details_fetched_at = utcnow_naive()
 
             def _str(value) -> Optional[str]:
                 return value if isinstance(value, str) and value else None
@@ -554,40 +558,72 @@ class DataService:
         if not records_by_ts:
             return 0
 
-        # Sanity-check the newest incoming close against stored data: a whole
-        # batch shifted by a ZAc/ZAR unit mismatch gets rescaled (or rejected)
-        # here rather than only caught on the next incremental save.
-        newest_ts = max(records_by_ts)
-        newest_close = self._to_float(records_by_ts[newest_ts].get("close"))
-        if newest_close is not None:
-            factor, prev_close = self._close_scale_factor(symbol, newest_ts, newest_close)
+        # Per-bar unit/implausibility check (was: newest close decided a
+        # batch-wide rescale-or-reject, which corrupted clean bars in mixed-
+        # unit frames and dropped good bars over one bad one). Each bar is
+        # compared to the previous reference close - the stored bar before
+        # the batch, then each accepted bar in order.
+        ordered = sorted(records_by_ts)
+        prev_stored = self.db.query(StockPrice.close_price, StockPrice.timestamp).filter(
+            StockPrice.symbol == symbol,
+            StockPrice.timestamp < ordered[0],
+        ).order_by(StockPrice.timestamp.desc()).first()
+        ref_close = prev_stored.close_price if prev_stored else None
+        ref_ts = prev_stored.timestamp if prev_stored else None
+
+        rejected_ts = set()
+        for ts in ordered:
+            record = records_by_ts[ts]
+            close = self._to_float(record.get("close"))
+            if close is None or close <= 0:
+                continue  # invalid closes are skipped in the insert loop
+            factor: Optional[float] = 1.0
+            if ref_close and ts - ref_ts <= timedelta(days=31):
+                if not self._ratio_ok(close, ref_close):
+                    factor = next(
+                        (f for f in (100.0, 0.01) if self._ratio_ok(close * f, ref_close)),
+                        None,
+                    )
             if factor is None:
-                # Same corroboration rule as the single-bar path: a crash or
-                # corporate action confirmed by the other provider is accepted,
-                # otherwise the batch is rejected and the user is notified.
-                corroborated = self._close_corroborated(symbol, newest_ts, newest_close, source)
-                if corroborated:
-                    logger.warning(
-                        f"{symbol} history @ {newest_ts:%Y-%m-%d}: close {newest_close} implausible "
-                        f"vs previous close {prev_close} but corroborated by alternate source - "
-                        "accepting (possible crash or corporate action)"
-                    )
-                    self._notify_bar_rejection(symbol, newest_ts, newest_close, prev_close, accepted=True)
-                    factor = 1.0
-                else:
-                    logger.warning(
-                        f"Rejecting {symbol} history @ {newest_ts:%Y-%m-%d}: close {newest_close} "
-                        f"implausible vs previous close {prev_close}"
-                    )
-                    self._notify_bar_rejection(symbol, newest_ts, newest_close, prev_close, accepted=False)
-                    return 0
+                rejected_ts.add(ts)
+                continue
             if factor != 1.0:
-                for record in records_by_ts.values():
-                    self._rescale_record(record, factor)
+                self._rescale_record(record, factor)
+                close = self._to_float(record.get("close"))
                 logger.warning(
-                    f"Rescaled {len(records_by_ts)} {symbol} bars x{factor}: "
-                    f"suspected unit mismatch vs previous close {prev_close}"
+                    f"Rescaled {symbol} @ {ts:%Y-%m-%d}: x{factor} "
+                    f"(close now {close}, reference {ref_close})"
                 )
+            ref_close, ref_ts = close, ts
+
+        if rejected_ts:
+            newest_bad = max(rejected_ts)
+            bad_close = self._to_float(records_by_ts[newest_bad].get("close"))
+            # Same corroboration rule as the single-bar path - but only a
+            # lone rejected bar can be a crash; sustained divergence across
+            # several bars is a unit/feed problem, not a market event.
+            corroborated = (
+                len(rejected_ts) == 1
+                and self._close_corroborated(symbol, newest_bad, bad_close, source)
+            )
+            if corroborated:
+                logger.warning(
+                    f"{symbol} @ {newest_bad:%Y-%m-%d}: close {bad_close} implausible "
+                    "but corroborated by alternate source - accepting "
+                    "(possible crash or corporate action)"
+                )
+                self._notify_bar_rejection(symbol, newest_bad, bad_close, ref_close, accepted=True)
+                rejected_ts.discard(newest_bad)
+            else:
+                logger.warning(
+                    f"Rejecting {len(rejected_ts)} {symbol} bar(s): implausible vs "
+                    f"reference closes (newest {newest_bad:%Y-%m-%d} close {bad_close})"
+                )
+                self._notify_bar_rejection(symbol, newest_bad, bad_close, ref_close, accepted=False)
+                for ts in rejected_ts:
+                    del records_by_ts[ts]
+                if not records_by_ts:
+                    return 0
 
         # Only query the timestamps we are about to write.
         existing_rows = self.db.query(StockPrice).filter(
@@ -686,15 +722,18 @@ class DataService:
             logger.error(f"Error updating technical indicators for {symbol}: {e}")
             self.db.rollback()
 
-    def _existing_dividends_by_day(self, symbol: str) -> dict:
-        """Return {date: Dividend} for the symbol's stored dividends.
+    def _existing_dividends_by_key(self, symbol: str) -> dict:
+        """Return {(ex-date, amount): Dividend} for the symbol's stored dividends.
 
-        Dedup is by calendar day, not exact timestamp: providers disagree on
-        the time-of-day component (midnight vs exchange-open), which let the
-        same dividend be stored twice under different times.
+        Dedup is by calendar day + amount: providers disagree on the
+        time-of-day component, and a special dividend can share an ex-date
+        with an interim - day-only dedup silently dropped one of them.
         """
         rows = self.db.query(Dividend).filter(Dividend.symbol == symbol).all()
-        return {r.ex_dividend_date.date(): r for r in rows if r.ex_dividend_date}
+        return {
+            (r.ex_dividend_date.date(), round(r.amount or 0.0, 6)): r
+            for r in rows if r.ex_dividend_date
+        }
 
     def _price_closes(self, symbol: str) -> list:
         """(timestamp, close) pairs for a symbol, ascending - loaded once per symbol."""
@@ -760,7 +799,8 @@ class DataService:
                         self.db.add(stock)
                         self.db.flush()
 
-                    existing_by_day = self._existing_dividends_by_day(symbol)
+                    existing_by_key = self._existing_dividends_by_key(symbol)
+                    closes = self._price_closes(symbol)
 
                     for record in td_dividends:
                         ex_date_str = record.get("ex_date")
@@ -773,8 +813,14 @@ class DataService:
                             return datetime.strptime(value, "%Y-%m-%d") if value else None
 
                         ex_date = datetime.strptime(ex_date_str, "%Y-%m-%d")
+                        # Twelve Data can report ZAc where Rand was expected -
+                        # same rescale rule as the Yahoo path.
+                        amount_rand = self._dividend_amount_rand(
+                            symbol, float(amount), self._close_near(closes, ex_date)
+                        )
+                        key = (ex_date.date(), round(amount_rand, 6))
 
-                        existing = existing_by_day.get(ex_date.date())
+                        existing = existing_by_key.get(key)
                         if existing:
                             if _parse_date("payment_date") and not existing.payment_date:
                                 existing.payment_date = _parse_date("payment_date")
@@ -784,10 +830,17 @@ class DataService:
                                 existing.declaration_date = _parse_date("declaration_date")
                             continue
 
+                        if any(day == ex_date.date() for day, _ in existing_by_key):
+                            logger.info(
+                                f"{symbol}: storing additional same-day dividend "
+                                f"R {amount_rand:.2f} on {ex_date:%Y-%m-%d} "
+                                "(special/other payment sharing an ex-date)"
+                            )
+
                         dividend = Dividend(
                             stock_id=stock.id,
                             symbol=symbol,
-                            amount=float(amount),
+                            amount=amount_rand,
                             currency="ZAR",
                             ex_dividend_date=ex_date,
                             payment_date=_parse_date("payment_date"),
@@ -795,7 +848,7 @@ class DataService:
                             declaration_date=_parse_date("declaration_date"),
                         )
                         self.db.add(dividend)
-                        existing_by_day[ex_date.date()] = dividend
+                        existing_by_key[key] = dividend
                         saved += 1
 
                     continue
@@ -811,7 +864,7 @@ class DataService:
                     self.db.add(stock)
                     self.db.flush()
 
-                existing_by_day = self._existing_dividends_by_day(symbol)
+                existing_by_key = self._existing_dividends_by_key(symbol)
                 closes = self._price_closes(symbol)
 
                 for date, amount in dividends.items():
@@ -819,20 +872,28 @@ class DataService:
                     # yfinance returns tz-aware exchange-local timestamps; store the
                     # ex-date as naive midnight so dedup matches the Twelve Data path.
                     ex_date = datetime(ex_date.year, ex_date.month, ex_date.day)
-                    if ex_date.date() in existing_by_day:
+                    amount_rand = self._dividend_amount_rand(
+                        symbol, float(amount), self._close_near(closes, ex_date)
+                    )
+                    key = (ex_date.date(), round(amount_rand, 6))
+                    if key in existing_by_key:
                         continue
+                    if any(day == ex_date.date() for day, _ in existing_by_key):
+                        logger.info(
+                            f"{symbol}: storing additional same-day dividend "
+                            f"R {amount_rand:.2f} on {ex_date:%Y-%m-%d} "
+                            "(special/other payment sharing an ex-date)"
+                        )
 
                     dividend = Dividend(
                         stock_id=stock.id,
                         symbol=symbol,
-                        amount=self._dividend_amount_rand(
-                            symbol, float(amount), self._close_near(closes, ex_date)
-                        ),
+                        amount=amount_rand,
                         currency="ZAR",
                         ex_dividend_date=ex_date,
                     )
                     self.db.add(dividend)
-                    existing_by_day[ex_date.date()] = dividend
+                    existing_by_key[key] = dividend
                     saved += 1
 
             except Exception as e:
@@ -946,7 +1007,130 @@ class DataService:
 
         logger.error(f"Failed to get historical data for {symbol}")
         return 0
-    
+
+    def update_historical_data_batch(
+        self, symbols: List[str], days: int = 365
+    ) -> tuple[Dict[str, int], List[str]]:
+        """Update historical data for many symbols in one pass.
+
+        Same incremental/backfill logic as update_historical_data, but the
+        per-symbol stats come from a single grouped query and every symbol
+        that falls through to Yahoo is covered by one batched yf.download
+        instead of a serial request each. Twelve Data's history endpoint is
+        per-symbol, so it is still tried first per symbol (a cheap no-op when
+        disabled).
+
+        Returns ({symbol: new_bars_saved}, failed_symbols).
+        """
+        if not symbols:
+            return {}, []
+
+        end_date = datetime.now(timezone.utc)
+        end_naive = end_date.replace(tzinfo=None)
+        window_start = end_naive - timedelta(days=days)
+
+        # One grouped query replaces the two per-symbol queries
+        # update_historical_data runs (latest bar, in-window bar count).
+        stats = {}
+        for symbol, latest, bars_in_window in self.db.query(
+            StockPrice.symbol,
+            func.max(StockPrice.timestamp),
+            func.sum(case((StockPrice.timestamp >= window_start, 1), else_=0)),
+        ).filter(StockPrice.symbol.in_(symbols)).group_by(StockPrice.symbol).all():
+            stats[symbol] = (latest, bars_in_window or 0)
+
+        # Decide per symbol whether it needs a full backfill or just the
+        # ~7-day tail (same rules as the single-symbol path).
+        expected_bars = days * 5 / 7
+        plans = {}  # symbol -> (start_date, backfill)
+        for symbol in symbols:
+            latest_stored, bars_in_window = stats.get(symbol, (None, 0))
+            backfill = (
+                latest_stored is None
+                or latest_stored < window_start
+                or bars_in_window < expected_bars * 0.5
+            )
+            start = window_start if backfill else latest_stored - timedelta(days=7)
+            plans[symbol] = (start, backfill)
+
+        results: Dict[str, int] = {}
+        failed: List[str] = []
+        yahoo_needed: Dict[str, tuple] = {}
+
+        # Twelve Data first, per symbol - its history endpoint takes one
+        # symbol per request anyway.
+        for symbol, (start, backfill) in plans.items():
+            outputsize = min(days, max((end_naive - start).days, 10))
+            try:
+                historical = self.twelve_data.get_historical_data(
+                    symbol,
+                    start_date=start.strftime("%Y-%m-%d"),
+                    end_date=end_date.strftime("%Y-%m-%d"),
+                    outputsize=outputsize,
+                )
+            except Exception as e:
+                historical = None
+                logger.error(f"Twelve Data history failed for {symbol}: {e}")
+
+            if not historical:
+                yahoo_needed[symbol] = (start, backfill)
+                continue
+            try:
+                saved = self._save_historical_data(symbol, historical)
+                logger.info(f"Saved {saved} historical data points for {symbol} from Twelve Data")
+                self._update_technical_indicators(symbol, full=backfill, tail=saved + 1)
+                self.db.commit()
+                results[symbol] = saved
+            except Exception as e:
+                failed.append(symbol)
+                logger.error(f"Historical update failed for {symbol}: {e}")
+                self.db.rollback()
+
+        if yahoo_needed:
+            # One download from the earliest needed date; each symbol then
+            # slices its own frame to its own window.
+            min_start = min(start for start, _ in yahoo_needed.values())
+            frames = self.yfinance.get_history_batch(
+                list(yahoo_needed),
+                start_date=min_start.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d"),
+            )
+            for symbol, (start, backfill) in yahoo_needed.items():
+                try:
+                    frame = frames.get(symbol)
+                    if frame is None or frame.empty:
+                        results[symbol] = 0
+                        logger.error(f"Failed to get historical data for {symbol}")
+                        continue
+                    records = []
+                    for index, row in frame.iterrows():
+                        timestamp = self._bar_date_timestamp(index.to_pydatetime())
+                        # Yahoo's window is day-granular while `start` may
+                        # carry a time-of-day - compare dates, not times.
+                        if timestamp.date() < start.date():
+                            continue
+                        records.append({
+                            "timestamp": timestamp,
+                            "open": row.get("Open"),
+                            "high": row.get("High"),
+                            "low": row.get("Low"),
+                            "close": row.get("Close"),
+                            # Absent with auto_adjust=True - falls back to close.
+                            "adjusted_close": row.get("Adj Close"),
+                            "volume": row.get("Volume"),
+                        })
+                    saved = self._bulk_save_stock_prices(symbol, records)
+                    logger.info(f"Saved {saved} historical data points for {symbol} from Yahoo Finance")
+                    self._update_technical_indicators(symbol, full=backfill, tail=saved + 1)
+                    self.db.commit()
+                    results[symbol] = saved
+                except Exception as e:
+                    failed.append(symbol)
+                    logger.error(f"Historical update failed for {symbol}: {e}")
+                    self.db.rollback()
+
+        return results, failed
+
     def _save_historical_data(self, symbol: str, data: List[Dict]) -> int:
         """Save historical data points from Twelve Data in bulk."""
         records = []
