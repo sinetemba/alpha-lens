@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     moneyweb_username: str = Field(default="", alias="MONEYWEB_USERNAME")
     moneyweb_password: str = Field(default="", alias="MONEYWEB_PASSWORD")
 
+    # Luno (crypto holdings sync). Same variable names as the luno-mcp server,
+    # so one key pair serves both. Use a read-only key (balances only).
+    luno_api_key_id: str = Field(default="", alias="LUNO_API_KEY_ID")
+    luno_api_secret: str = Field(default="", alias="LUNO_API_SECRET")
+
     # Financial Modeling Prep API
     fmp_api_key: str = Field(default="", alias="FMP_API_KEY")
     fmp_base_url: str = Field(default="https://financialmodelingprep.com/api/v3", alias="FMP_BASE_URL")

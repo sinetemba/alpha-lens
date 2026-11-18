@@ -201,6 +201,8 @@ def _render_data_sources():
          else "— Off (TWELVE_DATA_ENABLED)"},
         {"Source": "EasyEquities", "Used for": "Portfolio sync",
          "Status": _yes_no(bool(settings.easyequities_username and settings.easyequities_password))},
+        {"Source": "Luno", "Used for": "Crypto holdings sync + ZAR prices",
+         "Status": _yes_no(bool(settings.luno_api_key_id and settings.luno_api_secret))},
         {"Source": "Moneyweb", "Used for": "Top movers, dividend watch",
          "Status": _yes_no(bool(settings.moneyweb_username and settings.moneyweb_password))},
     ]
