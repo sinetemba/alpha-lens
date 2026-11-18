@@ -72,11 +72,12 @@ class DataService:
         """
         logger.info("Starting stock price update")
 
-        # Twelve Data's quote endpoint accepts up to 10 symbols per request, so
-        # a few batched calls replace one throttled call per symbol.
+        # Batched quotes cost one credit per symbol, so each batch is capped at
+        # the per-minute credit limit (a 10-symbol batch overshoots 8/min).
         quotes: Dict[str, Dict] = {}
-        for i in range(0, len(symbols), 10):
-            chunk = symbols[i:i + 10]
+        batch = self.twelve_data.max_batch_size()
+        for i in range(0, len(symbols) if self.twelve_data.enabled else 0, batch):
+            chunk = symbols[i:i + batch]
             try:
                 quotes.update(self.twelve_data.get_multiple_quotes(chunk))
             except Exception as e:

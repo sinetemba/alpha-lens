@@ -130,7 +130,8 @@ def test_save_historical_data_refreshes_existing_bars(db_session):
 def test_update_stock_prices_uses_batch_endpoints(db_session, monkeypatch):
     """update_stock_prices should batch Twelve Data quotes and batch the Yahoo fallback."""
     data_service = DataService(db_session)
-    data_service.twelve_data = MagicMock()
+    data_service.twelve_data = MagicMock(enabled=True)
+    data_service.twelve_data.max_batch_size.return_value = 8
     data_service.yfinance = MagicMock()
 
     quote = {"timestamp": "2024-01-15 10:00:00", "close": "102.5", "mic_code": "XJSE"}
@@ -140,8 +141,8 @@ def test_update_stock_prices_uses_batch_endpoints(db_session, monkeypatch):
     symbols = [f"S{i}" for i in range(25)] + ["NPN"]
     updated = data_service.update_stock_prices(symbols)
 
-    # 26 symbols -> 3 batched quote calls (10/10/6), not 26 per-symbol calls.
-    assert data_service.twelve_data.get_multiple_quotes.call_count == 3
+    # 26 symbols -> 4 batches capped at the per-minute credit limit (8/8/8/2).
+    assert data_service.twelve_data.get_multiple_quotes.call_count == 4
     # Yahoo batch fallback called once with the unresolved symbols.
     data_service.yfinance.get_latest_bars.assert_called_once()
     assert updated == 1
@@ -237,3 +238,16 @@ def test_bulk_save_ignores_zero_prices_and_heals_adjusted_close(db_session):
     assert rows[10].close_price == pytest.approx(1.6)
     assert rows[10].adjusted_close == pytest.approx(1.6)
     assert rows[11].adjusted_close == pytest.approx(1.62)
+
+
+def test_update_stock_prices_skips_disabled_twelve_data(db_session):
+    data_service = DataService(db_session)
+    data_service.twelve_data = MagicMock(enabled=False)
+    data_service.twelve_data.max_batch_size.return_value = 8
+    data_service.yfinance = MagicMock()
+    data_service.yfinance.get_latest_bars.return_value = {}
+
+    data_service.update_stock_prices(["NPN", "SOL"])
+
+    data_service.twelve_data.get_multiple_quotes.assert_not_called()
+    data_service.yfinance.get_latest_bars.assert_called_once_with(["NPN", "SOL"])

@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # Twelve Data API
     twelve_data_api_key: str = Field(default="", alias="TWELVE_DATA_API_KEY")
     twelve_data_base_url: str = Field(default="https://api.twelvedata.com", alias="TWELVE_DATA_BASE_URL")
+    # The free plan serves no JSE symbols (Pro plan required) - false skips
+    # Twelve Data entirely and uses Yahoo Finance directly.
+    twelve_data_enabled: bool = Field(default=True, alias="TWELVE_DATA_ENABLED")
 
     # Yahoo Finance
     yfinance_enabled: bool = Field(default=True, alias="YFINANCE_ENABLED")

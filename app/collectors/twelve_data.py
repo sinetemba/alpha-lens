@@ -14,11 +14,15 @@ from loguru import logger
 
 JSE_MIC_CODE = "XJSE"
 
-# Twelve Data's "basic" (free) plan caps requests both per-minute and per-day.
+# Twelve Data's "basic" (free) plan caps API *credits* both per-minute and
+# per-day. A request costs one credit per symbol - a 10-symbol batch quote is
+# 10 credits, so it overshoots an 8/min cap by itself and is rejected (429).
 # These are self-imposed defaults matching that plan; the per-minute figure is
 # refined at runtime from the API's own 429 message in case the account differs.
 DEFAULT_REQUESTS_PER_MINUTE = 8
 DEFAULT_REQUESTS_PER_DAY = 800
+# The quote endpoint's own per-request symbol cap.
+MAX_QUOTE_BATCH = 10
 
 _MINUTE_LIMIT_RE = re.compile(r"current limit being (\d+)")
 
@@ -49,8 +53,19 @@ class TwelveDataCollector:
         self.api_key = settings.twelve_data_api_key
         self.base_url = settings.twelve_data_base_url
 
-        if not self.api_key:
+        if settings.twelve_data_enabled and not self.api_key:
             logger.warning("Twelve Data API key not configured. Collector will not function.")
+
+    @property
+    def enabled(self) -> bool:
+        """False when switched off (TWELVE_DATA_ENABLED=false) or keyless."""
+        return settings.twelve_data_enabled and bool(self.api_key)
+
+    @classmethod
+    def max_batch_size(cls) -> int:
+        """Largest quote batch that fits in one minute's credits."""
+        with cls._lock:
+            return max(1, min(MAX_QUOTE_BATCH, cls._minute_limit))
 
     @classmethod
     def _reset_daily_count_if_new_day(cls) -> None:
@@ -106,11 +121,11 @@ class TwelveDataCollector:
         return None
 
     @classmethod
-    def _throttle(cls) -> bool:
-        """Pace requests to stay under the per-minute cap, sleeping if needed.
+    def _throttle(cls, credits: int = 1) -> bool:
+        """Reserve `credits` API credits, sleeping to stay under the per-minute cap.
 
         Returns False without sleeping or making a request if today's daily cap
-        is already exhausted - the caller should skip the request entirely.
+        can't cover the request - the caller should skip it entirely.
 
         The sleep happens outside _lock: holding it while sleeping would block
         every other thread that touches the collector - including Streamlit UI
@@ -119,20 +134,25 @@ class TwelveDataCollector:
         while True:
             with cls._lock:
                 cls._reset_daily_count_if_new_day()
-                if cls._daily_count >= cls._daily_limit:
+                if cls._daily_count + credits > cls._daily_limit:
                     return False
 
                 now = time.monotonic()
                 while cls._request_times and now - cls._request_times[0] >= 60:
                     cls._request_times.popleft()
 
-                if len(cls._request_times) < cls._minute_limit:
-                    cls._request_times.append(now)
-                    cls._daily_count += 1
+                # One window entry per credit. A request larger than the whole
+                # minute cap could never fit, so it only waits for an empty window.
+                needed = min(credits, cls._minute_limit)
+                if len(cls._request_times) + needed <= cls._minute_limit:
+                    cls._request_times.extend([now] * credits)
+                    cls._daily_count += credits
                     cls._persist_daily_state()
                     return True
 
-                wait = 60 - (now - cls._request_times[0]) + 0.1
+                # Wait until enough of the oldest entries age out of the window.
+                release_at = cls._request_times[len(cls._request_times) + needed - cls._minute_limit - 1]
+                wait = 60 - (now - release_at) + 0.1
 
             if wait > 0:
                 logger.info(f"Twelve Data per-minute limit reached, waiting {wait:.1f}s")
@@ -187,25 +207,28 @@ class TwelveDataCollector:
 
         logger.warning(f"Twelve Data rate limit hit: {message or 'HTTP 429'}")
 
-    def _make_request(self, endpoint: str, params: Dict) -> Optional[Dict]:
-        """Make a request to the Twelve Data API."""
+    def _make_request(self, endpoint: str, params: Dict, credits: int = 1) -> Optional[Dict]:
+        """Make a request to the Twelve Data API, costing `credits` per attempt."""
+        if not settings.twelve_data_enabled:
+            return None
         if not self.api_key:
             logger.error("Twelve Data API key not configured")
-            return None
-
-        if not self._throttle():
-            if not self.__class__._quota_exhausted_logged:
-                logger.warning(
-                    f"Twelve Data daily quota ({self._daily_limit} requests) reached - "
-                    "skipping remaining Twelve Data calls until tomorrow."
-                )
-                self.__class__._quota_exhausted_logged = True
             return None
 
         params["apikey"] = self.api_key
 
         response = None
         for attempt in range(3):
+            # Every attempt - retries included - reaches the API and is billed,
+            # so each one is paced and counted.
+            if not self._throttle(credits):
+                if not self.__class__._quota_exhausted_logged:
+                    logger.warning(
+                        f"Twelve Data daily quota ({self._daily_limit} credits) reached - "
+                        "skipping remaining Twelve Data calls until tomorrow."
+                    )
+                    self.__class__._quota_exhausted_logged = True
+                return None
             try:
                 response = requests.get(
                     f"{self.base_url}/{endpoint}", params=params, timeout=30
@@ -436,20 +459,21 @@ class TwelveDataCollector:
         return None
 
     def get_multiple_quotes(self, symbols: List[str]) -> Dict[str, Dict]:
-        """Get quotes for up to 10 symbols in one request, keyed by symbol.
+        """Get quotes for up to `max_batch_size()` symbols in one request, keyed by symbol.
 
         Applies the same JSE exchange check as get_quote to each returned quote.
         """
         if not symbols:
             return {}
-        if len(symbols) > 10:
+        limit = self.max_batch_size()
+        if len(symbols) > limit:
             logger.warning(
                 f"get_multiple_quotes called with {len(symbols)} symbols; "
-                f"dropping {symbols[10:]} - chunk the call site instead"
+                f"dropping {symbols[limit:]} - chunk the call site instead"
             )
-            symbols = symbols[:10]
+            symbols = symbols[:limit]
 
-        data = self._make_request("quote", {"symbol": ",".join(symbols)})
+        data = self._make_request("quote", {"symbol": ",".join(symbols)}, credits=len(symbols))
         if not data:
             return {}
 

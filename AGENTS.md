@@ -34,6 +34,7 @@ Context for anyone working on this repository in the future.
 - No Alembic. `init_database()` runs `create_all` (new tables) then `_migrate_schema()` in `app/database/init_db.py`; any column/index added to an existing model needs an idempotent inspect-then-`ALTER` step there, with SQL valid on both SQLite and PostgreSQL.
 - `app/services/backup.py`: the daemon's 60s loop calls `_backup_if_due()` - backs up when the newest file in `data/backups/` is >7 days old (survives sleep, unlike a cron slot), keeps 8, records `database_backup` in `updater_runs`. `run_updater.py --backup` forces one. Take one before any bulk data repair.
 - `scripts/check_stored_prices.py [--all]` - read-only stored-vs-Yahoo close check. As of 2026-11-18 every tracked symbol Yahoo carries agrees; SKA (R0.0085), BAT and AXX were verified correct (backlog #5 was wrong).
+- `scripts/sync_easyequities.py` - headless EasyEquities holdings sync (same code path as the Portfolio page; it was `_sync_holdings.py` in the repo root).
 
 ## Windows headless updater
 
@@ -62,9 +63,9 @@ python scripts\run_updater.py --logon
 
 ## API rate limits
 
-- **Twelve Data** free tier: 8 requests/minute, 800/day.
+- **Twelve Data** free tier: 8 credits/minute, 800/day. A request costs **one credit per symbol** - a 10-symbol batch quote is 10 credits and is rejected outright on the free tier. Quote batches are capped at the per-minute limit (`max_batch_size()`), and every attempt including retries is throttled and counted.
 - The app throttles automatically and falls back to **Yahoo Finance** for prices, history, and dividends.
-- Many JSE symbols are not on the free Twelve Data plan, so expect to see 400/403/wrong-exchange warnings and Yahoo fallback logs.
+- **The free plan serves no JSE symbols** (checked 2026-11-18: SOL/AXX need the Pro plan, NPK resolves to NYSE). In the whole log history every price/history/dividend came from Yahoo. `TWELVE_DATA_ENABLED=false` skips Twelve Data entirely (no requests, no quota caption); the cost of leaving it on is 429 noise and ~12 min of rate-limit sleeping per daily historical run. With it off, `_close_corroborated` has no second source, so implausible moves are always rejected (same as before in practice).
 
 ## Common commands
 
@@ -160,14 +161,15 @@ The `strftime('%Y-%m-%d', timestamp)` function is SQLite-only. For PostgreSQL, u
 - Alert Notification rows are created on every check run regardless of `notification_enabled` (the dashboard page is an in-app channel); only external delivery via Apprise is gated on the setting.
 - `get_latest_and_previous_prices` (`services/price_queries.py`) scopes its window CTE to 92 days back from each symbol's own latest bar — don't widen it without a reason; symbols suspended longer than that simply get no previous-day snapshot.
 - `_ensure_stock` backfills sector/industry/market_cap/shares/description/website from Yahoo `get_info` once per stock (skipped once `sector` is set) — new stocks get fundamentals for free.
-- RSI/ATR use Wilder smoothing (`ewm(alpha=1/n)`). Rows stored before 2026-11-18 still hold SMA-based values until recomputed — see improvement.md "still open" #7 for the optional normalisation pass.
+- RSI/ATR use Wilder smoothing (`ewm(alpha=1/n)`). All stored history was recomputed (`full=True`) on 2026-11-18, so it is uniformly Wilder. Commodity snapshot series (`AV_*`, `XAU_*`) are close-only, so high/low indicators (ADX etc.) log a calculation error for them - expected.
 - USD-account portfolio holdings (`is_jse_tracked_account` == False) are never priced/valued from JSE bars — `_update_holding_values` and Home's metrics only apply stored JSE closes to JSE-tracked accounts; EE-synced USD values pass through untouched. Holdings priced from `account_type` appear in Rand totals everywhere.
 - `PortfolioHolding.account_type == "Manual"` marks dashboard-added holdings — EasyEquities reconciliation deletes any holding under an EE-reported account type that EE stops reporting, so manual rows must never carry a real EE account name or the next sync deletes them.
 - When a JSE price lookup finds no stored bar, holdings keep their last-known (EE-synced) values — never null fields on a missing fetch.
 - The updater writes a heartbeat row to the `updater_runs` table on every job completion (`_record_run`). The dashboard's `render_updater_status_banner` (rendered via `render_last_fetch_caption` on data pages + directly on Home/Notifications) warns when the last `price_news_update` run failed or is >20h old.
 - The Twelve Data daily counter is shared across processes via `data/.twelve_data_usage`; `format_twelve_data_quota()` (utils.py) renders it as `Twelve Data today: N/800` inside `render_market_data_refresh_control` captions.
-- `run_updater.py --price-news|--full|--logon` exits non-zero when a run fails — Task Scheduler will show failure.
+- `run_updater.py --price-news|--full|--logon|--backup` exits non-zero when a run fails — Task Scheduler will show failure.
 - The daemon checks market-data freshness every 60s and runs a catch-up update when the last fetch is >4h old (covers jobs misfired while the machine slept — APScheduler drops those past `misfire_grace_time`). Catch-up retries no more than once per 30min and can't overlap a scheduled run (`_job_lock`).
+- The 18:00 historical job also misfires whenever the machine sleeps through 18:00 - before 2026-11-18 it had silently not run for 6 days (no history, dividends or dead-symbol deactivation). `_historical_catch_up_if_due()` in the same 60s loop runs it when no *successful* `daily_historical` heartbeat is newer than 26h (retry at most hourly); `_historical_lock` stops cron and catch-up overlapping.
 - APScheduler's own logging (misfires, job errors) is routed into `updater.log` via a stdlib→loguru handler in `setup()`.
 
 - Bullion products on the Krugerrands page are valued by `fine_oz_per_unit` from `PRODUCT_CATALOG` (fine troy ounces per item) — value = fine_oz x metal spot/oz, which prices 22k coins, .9999 gold bars and .999 silver uniformly. Holdings are stored in `krugerrand_holdings` with the fine-oz content denormalised, so catalogue edits never corrupt recorded purchases.

@@ -5,7 +5,13 @@ from app.models.krugerrand import KrugerrandHolding
 from app.models.stock import Stock, StockPrice
 from app.collectors.alpha_vantage import AlphaVantageCollector
 from app.collectors.gold_api import GoldAPICollector
-from app.dashboard.utils import get_latest_market_data_timestamp, is_market_data_stale, render_last_fetch_caption
+from app.dashboard.utils import (
+    get_latest_market_data_timestamp,
+    holding_totals,
+    is_market_data_stale,
+    render_holding_totals,
+    render_last_fetch_caption,
+)
 from loguru import logger
 
 
@@ -311,6 +317,18 @@ def _render_krugerrand_calculator(gold_zar: float, silver_zar: float):
         st.metric(f"Total ({quantity:g} × {size_label})", f"R {per_unit_retail * quantity:,.2f}")
 
 
+def _holding_valuation(holding: KrugerrandHolding, spots: dict) -> tuple:
+    """(cost, current_value) in ZAR; None where unknown (no price paid / no spot).
+
+    Valued from the fine-oz content stored on the row, so catalogue edits
+    never change what a recorded purchase is worth.
+    """
+    cost = holding.purchase_price * holding.quantity if holding.purchase_price else None
+    spot = spots.get(holding.metal) or 0.0
+    current_value = holding.fine_oz_per_unit * holding.quantity * spot if spot > 0 else None
+    return cost, current_value
+
+
 def _render_holdings(db: Session, gold_zar: float, silver_zar: float):
     """Persistent record of purchased bullion with live valuation."""
     st.subheader("My Holdings")
@@ -325,17 +343,11 @@ def _render_holdings(db: Session, gold_zar: float, silver_zar: float):
 
     if holdings:
         rows = []
-        total_cost = total_value = 0.0
-        has_cost = False
+        valued = []
         for h in holdings:
-            spot = spots.get(h.metal) or 0.0
-            current_value = h.fine_oz_per_unit * h.quantity * spot if spot > 0 else None
-            cost = (h.purchase_price or 0.0) * h.quantity
-            has_cost = has_cost or cost > 0
-            total_cost += cost
-            if current_value is not None:
-                total_value += current_value
-            gain = (current_value - cost) if current_value is not None and cost > 0 else None
+            cost, current_value = _holding_valuation(h, spots)
+            valued.append((cost, current_value))
+            gain = (current_value - cost) if current_value is not None and cost else None
             rows.append({
                 "Product": PRODUCT_CATALOG.get(h.product, {}).get("name", h.product),
                 "Size": h.label,
@@ -348,18 +360,7 @@ def _render_holdings(db: Session, gold_zar: float, silver_zar: float):
                 "Purchased": h.purchase_date.strftime("%Y-%m-%d") if h.purchase_date else "-",
             })
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Total cost", f"R {total_cost:,.2f}" if has_cost else "N/A")
-        with c2:
-            st.metric("Current value", f"R {total_value:,.2f}" if total_value else "N/A")
-        with c3:
-            if has_cost and total_value:
-                gain = total_value - total_cost
-                st.metric("Gain/Loss", f"R {gain:+,.2f}", delta=f"{gain / total_cost * 100:+.1f}%")
-            else:
-                st.metric("Gain/Loss", "N/A")
-
+        render_holding_totals(holding_totals(valued))
         st.dataframe(rows, use_container_width=True, hide_index=True)
     else:
         st.info("No bullion recorded yet - log a purchase below.")

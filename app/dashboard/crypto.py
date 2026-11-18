@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from app.collectors.coingecko import CoinGeckoCollector
+from app.dashboard.utils import holding_totals, render_holding_totals
 from app.models.crypto import CryptoHolding
 
 # CoinGecko ids for the popular-coins picker. Anything else can be added by
@@ -65,26 +66,27 @@ def _search_coin(query: str) -> list:
     return CoinGeckoCollector().search(query)
 
 
+def _holding_valuation(holding: CryptoHolding, price: Optional[float]) -> tuple:
+    """(cost, current_value) in ZAR; None where unknown (no price paid / no quote)."""
+    cost = holding.purchase_price * holding.quantity if holding.purchase_price else None
+    current_value = price * holding.quantity if price else None
+    return cost, current_value
+
+
 def _render_holdings(db: Session, holdings: list, markets: dict):
     """Holdings table with live valuation plus add/remove flows."""
     st.subheader("My Holdings")
 
     if holdings:
         rows = []
-        total_cost = total_value = 0.0
-        has_cost = has_value = False
+        valued = []
         for h in holdings:
             market = markets.get(h.coin_id) or {}
             price = market.get("current_price")
             change_24h = market.get("price_change_percentage_24h")
-            current_value = price * h.quantity if price else None
-            cost = (h.purchase_price or 0.0) * h.quantity
-            has_cost = has_cost or cost > 0
-            total_cost += cost
-            if current_value is not None:
-                has_value = True
-                total_value += current_value
-            gain = (current_value - cost) if current_value is not None and cost > 0 else None
+            cost, current_value = _holding_valuation(h, price)
+            valued.append((cost, current_value))
+            gain = (current_value - cost) if current_value is not None and cost else None
             rows.append({
                 "Coin": f"{h.symbol} — {h.name or h.coin_id}",
                 "Qty": f"{h.quantity:g}",
@@ -98,18 +100,7 @@ def _render_holdings(db: Session, holdings: list, markets: dict):
                 "Purchased": h.purchase_date.strftime("%Y-%m-%d") if h.purchase_date else "-",
             })
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Total cost", f"R {total_cost:,.2f}" if has_cost else "N/A")
-        with c2:
-            st.metric("Current value", f"R {total_value:,.2f}" if has_value else "N/A")
-        with c3:
-            if has_cost and has_value:
-                gain = total_value - total_cost
-                st.metric("Gain/Loss", f"R {gain:+,.2f}", delta=f"{gain / total_cost * 100:+.1f}%")
-            else:
-                st.metric("Gain/Loss", "N/A")
-
+        render_holding_totals(holding_totals(valued))
         st.dataframe(rows, use_container_width=True, hide_index=True)
     else:
         st.info("No crypto holdings yet - record a purchase below.")

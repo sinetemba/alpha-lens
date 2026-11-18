@@ -7,7 +7,8 @@ Scheduler or a Windows Service wrapper.
 
 Schedule defaults (all Africa/Johannesburg):
 - 09:00, 13:00, 17:00 : stock prices + news
-- 18:00 daily          : historical prices
+- 18:00 daily          : historical prices + dividends (made up from the
+                         heartbeat if missed while the machine slept)
 - Sunday 02:00         : clean old news
 - every 7 days         : database backup (checked each minute, so a sleeping
                          machine catches up on wake - see services/backup.py)
@@ -161,8 +162,10 @@ def _maybe_deactivate_dead_symbol(db: Session, symbol: str) -> None:
 
 
 def _estimate_api_calls(symbols: list, include_historical: bool = False) -> int:
-    """Rough upper-bound of Twelve Data calls for the next run."""
-    calls = -(-len(symbols) // 10)  # quotes are batched 10 symbols per request
+    """Rough upper-bound of Twelve Data credits for the next run."""
+    if not settings.twelve_data_enabled:
+        return 0
+    calls = len(symbols)  # batched quotes still cost one credit per symbol
     if include_historical:
         # The daily job also calls the history and dividends endpoints once
         # per symbol (before any Yahoo fallback).
@@ -212,6 +215,10 @@ class UpdaterService:
     CATCH_UP_RETRY_SECONDS = 30 * 60
     # A failed backup (e.g. Postgres down) is retried at most this often.
     BACKUP_RETRY_SECONDS = 60 * 60
+    # The 18:00 historical job is made up when no successful run is newer
+    # than this - a day plus slack, so the scheduled run normally wins.
+    HISTORICAL_MAX_AGE = timedelta(hours=26)
+    HISTORICAL_RETRY_SECONDS = 60 * 60
 
     def __init__(self):
         self.scheduler = BackgroundScheduler(timezone=settings.scheduler_timezone)
@@ -219,7 +226,10 @@ class UpdaterService:
         # Serializes price+news runs across cron jobs, catch-up and logon
         # one-shots so they can never overlap.
         self._job_lock = threading.Lock()
+        # Same for the historical job (cron vs catch-up).
+        self._historical_lock = threading.Lock()
         self._last_catch_up_attempt: Optional[datetime] = None
+        self._last_historical_attempt: Optional[datetime] = None
         self._last_backup_attempt: Optional[datetime] = None
 
     def _on_job_error(self, event):
@@ -334,6 +344,9 @@ class UpdaterService:
 
     def _update_historical(self) -> bool:
         """Daily job: update historical data and dividends for tracked symbols."""
+        if not self._historical_lock.acquire(blocking=False):
+            logger.warning("Historical update skipped: another historical update is in progress")
+            return False
         logger.info("Running daily historical update")
         db = SessionLocal()
         ok = False
@@ -372,6 +385,44 @@ class UpdaterService:
                 _record_run(db, "daily_historical", ok, detail)
             finally:
                 db.close()
+                self._historical_lock.release()
+
+    def _historical_catch_up_if_due(self) -> None:
+        """Run the historical job when no successful run is recent enough.
+
+        The 18:00 cron job misfires whenever the machine is asleep or off at
+        that time (APScheduler drops it after misfire_grace_time), which left
+        history, dividends and dead-symbol deactivation silently not running
+        for days. The daemon's minute loop makes it up from the heartbeat.
+        """
+        now = datetime.now(timezone.utc)
+        if (
+            self._last_historical_attempt is not None
+            and (now - self._last_historical_attempt).total_seconds() < self.HISTORICAL_RETRY_SECONDS
+        ):
+            return
+
+        db = SessionLocal()
+        try:
+            last_ok = db.query(func.max(UpdaterRun.finished_at)).filter(
+                UpdaterRun.job_name == "daily_historical",
+                UpdaterRun.success == True,
+            ).scalar()
+        except Exception as e:
+            logger.warning(f"Historical catch-up check failed: {e}")
+            return
+        finally:
+            db.close()
+
+        if last_ok is not None and now - last_ok.replace(tzinfo=timezone.utc) <= self.HISTORICAL_MAX_AGE:
+            return
+
+        self._last_historical_attempt = now
+        logger.info(
+            f"No successful historical update since {last_ok or 'ever'} - running catch-up"
+        )
+        if not self._update_historical():
+            logger.warning("Historical catch-up did not complete successfully")
 
     def _weekly_cleanup(self) -> bool:
         """Weekly job: delete old news articles."""
@@ -507,6 +558,7 @@ class UpdaterService:
                 elif stop_event is None:
                     time.sleep(60)
                 self._catch_up_if_stale()
+                self._historical_catch_up_if_due()
                 self._backup_if_due()
         except KeyboardInterrupt:
             logger.info("Shutting down updater service (keyboard interrupt)")

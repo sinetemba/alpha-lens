@@ -28,6 +28,53 @@ def format_stock_label(symbol: str, name: Optional[str] = None) -> str:
     return symbol
 
 
+def holding_totals(pairs: Iterable[tuple[Optional[float], Optional[float]]]) -> dict:
+    """Totals over (cost, current_value) pairs; either may be None if unknown.
+
+    Gain/loss covers only holdings with BOTH a cost and a live value - summing
+    all values minus all costs counted an un-costed holding's whole value as
+    gain and an unpriced holding's whole cost as loss.
+    """
+    total_cost = total_value = gain_cost = gain_value = 0.0
+    has_cost = has_value = has_gain = False
+    for cost, value in pairs:
+        if cost:
+            total_cost += cost
+            has_cost = True
+        if value is not None:
+            total_value += value
+            has_value = True
+        if cost and value is not None:
+            gain_cost += cost
+            gain_value += value
+            has_gain = True
+    gain = gain_value - gain_cost if has_gain else None
+    return {
+        "total_cost": total_cost if has_cost else None,
+        "total_value": total_value if has_value else None,
+        "gain": gain,
+        "gain_pct": gain / gain_cost * 100 if has_gain else None,
+    }
+
+
+def render_holding_totals(totals: dict) -> None:
+    """Total cost / current value / gain-loss metric row for `holding_totals`."""
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        cost = totals["total_cost"]
+        st.metric("Total cost", f"R {cost:,.2f}" if cost is not None else "N/A")
+    with c2:
+        value = totals["total_value"]
+        st.metric("Current value", f"R {value:,.2f}" if value is not None else "N/A")
+    with c3:
+        if totals["gain"] is not None:
+            st.metric(
+                "Gain/Loss", f"R {totals['gain']:+,.2f}", delta=f"{totals['gain_pct']:+.1f}%"
+            )
+        else:
+            st.metric("Gain/Loss", "N/A")
+
+
 def style_gain_loss_row(row: pd.Series) -> list[str]:
     """Colour a table row green/red/yellow based on its '_gain_loss' value.
 
@@ -162,6 +209,8 @@ _TWELVE_DATA_DAILY_LIMIT = 800
 
 def format_twelve_data_quota() -> Optional[str]:
     """'Twelve Data today: 123/800' from the shared counter, or None if unused."""
+    if not settings.twelve_data_enabled:
+        return None
     try:
         data = json.loads(_TWELVE_DATA_USAGE_FILE.read_text(encoding="utf-8"))
         if data.get("date") != str(datetime.now(timezone.utc).date()):

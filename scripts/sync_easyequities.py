@@ -1,5 +1,15 @@
-"""Headless EasyEquities holdings sync (same path as the Portfolio page)."""
+r"""Headless EasyEquities holdings sync (same path as the Portfolio page).
+
+Run from the repo root:
+    python scripts\sync_easyequities.py
+"""
+import os
+import sys
 from datetime import datetime, timezone
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from app.models.base import SessionLocal
 from app.models.portfolio import Portfolio
