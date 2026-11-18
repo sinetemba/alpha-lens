@@ -14,6 +14,15 @@ from app.database.init_db import init_database
 from app.config.settings import settings
 from loguru import logger
 
+# Must be the first Streamlit command in the script - the cache_resource
+# spinner below already counts as one.
+st.set_page_config(
+    page_title="JSE Stock Analysis Platform",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 # Initialize logging + database on first run only.
 # st.cache_resource ensures this body executes once per process: the whole
 # script re-executes on every widget interaction (Streamlit's rerun model), so

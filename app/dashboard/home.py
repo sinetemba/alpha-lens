@@ -86,14 +86,11 @@ def _page(db: Session, title: str, icon: str, url_path: str, render, default: bo
 
 
 def show_home():
-    """Display the home dashboard."""
-    st.set_page_config(
-        page_title="JSE Stock Analysis Platform",
-        page_icon="📈",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
+    """Display the home dashboard.
 
+    st.set_page_config lives in main.py (the entry point) - it must be the
+    first Streamlit command and the cache_resource init call runs first here.
+    """
     # Initialize database session
     db = SessionLocal()
 
