@@ -1,0 +1,16 @@
+# Streamlit settings for every way of starting the dashboard, including a
+# bare `streamlit run main.py`.
+#
+# Bind to this PC only. Without this Streamlit listens on every network
+# interface, and the dashboard (holdings, sync/backup buttons, no login)
+# was reachable from any network the PC joined - Windows Firewall allows
+# Python inbound on the Public profile. scripts/run_dashboard.py passes
+# STREAMLIT_SERVER_ADDRESS from .env on top of this; change that (not this
+# file) if you deliberately want LAN access.
+[server]
+address = "localhost"
+port = 8501
+headless = true
+
+[browser]
+gatherUsageStats = false

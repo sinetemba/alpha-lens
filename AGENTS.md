@@ -51,6 +51,12 @@ Context for anyone working on this repository in the future.
     not fire on unlock.
 - **Alternative:** `scripts\windows_service.py` using `pywin32` (`--install`, `--start`, etc.).
 
+## Dashboard (Streamlit)
+
+- Start it with `scripts\run_dashboard.py` (or the `AlphaLensDashboard` scheduled task from `scripts\install_dashboard_task.ps1`), **not** a bare `streamlit run main.py`. The launcher passes `STREAMLIT_SERVER_ADDRESS`/`STREAMLIT_SERVER_PORT` from `.env` (default `localhost:8501`) - a bare `streamlit run` binds every interface, and with Windows Firewall allowing Python inbound on the Public profile the dashboard (holdings, sync/backup buttons, no login) was reachable from any network the PC joined. Verified 2026-11-19: no longer reachable via the LAN IP. `.streamlit/config.toml` (tracked - the rest of `.streamlit/` stays gitignored) also sets `server.address = "localhost"`, so even a bare `streamlit run main.py` binds to 127.0.0.1 only.
+- The task uses the project venv's `pythonw.exe` (no console), runs at logon **without elevation** (no admin needed to install), restarts up to 3x on crash, and writes Streamlit output to `data/logs/dashboard.log`. It previously ran on a global Python with Streamlit 1.66 while the venv/tests/requirements use 1.38 - keep it on the venv. Task Manager shows the base `Python313\pythonw.exe`; that's the venv launcher's child, loading `.venv\Lib\site-packages`.
+- Restart: `schtasks /end /tn AlphaLensDashboard` then `schtasks /run /tn AlphaLensDashboard`. Remove: `scripts\uninstall_dashboard_task.ps1`.
+
 ## Running the updater manually
 
 ```powershell

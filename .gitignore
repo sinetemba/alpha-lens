@@ -66,8 +66,9 @@ data/cache/
 *~
 .DS_Store
 
-# Streamlit
-.streamlit/
+# Streamlit - only the shared config is tracked; secrets/credentials stay local
+.streamlit/*
+!.streamlit/config.toml
 
 # Testing
 .pytest_cache/
