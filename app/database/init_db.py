@@ -1,5 +1,5 @@
 from app.models.base import Base, engine, SessionLocal
-from app.models import Stock, StockPrice, NewsArticle, WatchlistItem, Portfolio, PortfolioHolding, Dividend, Notification
+from app.models import Stock, StockPrice, NewsArticle, WatchlistItem, Portfolio, PortfolioHolding, Dividend, Notification, UpdaterRun, KrugerrandHolding, CryptoHolding
 from app.config.settings import settings
 import os
 
@@ -67,6 +67,16 @@ def _migrate_schema():
                 )
             print("Migration: added 'fetched_at' column to stock_prices.")
 
+    # --- notifications.attempts (failed-send retry counter) ---
+    if "notifications" in inspector.get_table_names():
+        columns = [col["name"] for col in inspector.get_columns("notifications")]
+        if "attempts" not in columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE notifications ADD COLUMN attempts INTEGER DEFAULT 0")
+                )
+            print("Migration: added 'attempts' column to notifications.")
+
     _enforce_unique_indexes(inspector)
     _ensure_plain_indexes(inspector)
 
@@ -120,6 +130,8 @@ def _ensure_plain_indexes(inspector):
         ("portfolio_holdings", "ix_portfolio_holdings_portfolio_id", "portfolio_id"),
         ("portfolio_holdings", "ix_portfolio_holdings_stock_id", "stock_id"),
         ("watchlist_items", "ix_watchlist_items_is_active", "is_active"),
+        ("watchlist_items", "ix_watchlist_items_stock_id", "stock_id"),
+        ("dividends", "ix_dividends_stock_id", "stock_id"),
         ("news_articles", "ix_news_articles_created_at", "created_at"),
     ]
 
@@ -133,6 +145,47 @@ def _ensure_plain_indexes(inspector):
                 f"CREATE INDEX {index_name} ON {table} ({columns})"
             ))
         print(f"Migration: added index {index_name} on {table}({columns}).")
+
+
+def _normalize_bar_timestamps():
+    """Collapse non-midnight stock_prices bars to exchange-local midnight.
+
+    Early quote saves stored bars at their fetch time (e.g. 14:32) instead of
+    the trading-day midnight used by every other write path. Normalise them so
+    the (symbol, timestamp) dedup keeps working; drop any that would collide
+    with a real midnight bar for the same day.
+    """
+    from datetime import time as dt_time
+
+    db = SessionLocal()
+    try:
+        midnight_keys = set()
+        intraday = []
+        for row in db.query(StockPrice).all():
+            if row.timestamp.time() == dt_time(0, 0):
+                midnight_keys.add((row.symbol, row.timestamp))
+            else:
+                intraday.append(row)
+        if not intraday:
+            return
+
+        deleted = updated = 0
+        for row in intraday:
+            midnight = row.timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+            if (row.symbol, midnight) in midnight_keys:
+                db.delete(row)
+                deleted += 1
+            else:
+                row.timestamp = midnight
+                midnight_keys.add((row.symbol, midnight))
+                updated += 1
+        db.commit()
+        print(f"Migration: normalised {updated} intraday bar(s) to midnight, removed {deleted} duplicate(s).")
+    except Exception as e:
+        db.rollback()
+        print(f"Error normalising bar timestamps: {e}")
+    finally:
+        db.close()
 
 
 def _backfill_stock_names():
@@ -184,6 +237,7 @@ def init_database():
     print("Initializing database...")
     create_tables()
     _migrate_schema()
+    _normalize_bar_timestamps()
     _cleanup_excluded_holdings()
     _backfill_stock_names()
     

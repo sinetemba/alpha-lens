@@ -1,19 +1,38 @@
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from app.models.notification import Notification
-from app.models.stock import StockPrice
+from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
-from app.dashboard.home import _get_latest_and_previous_prices
+# app.services.price_queries is Streamlit-free so this service also runs inside
+# the headless updater (importing app.dashboard.home would drag Streamlit and a
+# ThreadPoolExecutor into that process).
+from app.services.price_queries import get_latest_and_previous_prices
 from app.config.settings import settings
 from loguru import logger
 import json
 import apprise
 
 
+# Failed sends are retried on each run until this cap, then left in the table
+# (still visible to a future notifications page) but no longer re-sent.
+MAX_SEND_ATTEMPTS = 5
+
+# Identical alerts (same type/title/symbol) within this window reuse the
+# existing row - a persistent condition like a price parked above target must
+# not create a new notification on every update run.
+ALERT_DEDUP_WINDOW = timedelta(hours=20)
+
+
+def _utcnow_naive() -> datetime:
+    """Current UTC time as a naive datetime, matching the naive DateTime columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 class NotificationService:
     """Service for managing and sending notifications."""
-    
+
     def __init__(self, db: Session):
         self.db = db
         self.enabled = settings.notification_enabled
@@ -32,19 +51,19 @@ class NotificationService:
                 f"{settings.notification_email_smtp_host}:"
                 f"{settings.notification_email_smtp_port}"
             )
-            self.appr.add(email_url)
+            self.appr.add(email_url, tag="email")
             logger.info("Email notification channel configured")
         
         # ntfy
         if settings.notification_ntfy_topic:
             ntfy_url = f"ntfy://{settings.notification_ntfy_topic}"
-            self.appr.add(ntfy_url)
+            self.appr.add(ntfy_url, tag="ntfy")
             logger.info("ntfy notification channel configured")
         
         # Discord
         if settings.notification_discord_webhook_url:
             discord_url = f"discord://{settings.notification_discord_webhook_url}"
-            self.appr.add(discord_url)
+            self.appr.add(discord_url, tag="discord")
             logger.info("Discord notification channel configured")
         
         # Telegram
@@ -53,7 +72,7 @@ class NotificationService:
                 f"tgram://{settings.notification_telegram_bot_token}/"
                 f"{settings.notification_telegram_chat_id}"
             )
-            self.appr.add(telegram_url)
+            self.appr.add(telegram_url, tag="telegram")
             logger.info("Telegram notification channel configured")
     
     def create_notification(
@@ -64,7 +83,22 @@ class NotificationService:
         stock_symbol: Optional[str] = None,
         metadata: Optional[dict] = None
     ) -> Notification:
-        """Create a notification in the database."""
+        """Create a notification in the database.
+
+        Identical alerts (same type, title and symbol) raised within
+        ALERT_DEDUP_WINDOW return the existing row instead of inserting a
+        duplicate on every update run.
+        """
+        cutoff = _utcnow_naive() - ALERT_DEDUP_WINDOW
+        existing = self.db.query(Notification).filter(
+            Notification.type == notification_type,
+            Notification.title == title,
+            Notification.stock_symbol == stock_symbol,
+            Notification.created_at >= cutoff,
+        ).first()
+        if existing:
+            return existing
+
         notification = Notification(
             type=notification_type,
             title=title,
@@ -107,39 +141,58 @@ class NotificationService:
             
             if success:
                 notification.is_sent = True
-                notification.sent_at = datetime.now(timezone.utc)
+                notification.sent_at = _utcnow_naive()
                 notification.delivery_channel = channel or "all"
                 self.db.commit()
                 logger.info(f"Notification sent: {notification.title}")
                 return True
-            else:
-                logger.error(f"Failed to send notification: {notification.title}")
-                return False
-        
+
+            logger.error(f"Failed to send notification: {notification.title}")
+
         except Exception as e:
             logger.error(f"Error sending notification: {e}")
-            return False
+
+        notification.attempts = (notification.attempts or 0) + 1
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+        return False
     
-    def check_price_alerts(self):
-        """Check watchlist items for price alerts."""
-        if not self.enabled:
-            return
-        
-        watchlist_items = self.db.query(WatchlistItem).filter(
-            WatchlistItem.is_active == True
+    def _alertable_watchlist_items(self) -> List:
+        """Active watchlist items whose stock is still active.
+
+        Deactivated stocks (delisted/bad tickers) are not tracked by the
+        updater, so their stored prices are frozen - alerting against them
+        is noise (e.g. a delisted stock permanently above its target).
+        """
+        return self.db.query(WatchlistItem).join(
+            Stock, WatchlistItem.stock_id == Stock.id
+        ).filter(
+            WatchlistItem.is_active == True,
+            Stock.is_active == True,
         ).all()
+
+    def check_price_alerts(self):
+        """Check watchlist items for price alerts.
+
+        Runs even when external delivery is disabled: the Notifications page
+        is an in-app alert channel of its own, so rows are created
+        unconditionally and only sending is gated on self.enabled.
+        """
+        watchlist_items = self._alertable_watchlist_items()
 
         if not watchlist_items:
             return
 
         symbols = [item.symbol for item in watchlist_items]
-        prices = _get_latest_and_previous_prices(self.db, symbols)
+        prices = get_latest_and_previous_prices(self.db, symbols)
 
         for item in watchlist_items:
             latest, prev = prices.get(item.symbol, (None, None))
             if not latest:
                 continue
-            
+
             current_price = latest.close_price
             
             # Check target price
@@ -185,19 +238,14 @@ class NotificationService:
                     )
     
     def check_technical_alerts(self):
-        """Check for technical indicator alerts."""
-        if not self.enabled:
-            return
-        
-        watchlist_items = self.db.query(WatchlistItem).filter(
-            WatchlistItem.is_active == True
-        ).all()
+        """Check for technical indicator alerts (see check_price_alerts re: enabled)."""
+        watchlist_items = self._alertable_watchlist_items()
 
         if not watchlist_items:
             return
 
         symbols = [item.symbol for item in watchlist_items]
-        prices = _get_latest_and_previous_prices(self.db, symbols)
+        prices = get_latest_and_previous_prices(self.db, symbols)
 
         for item in watchlist_items:
             latest, prev = prices.get(item.symbol, (None, None))
@@ -205,7 +253,7 @@ class NotificationService:
                 continue
             
             # RSI overbought/oversold
-            if latest.rsi:
+            if latest.rsi is not None:
                 if latest.rsi > 70:
                     self.create_notification(
                         notification_type="technical",
@@ -223,8 +271,11 @@ class NotificationService:
                         metadata={"indicator": "RSI", "value": latest.rsi}
                     )
             
-            # MACD crossover
-            if latest.macd and latest.macd_signal and prev and prev.macd and prev.macd_signal:
+            # MACD crossover (0.0 is a legitimate value - check for None, not truthiness)
+            if (
+                latest.macd is not None and latest.macd_signal is not None
+                and prev and prev.macd is not None and prev.macd_signal is not None
+            ):
                 # Bullish crossover
                 if prev.macd <= prev.macd_signal and latest.macd > latest.macd_signal:
                     self.create_notification(
@@ -250,7 +301,8 @@ class NotificationService:
             return
         
         pending = self.db.query(Notification).filter(
-            Notification.is_sent == False
+            Notification.is_sent == False,
+            or_(Notification.attempts.is_(None), Notification.attempts < MAX_SEND_ATTEMPTS),
         ).all()
         
         for notification in pending:
@@ -270,7 +322,7 @@ class NotificationService:
         
         if notification:
             notification.is_read = True
-            notification.read_at = datetime.now(timezone.utc)
+            notification.read_at = _utcnow_naive()
             self.db.commit()
     
     def mark_all_as_read(self):
@@ -279,6 +331,6 @@ class NotificationService:
             Notification.is_read == False
         ).update({
             "is_read": True,
-            "read_at": datetime.now(timezone.utc)
+            "read_at": _utcnow_naive()
         })
         self.db.commit()

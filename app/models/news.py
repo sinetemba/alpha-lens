@@ -1,7 +1,6 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text, Float, ForeignKey, Index
 from sqlalchemy.orm import relationship
-from datetime import datetime, timezone
-from .base import Base
+from .base import Base, utcnow_naive
 
 
 class NewsArticle(Base):
@@ -23,7 +22,7 @@ class NewsArticle(Base):
     # Stock association (if article is about specific stock)
     stock_symbol = Column(String(10), index=True)
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    created_at = Column(DateTime, default=utcnow_naive, index=True)
 
     # Composite index for efficient queries
     __table_args__ = (

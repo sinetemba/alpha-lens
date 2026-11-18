@@ -96,6 +96,35 @@ def show_company(db: Session):
     with tab3:
         _render_company_news(db, selected_symbol)
 
+    st.markdown("---")
+    _render_manage_stocks(db)
+
+
+def _render_manage_stocks(db: Session):
+    """Deactivate tracked stocks (bad tickers, delisted, unwanted).
+
+    Deactivating hides a stock here and stops the updater tracking it, but
+    keeps its history. A deactivated stock is reactivated automatically by
+    re-adding it on the Watchlist or Portfolio page.
+    """
+    with st.expander("🗑️ Manage tracked stocks"):
+        active = _get_active_stocks()
+        names = {s[0]: s[1] for s in active}
+        to_deactivate = st.multiselect(
+            "Stocks to deactivate",
+            [s[0] for s in active],
+            format_func=lambda s: format_stock_label(s, names.get(s)),
+            key="deactivate_stocks",
+        )
+        if st.button("Deactivate selected", disabled=not to_deactivate):
+            db.query(Stock).filter(
+                Stock.symbol.in_(to_deactivate)
+            ).update({"is_active": False}, synchronize_session=False)
+            db.commit()
+            _get_active_stocks.clear()
+            st.success(f"Deactivated {len(to_deactivate)} stock(s).")
+            st.rerun()
+
 
 def _render_price_chart(db: Session, symbol: str):
     """Render price chart for a stock."""
@@ -117,7 +146,7 @@ def _render_price_chart(db: Session, symbol: str):
     }
     
     days = days_map[period]
-    start_date = datetime.now(timezone.utc) - timedelta(days=days)
+    start_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
 
     stock = db.query(Stock).filter(Stock.symbol == symbol).first()
     label = format_stock_label(symbol, stock.name if stock else None)
@@ -264,14 +293,14 @@ def _render_historical_data(db: Session, symbol: str):
     st.dataframe(data, use_container_width=True)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def _get_company_news(symbol: str, company_name: Optional[str]) -> List[Dict]:
+@st.cache_data(ttl=600, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
+def _get_company_news(db: Session, symbol: str, company_name: Optional[str]) -> List[Dict]:
     """Fetch live news for a company, cached 10 min.
 
     session_state caching was unbounded (never refreshed) when it hit and
     re-fetched on every rerun when it missed; a timed cache fixes both.
     """
-    return CompanyNewsService().get_company_news(symbol, company_name) or []
+    return CompanyNewsService(db).get_company_news(symbol, company_name) or []
 
 
 def _render_company_news(db: Session, symbol: str):
@@ -282,7 +311,7 @@ def _render_company_news(db: Session, symbol: str):
     st.subheader(f"News for {format_stock_label(symbol, company_name)}")
     
     with st.spinner("Loading company news..."):
-        news = _get_company_news(symbol, company_name)
+        news = _get_company_news(db, symbol, company_name)
     
     if not news:
         archived = db.query(NewsArticle).filter(

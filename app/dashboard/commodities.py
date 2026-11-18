@@ -68,7 +68,7 @@ def _save_latest_rates(db: Session, latest_rates: dict[str, float]) -> None:
     if not latest_rates:
         return
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     for api_symbol, rate in latest_rates.items():
@@ -89,10 +89,12 @@ def _save_latest_rates(db: Session, latest_rates: dict[str, float]) -> None:
 
         if existing_today:
             existing_today.close_price = rate
-            existing_today.timestamp = now
+            # Keep the bar keyed to day-midnight like every other write path;
+            # fetched_at carries the actual refresh instant.
+            existing_today.timestamp = today_start
             existing_today.fetched_at = now
         else:
-            db.add(StockPrice(stock_id=stock.id, symbol=yf_symbol, timestamp=now, close_price=rate))
+            db.add(StockPrice(stock_id=stock.id, symbol=yf_symbol, timestamp=today_start, close_price=rate))
 
     db.commit()
 
@@ -141,7 +143,9 @@ def _refresh_commodity_prices(db: Session) -> tuple[int, int]:
             try:
                 historical_prices = historical_collector.get_commodity_history(api_symbol)
                 if historical_prices:
-                    cutoff = datetime.now(timezone.utc) - timedelta(days=365)
+                    # point["timestamp"] is naive; comparing it with an aware
+                    # cutoff raises TypeError and silently failed every run.
+                    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=365)
                     saved += _save_historical_prices(
                         db,
                         api_symbol,
@@ -241,7 +245,10 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
 
         # Compare against the last prior calendar day's stored price, whether
         # today's price came from the live Metals.dev rate or the DB fallback.
-        reference_timestamp = latest_db.timestamp if latest_db else datetime.now(timezone.utc)
+        reference_timestamp = (
+            latest_db.timestamp if latest_db
+            else datetime.now(timezone.utc).replace(tzinfo=None)
+        )
         prev_db = _get_previous_day_price(db, yf_symbol, reference_timestamp)
 
         change_pct = None
@@ -282,7 +289,8 @@ def _render_commodity_charts(db: Session):
         return
 
     fig = go.Figure()
-    start_date = datetime.now(timezone.utc) - timedelta(days=90)
+    # StockPrice.timestamp is naive UTC - keep the filter naive to match.
+    start_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=90)
 
     for api_symbol in selected:
         database_symbol = database_symbols[api_symbol]
@@ -292,17 +300,22 @@ def _render_commodity_charts(db: Session):
         ).order_by(StockPrice.timestamp.asc()).all()
 
         if prices:
-            fig.add_trace(go.Scatter(
-                x=[p.timestamp for p in prices],
-                y=[p.close_price for p in prices],
-                name=format_stock_label(api_symbol, COMMODITY_SYMBOLS[api_symbol][0]),
-                mode="lines"
-            ))
+            # Rebase each series to % change from its first visible point -
+            # the sources report different units (ZAR/g, USD/oz, USD/lb) so
+            # raw closes on one axis are not comparable.
+            base = prices[0].close_price
+            if base:
+                fig.add_trace(go.Scatter(
+                    x=[p.timestamp for p in prices],
+                    y=[(p.close_price / base - 1) * 100 for p in prices],
+                    name=format_stock_label(api_symbol, COMMODITY_SYMBOLS[api_symbol][0]),
+                    mode="lines"
+                ))
 
     fig.update_layout(
-        title="90-Day Commodity Price Performance",
+        title="90-Day Commodity Price Performance (% change)",
         xaxis_title="Date",
-        yaxis_title="Price (source units)",
+        yaxis_title="Change since first day (%)",
         hovermode="x unified",
         height=500
     )

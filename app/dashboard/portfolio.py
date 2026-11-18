@@ -1,12 +1,17 @@
 from collections import Counter
 import pandas as pd
 import streamlit as st
-from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session, joinedload
-from app.models.portfolio import Portfolio, PortfolioHolding
+from app.models.dividend import Dividend
+from app.models.portfolio import (
+    Portfolio,
+    PortfolioHolding,
+    EXCLUDED_ACCOUNT_TYPES,
+    EXCLUDED_PORTFOLIO_SYMBOLS,
+    is_jse_tracked_account,
+)
 from app.models.stock import Stock, StockPrice
 from app.dashboard.utils import (
-    day_of,
     format_stock_label,
     is_market_data_stale,
     PriceSnapshot,
@@ -15,12 +20,9 @@ from app.dashboard.utils import (
     _to_display_tz,
 )
 from app.collectors.easyequities import EasyEquitiesCollector
-from datetime import datetime, timedelta, timezone
+from app.services.price_queries import get_latest_and_previous_prices
+from datetime import datetime, timezone
 from loguru import logger
-
-
-EXCLUDED_PORTFOLIO_SYMBOLS = {"SZK"}
-EXCLUDED_ACCOUNT_TYPES = {"Demo ZAR"}
 
 
 def _normalize_account_type(account_type: str | None) -> str:
@@ -77,7 +79,7 @@ def show_portfolio(db: Session):
                 error_detail = f" Error: {collector.last_error}" if collector.last_error else ""
                 st.warning(f"EasyEquities sync failed. Showing the most recent database values.{error_detail}")
             else:
-                portfolio.last_easyequities_sync = datetime.now(timezone.utc)
+                portfolio.last_easyequities_sync = datetime.now(timezone.utc).replace(tzinfo=None)
                 db.commit()
                 if refresh_requested:
                     st.success(f"Synced {synced_holdings} holding{'s' if synced_holdings != 1 else ''} from EasyEquities.")
@@ -158,7 +160,8 @@ def show_portfolio(db: Session):
         
         flash = st.session_state.pop("portfolio_add_flash", None)
         if flash:
-            st.warning(flash)
+            level, message = flash
+            getattr(st, level)(message)
 
         if st.button("Add Holding"):
             if symbol and quantity > 0 and purchase_price > 0:
@@ -166,12 +169,18 @@ def show_portfolio(db: Session):
                 if saved is None:
                     st.warning(f"{symbol} is excluded from portfolio tracking - not added.")
                 else:
+                    # Flash the result post-rerun: st.rerun() discards messages
+                    # rendered in this run.
                     if saved == 0:
                         st.session_state["portfolio_add_flash"] = (
+                            "warning",
                             f"Added {symbol}, but no price history could be fetched - "
-                            "double-check that the ticker is correct."
+                            "double-check that the ticker is correct.",
                         )
-                    st.success(f"Added {quantity} shares of {symbol} to portfolio!")
+                    else:
+                        st.session_state["portfolio_add_flash"] = (
+                            "success", f"Added {quantity} shares of {symbol} to portfolio!"
+                        )
                     st.rerun()
             else:
                 st.error("Please fill in all required fields.")
@@ -322,64 +331,8 @@ def show_portfolio(db: Session):
 def _get_group_latest_and_previous_prices(
     db: Session, symbols: list[str]
 ) -> dict[str, tuple[PriceSnapshot | None, PriceSnapshot | None]]:
-    """Batch-fetch each symbol's latest price and its most recent prior-day price.
-
-    Uses a single windowed CTE to pull only the latest and prior-day rows per
-    requested symbol, avoiding full scans and per-symbol N+1 queries.
-    """
-    if not symbols:
-        return {}
-
-    ranked = db.query(
-        StockPrice.symbol,
-        StockPrice.timestamp,
-        StockPrice.close_price,
-        StockPrice.volume,
-        StockPrice.rsi,
-        StockPrice.macd,
-        StockPrice.macd_signal,
-        func.dense_rank().over(
-            partition_by=StockPrice.symbol,
-            order_by=day_of(db, StockPrice.timestamp).desc(),
-        ).label('day_rank'),
-        func.row_number().over(
-            partition_by=[StockPrice.symbol, day_of(db, StockPrice.timestamp)],
-            order_by=StockPrice.timestamp.desc(),
-        ).label('intra_rank'),
-    ).filter(StockPrice.symbol.in_(symbols)).cte('ranked')
-
-    rows = db.query(
-        ranked.c.symbol,
-        ranked.c.timestamp,
-        ranked.c.close_price,
-        ranked.c.volume,
-        ranked.c.rsi,
-        ranked.c.macd,
-        ranked.c.macd_signal,
-        ranked.c.day_rank,
-    ).filter(or_(
-        and_(ranked.c.day_rank == 1, ranked.c.intra_rank == 1),
-        and_(ranked.c.day_rank == 2, ranked.c.intra_rank == 1),
-    )).order_by(ranked.c.symbol, ranked.c.day_rank).all()
-
-    result: dict[str, tuple[PriceSnapshot | None, PriceSnapshot | None]] = {}
-    for row in rows:
-        sym = row.symbol
-        latest, prev = result.get(sym, (None, None))
-        snapshot = PriceSnapshot(
-            close_price=row.close_price,
-            timestamp=row.timestamp,
-            volume=row.volume,
-            rsi=row.rsi,
-            macd=row.macd,
-            macd_signal=row.macd_signal,
-        )
-        if row.day_rank == 1:
-            latest = snapshot
-        else:
-            prev = snapshot
-        result[sym] = (latest, prev)
-    return result
+    """Cached wrapper around the shared latest/previous-day price query."""
+    return get_latest_and_previous_prices(db, symbols)
 
 
 def _render_holdings_table(
@@ -471,8 +424,9 @@ def _render_holdings_table(
     else:
         st.info("Select at least one column to display the holdings table.")
 
-    # Today's movement for this account group
-    symbols = [h.symbol for h in holdings if h.symbol]
+    # Today's movement for this account group (JSE-priced symbols only -
+    # USD-account holdings resolve to the wrong instrument via .JO lookups)
+    symbols = [h.symbol for h in holdings if h.symbol and is_jse_tracked_account(h.account_type)]
     prices = _get_group_latest_and_previous_prices(db, symbols)
     today_gain = 0.0
     yesterday_value = 0.0
@@ -726,11 +680,17 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
         db.add(stock)
         db.flush()
     
-    # Create holding
+    # Create holding. account_type="Manual" deliberately: EasyEquities
+    # reconciliation deletes every holding under an account type it synced
+    # that EE no longer reports - a manual holding under the default "ZAR"
+    # account would be silently deleted on the next sync. "Manual" is never
+    # an EE account type, so reconciliation skips it; is_jse_tracked_account
+    # still treats it as JSE-tracked.
     holding = PortfolioHolding(
         portfolio_id=portfolio_id,
         stock_id=stock.id,
         symbol=symbol,
+        account_type="Manual",
         quantity=quantity,
         purchase_price=purchase_price,
         purchase_date=purchase_date
@@ -749,6 +709,16 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
         logger.info(f"Fetched {saved} price points for {symbol}")
     except Exception as e:
         logger.error(f"Failed to fetch price data for {symbol}: {e}")
+
+    # Same bad-ticker rule as the watchlist add path: only deactivate when the
+    # symbol has no stored prices at all; never on a mere provider outage.
+    has_prices = db.query(StockPrice).filter(StockPrice.symbol == symbol).first() is not None
+    if saved > 0 and not stock.is_active:
+        stock.is_active = True
+        db.commit()
+    elif saved == 0 and not has_prices:
+        stock.is_active = False
+        db.commit()
     return saved
 
 
@@ -799,7 +769,7 @@ def _sync_holding_from_easyequities(
             stock_id=stock.id,
             symbol=symbol,
             account_type=account_type,
-            purchase_date=datetime.now(timezone.utc),
+            purchase_date=datetime.now(timezone.utc).replace(tzinfo=None),
         )
         db.add(holding)
 
@@ -816,7 +786,7 @@ def _sync_holding_from_easyequities(
     )
     # Always update the timestamp so the UI reflects the latest sync time,
     # even when EasyEquities returns identical values.
-    holding.updated_at = datetime.now(timezone.utc)
+    holding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _remove_holding(db: Session, portfolio_id: int, symbol: str, account_type: str):
@@ -830,22 +800,35 @@ def _remove_holding(db: Session, portfolio_id: int, symbol: str, account_type: s
 
 
 def _update_holding_values(db: Session, holdings: list) -> None:
-    """Update current values for all holdings from the latest stored prices.
+    """Update current values for holdings from the latest stored prices.
 
     One batched latest-price query plus one commit, instead of a query and a
     commit per holding.
+
+    Only JSE-tracked accounts are priced: stored prices are JSE quotes, so a
+    USD-account holding (e.g. AAPL under a bare US symbol) would either be
+    valued with the wrong instrument or have its EasyEquities-synced values
+    wiped to None. Those holdings keep whatever the sync last set.
     """
-    if not holdings:
+    jse_holdings = [h for h in holdings if is_jse_tracked_account(h.account_type)]
+    if not jse_holdings:
         return
 
+    symbols = [h.symbol for h in jse_holdings]
     latest_by_symbol = {
         symbol: snapshots[0]
-        for symbol, snapshots in _get_group_latest_and_previous_prices(
-            db, [h.symbol for h in holdings]
-        ).items()
+        for symbol, snapshots in _get_group_latest_and_previous_prices(db, symbols).items()
     }
 
-    for holding in holdings:
+    # Dividends received per share since each holding's purchase date - same
+    # rule as the Dividends page income estimate.
+    dividends_by_symbol: dict[str, list] = {}
+    for sym, amount, ex_date in db.query(
+        Dividend.symbol, Dividend.amount, Dividend.ex_dividend_date
+    ).filter(Dividend.symbol.in_(symbols)).all():
+        dividends_by_symbol.setdefault(sym, []).append((ex_date, amount or 0.0))
+
+    for holding in jse_holdings:
         latest = latest_by_symbol.get(holding.symbol)
         if latest and latest.close_price is not None:
             holding.current_price = latest.close_price
@@ -857,11 +840,15 @@ def _update_holding_values(db: Session, holdings: list) -> None:
             else:
                 holding.gain_loss = holding.current_value
                 holding.gain_loss_percentage = 0.0
-        else:
-            holding.current_price = None
-            holding.current_value = None
-            holding.gain_loss = None
-            holding.gain_loss_percentage = None
+        # No stored bar: keep whatever the last EasyEquities sync set - a
+        # missing/failed JSE price fetch must not wipe last-known values.
+
+        holding.total_dividends_received = (holding.quantity or 0.0) * sum(
+            amount
+            for ex_date, amount in dividends_by_symbol.get(holding.symbol, [])
+            if holding.purchase_date is None
+            or (ex_date is not None and ex_date >= holding.purchase_date)
+        )
 
     db.commit()
 

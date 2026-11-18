@@ -9,7 +9,7 @@ An open-source, Python-based web application focused on providing investors with
 - **Portfolio Tracking**: Track your investments and performance
 - **News Aggregation**: Aggregate financial news from multiple South African sources
 - **Technical Analysis**: Calculate and display technical indicators (RSI, MACD, Bollinger Bands, etc.)
-- **Automated Data Collection**: Hourly updates via background scheduler
+- **Automated Data Collection**: Scheduled updates via the headless updater (3x/day prices+news, daily full, logon refresh)
 - **Notifications**: Get alerts for price changes, news, and technical signals
 - **Interactive Charts**: Beautiful visualizations using Plotly
 
@@ -133,15 +133,20 @@ See the Docker section below for containerized deployment.
 
 ### Dashboard Navigation
 
-The application has seven main sections:
+The application has nine main sections:
 
 1. **Home**: JSE index, portfolio value, daily gain, Moneyweb top movers, and recent news
 2. **Watchlist**: Manage your stock watchlist with price alerts
 3. **Portfolio**: Track your holdings and performance
 4. **Dividends**: Track dividend history and payments
-5. **Company View**: Detailed information about specific stocks
-6. **Commodities**: Track commodity prices
-7. **Krugerrands**: Track Krugerrand prices
+5. **Notifications**: View price/technical alerts raised by the updater (mark read/unread)
+6. **Company View**: Detailed information about specific stocks
+7. **Penny Stocks**: Screener for JSE shares trading below R5
+8. **Commodities**: Track commodity prices
+9. **Krugerrands**: Track Krugerrand prices
+
+Every page shows a stale-data banner when the headless updater's last
+`updater_runs` heartbeat is >20h old or its last run failed.
 
 ### Adding Stocks to Watchlist
 
@@ -236,23 +241,14 @@ The app will create the tables automatically. No manual schema import is require
 
 ## Database Migrations
 
-### Create a New Migration
+Schema changes are applied automatically on startup by
+`app/database/init_db.py` (`create_tables()` for new tables plus
+`_migrate_schema()` for column/index additions and backfills) - there is
+nothing to run manually.
 
-```bash
-alembic revision --autogenerate -m "description of changes"
-```
-
-### Apply Migrations
-
-```bash
-alembic upgrade head
-```
-
-### Rollback Migration
-
-```bash
-alembic downgrade -1
-```
+An Alembic scaffold exists (`alembic.ini`, `alembic/`) but has **no revisions**
+- `alembic upgrade head` is a no-op. If you add a schema change, extend
+`_migrate_schema()` (or commit to Alembic and generate a revision).
 
 ## Data Sources
 
@@ -399,7 +395,7 @@ This project follows PEP 8 guidelines. Consider using:
 - ✅ Portfolio tracking
 - ✅ Historical prices
 - ✅ Technical indicators
-- ✅ Hourly updates
+- ✅ Scheduled updates
 - ✅ News aggregation
 - ✅ Dividend tracking
 - ✅ Notifications

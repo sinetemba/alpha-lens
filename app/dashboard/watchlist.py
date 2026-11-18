@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
-from app.models.stock import Stock
+from app.models.stock import Stock, StockPrice
 from app.models.watchlist import WatchlistItem
 from app.models.portfolio import PortfolioHolding
 from app.dashboard.utils import format_stock_label, render_market_data_refresh_control, style_gain_loss_row
@@ -33,24 +33,39 @@ def show_watchlist(db: Session):
         
         purchase_price = st.number_input("Purchase Price", min_value=0.0, step=0.01)
         stop_loss = st.number_input("Stop Loss", min_value=0.0, step=0.01)
+        alert_move = st.checkbox("Alert me on a daily move beyond a threshold")
+        move_threshold = st.number_input(
+            "Move threshold %", min_value=0.5, max_value=50.0, value=5.0, step=0.5
+        ) if alert_move else 5.0
         notes = st.text_area("Notes")
         
         flash = st.session_state.pop("watchlist_add_flash", None)
         if flash:
-            st.warning(flash)
+            level, message = flash
+            getattr(st, level)(message)
 
         if st.button("Add to Watchlist"):
             if symbol:
-                saved = _add_to_watchlist(db, symbol, target_price, purchase_price, stop_loss, notes)
+                saved = _add_to_watchlist(
+                    db, symbol, target_price, purchase_price, stop_loss, notes,
+                    alert_move, move_threshold,
+                )
                 if saved is None:
                     st.warning(f"{symbol} is already on your watchlist.")
                 else:
+                    # Show the result via a post-rerun flash: st.rerun() wipes
+                    # messages rendered in this run, so a same-run st.success
+                    # would never be seen.
                     if saved == 0:
                         st.session_state["watchlist_add_flash"] = (
+                            "warning",
                             f"Added {symbol}, but no price history could be fetched - "
-                            "double-check that the ticker is correct."
+                            "double-check that the ticker is correct.",
                         )
-                    st.success(f"Added {symbol} to watchlist!")
+                    else:
+                        st.session_state["watchlist_add_flash"] = (
+                            "success", f"Added {symbol} to watchlist!"
+                        )
                     st.rerun()
             else:
                 st.error("Please enter a stock symbol.")
@@ -109,9 +124,15 @@ def show_watchlist(db: Session):
 
     # Watchlist table
     st.subheader("Your Watchlist")
+    filter_choice = st.radio(
+        "Filter",
+        ["All", "Above Target", "Gain", "Loss"],
+        index=0,
+        horizontal=True,
+        key="watchlist_filter",
+    )
 
     data = []
-    watchlist_updated = False
     for item in watchlist_items:
         latest, prev = prices.get(item.symbol, (None, None))
         holding = holdings_by_symbol.get(item.symbol)
@@ -127,9 +148,6 @@ def show_watchlist(db: Session):
         # Use holding purchase price (weighted avg) if available, else the stored watchlist value
         if holding and holding.quantity:
             purchase_price = holding.purchase_value / holding.quantity
-            if item.purchase_price is None or abs(item.purchase_price - purchase_price) > 1e-6:
-                item.purchase_price = purchase_price
-                watchlist_updated = True
         else:
             purchase_price = item.purchase_price
 
@@ -141,8 +159,12 @@ def show_watchlist(db: Session):
             gain_loss_pct = None
 
         daily_change = (
-            ((current_price - prev.close_price) / prev.close_price) * 100
-            if current_price is not None and prev and prev.close_price else None
+            latest.close_price - prev.close_price
+            if latest and latest.close_price and prev and prev.close_price else None
+        )
+        daily_change_pct = (
+            (daily_change / prev.close_price) * 100
+            if daily_change is not None else None
         )
 
         # Include the row even with no price data - silently dropping it makes
@@ -153,7 +175,8 @@ def show_watchlist(db: Session):
         data.append({
             "Symbol": format_stock_label(item.symbol, item.stock.name if item.stock else None),
             "Current Price": current_price,
-            "Daily Change": daily_change,
+            "Change": daily_change,
+            "Change %": daily_change_pct,
             "Purchase Price": purchase_price if purchase_price else None,
             "Target Price": item.target_price,
             "Stop Loss": item.stop_loss,
@@ -165,13 +188,20 @@ def show_watchlist(db: Session):
             ),
         })
 
-    if watchlist_updated:
-        db.commit()
+    # Filter categories match the row styling: "Above Target" rows render
+    # darkgreen, gain rows green, loss rows red (None/zero = no data/break-even,
+    # only visible under "All").
+    if filter_choice == "Above Target":
+        data = [r for r in data if r["_above_target"]]
+    elif filter_choice == "Gain":
+        data = [r for r in data if not r["_above_target"] and (r["_gain_loss"] or 0) > 0]
+    elif filter_choice == "Loss":
+        data = [r for r in data if (r["_gain_loss"] or 0) < 0]
 
     if data:
         watchlist_table = pd.DataFrame(data)
         styled_table = watchlist_table.style.apply(_style_watchlist_row, axis=1).hide(
-            axis="columns", subset=["_gain_loss", "_above_target"]
+            axis="columns", subset=[c for c in watchlist_table.columns if c.startswith("_")]
         )
         st.dataframe(
             styled_table,
@@ -180,7 +210,8 @@ def show_watchlist(db: Session):
             column_config={
                 "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
                 "Current Price": st.column_config.NumberColumn("Current Price", format="R %.2f", help="Latest market price per share."),
-                "Daily Change": st.column_config.NumberColumn("Daily Change", format="%+.2f%%", help="Change since the previous close."),
+                "Change": st.column_config.NumberColumn("Change", format="R %+.2f", help="Rand change since the previous close."),
+                "Change %": st.column_config.NumberColumn("Change %", format="%+.2f%%", help="Percentage change since the previous close."),
                 "Purchase Price": st.column_config.NumberColumn("Purchase Price", format="R %.2f", help="Average price paid per share, if held."),
                 "Target Price": st.column_config.NumberColumn("Target Price", format="R %.2f", help="Price target for this stock."),
                 "Stop Loss": st.column_config.NumberColumn("Stop Loss", format="R %.2f", help="Stop loss price for this stock."),
@@ -196,7 +227,9 @@ def show_watchlist(db: Session):
             '<span style="background-color: #fef3c7; padding: 2px 8px; border-radius: 4px;">No data / break-even</span>',
             unsafe_allow_html=True,
         )
-    
+    else:
+        st.info(f"No stocks match the '{filter_choice}' filter.")
+
     st.markdown("---")
 
     # Edit target / stop loss
@@ -228,9 +261,34 @@ def show_watchlist(db: Session):
                 key=f"edit_stop_{symbol_to_edit}",
             )
 
+        alert_move_edit = st.checkbox(
+            "Alert me on a daily move beyond a threshold",
+            value=bool(
+                item_to_edit
+                and (item_to_edit.notify_price_increase or item_to_edit.notify_price_decrease)
+            ),
+            key=f"edit_alert_{symbol_to_edit}",
+        )
+        move_threshold_edit = st.number_input(
+            "Move threshold %",
+            min_value=0.5,
+            max_value=50.0,
+            value=(item_to_edit.price_change_threshold or 5.0) if item_to_edit else 5.0,
+            step=0.5,
+            key=f"edit_threshold_{symbol_to_edit}",
+        ) if alert_move_edit else 5.0
+        new_notes = st.text_area(
+            "Notes",
+            value=item_to_edit.notes or "" if item_to_edit else "",
+            key=f"edit_notes_{symbol_to_edit}",
+        )
+
         if st.button("Update") and item_to_edit:
-            _edit_watchlist_item(db, item_to_edit.symbol, new_target, new_stop)
-            st.success(f"Updated {item_to_edit.symbol} target/stop loss.")
+            _edit_watchlist_item(
+                db, item_to_edit.symbol, new_target, new_stop,
+                alert_move_edit, move_threshold_edit, new_notes,
+            )
+            st.success(f"Updated {item_to_edit.symbol}.")
             st.rerun()
 
     st.markdown("---")
@@ -263,7 +321,16 @@ def show_watchlist(db: Session):
                 st.rerun()
 
 
-def _add_to_watchlist(db: Session, symbol: str, target_price: float, purchase_price: float, stop_loss: float, notes: str) -> int | None:
+def _add_to_watchlist(
+    db: Session,
+    symbol: str,
+    target_price: float,
+    purchase_price: float,
+    stop_loss: float,
+    notes: str,
+    notify_move: bool = False,
+    move_threshold: float = 5.0,
+) -> int | None:
     """Add a stock to the watchlist.
 
     Returns the number of price points backfilled, or None when the symbol is
@@ -296,7 +363,10 @@ def _add_to_watchlist(db: Session, symbol: str, target_price: float, purchase_pr
         target_price=target_price if target_price > 0 else None,
         purchase_price=purchase_price if purchase_price > 0 else None,
         stop_loss=stop_loss if stop_loss > 0 else None,
-        notes=notes if notes else None
+        notes=notes if notes else None,
+        notify_price_increase=notify_move,
+        notify_price_decrease=notify_move,
+        price_change_threshold=move_threshold,
     )
 
     db.add(item)
@@ -312,6 +382,19 @@ def _add_to_watchlist(db: Session, symbol: str, target_price: float, purchase_pr
         logger.info(f"Fetched {saved} price points for {symbol}")
     except Exception as e:
         logger.error(f"Failed to fetch price data for {symbol}: {e}")
+
+    # A symbol that produced no history and has no stored prices is almost
+    # certainly a bad ticker - deactivate it so it doesn't pollute the
+    # Company View selector or get tracked by the updater. A provider outage
+    # on an already-priced stock never triggers deactivation, and re-adding
+    # a previously-failed ticker reactivates it.
+    has_prices = db.query(StockPrice).filter(StockPrice.symbol == symbol).first() is not None
+    if saved > 0 and not stock.is_active:
+        stock.is_active = True
+        db.commit()
+    elif saved == 0 and not has_prices:
+        stock.is_active = False
+        db.commit()
     return saved
 
 
@@ -323,8 +406,16 @@ def _remove_from_watchlist(db: Session, symbols: list):
     db.commit()
 
 
-def _edit_watchlist_item(db: Session, symbol: str, target_price: float, stop_loss: float):
-    """Update a watchlist item's target price and stop loss."""
+def _edit_watchlist_item(
+    db: Session,
+    symbol: str,
+    target_price: float,
+    stop_loss: float,
+    notify_move: bool = False,
+    move_threshold: float = 5.0,
+    notes: str = "",
+):
+    """Update a watchlist item's target/stop-loss, alert preferences and notes."""
     item = db.query(WatchlistItem).filter(
         WatchlistItem.symbol == symbol,
         WatchlistItem.is_active == True,
@@ -336,6 +427,13 @@ def _edit_watchlist_item(db: Session, symbol: str, target_price: float, stop_los
 
     item.target_price = target_price if target_price > 0 else None
     item.stop_loss = stop_loss if stop_loss > 0 else None
+    item.notify_price_increase = notify_move
+    item.notify_price_decrease = notify_move
+    # Only overwrite the threshold when alerts are on - editing with the
+    # checkbox off must not silently reset a stored custom threshold to 5.0.
+    if notify_move:
+        item.price_change_threshold = move_threshold
+    item.notes = notes or None
     db.commit()
 
 

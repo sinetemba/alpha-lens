@@ -1,3 +1,4 @@
+import time
 import yfinance as yf
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
@@ -16,6 +17,28 @@ class YFinanceCollector:
 
     def __init__(self):
         self.enabled = settings.yfinance_enabled
+
+    @staticmethod
+    def _call_with_retry(label: str, fn, max_retries: int = 2, base_delay: float = 0.5):
+        """Run a callable with exponential-backoff retries on exceptions.
+
+        yfinance raises assorted transport/parsing errors for transient
+        failures; a short retry window absorbs most of them without stalling
+        the caller for long.
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = fn()
+                if attempt > 1:
+                    logger.info(f"{label} succeeded on attempt {attempt}")
+                return result
+            except Exception as e:
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logger.warning(f"{label} failed ({e}); retrying in {delay:.1f}s")
+                    time.sleep(delay)
+                else:
+                    raise
 
     def get_ticker(self, symbol: str) -> Optional[yf.Ticker]:
         """Get a Ticker object for a symbol."""
@@ -52,8 +75,10 @@ class YFinanceCollector:
             return None
         
         try:
-            info = ticker.info
-            return info
+            return self._call_with_retry(
+                f"Yahoo info for {symbol}",
+                lambda: ticker.info,
+            )
         except Exception as e:
             logger.error(f"Error getting info for {symbol}: {e}")
             return None
@@ -130,7 +155,10 @@ class YFinanceCollector:
             return None
         
         try:
-            hist = ticker.history(period=period, interval=interval)
+            hist = self._call_with_retry(
+                f"Yahoo history for {symbol}",
+                lambda: ticker.history(period=period, interval=interval),
+            )
             return self._to_rand(hist, symbol)
         except Exception as e:
             logger.error(f"Error getting history for {symbol}: {e}")
@@ -154,14 +182,17 @@ class YFinanceCollector:
         yf_symbols = {s: (s if "." in s else f"{s}.JO") for s in symbols}
 
         try:
-            data = yf.download(
-                list(yf_symbols.values()),
-                period=period,
-                interval=interval,
-                group_by="ticker",
-                threads=True,
-                progress=False,
-                auto_adjust=False,
+            data = self._call_with_retry(
+                f"Yahoo batch download ({len(yf_symbols)} symbols)",
+                lambda: yf.download(
+                    list(yf_symbols.values()),
+                    period=period,
+                    interval=interval,
+                    group_by="ticker",
+                    threads=True,
+                    progress=False,
+                    auto_adjust=False,
+                ),
             )
         except Exception as e:
             logger.error(f"Error batch downloading prices: {e}")
@@ -207,7 +238,10 @@ class YFinanceCollector:
             return None
         
         try:
-            hist = ticker.history(start=start_date, end=end_date, interval=interval)
+            hist = self._call_with_retry(
+                f"Yahoo history for {symbol}",
+                lambda: ticker.history(start=start_date, end=end_date, interval=interval),
+            )
             return self._to_rand(hist, symbol)
         except Exception as e:
             logger.error(f"Error getting history for {symbol}: {e}")
@@ -218,10 +252,16 @@ class YFinanceCollector:
         ticker = self.get_ticker(symbol)
         if not ticker:
             return None
-        
+
         try:
-            dividends = ticker.dividends
-            return dividends
+            # Note: Yahoo reports .JO dividend amounts in cents for some
+            # tickers and Rand for others (unlike OHLC, which is always ZAc).
+            # Unit correction happens in DataService.update_dividends, which
+            # can compare amounts against stored closes for free.
+            return self._call_with_retry(
+                f"Yahoo dividends for {symbol}",
+                lambda: ticker.dividends,
+            )
         except Exception as e:
             logger.error(f"Error getting dividends for {symbol}: {e}")
             return None
@@ -310,31 +350,4 @@ class YFinanceCollector:
             return calendar
         except Exception as e:
             logger.error(f"Error getting calendar for {symbol}: {e}")
-            return None
-    
-    def get_earnings(self, symbol: str) -> Optional[Dict]:
-        """Get earnings information for a symbol."""
-        ticker = self.get_ticker(symbol)
-        if not ticker:
-            return None
-        
-        try:
-            earnings = ticker.earnings
-            quarterly_earnings = ticker.quarterly_earnings
-            return {
-                "annual": earnings,
-                "quarterly": quarterly_earnings,
-            }
-        except Exception as e:
-            logger.error(f"Error getting earnings for {symbol}: {e}")
-            return None
-    
-    def search_symbols(self, query: str) -> Optional[List[Dict]]:
-        """Search for symbols matching a query."""
-        try:
-            tickers = yf.Tickers(query)
-            # This is a simplified search - yfinance doesn't have a direct search API
-            return None
-        except Exception as e:
-            logger.error(f"Error searching symbols: {e}")
             return None

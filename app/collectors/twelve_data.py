@@ -111,29 +111,33 @@ class TwelveDataCollector:
 
         Returns False without sleeping or making a request if today's daily cap
         is already exhausted - the caller should skip the request entirely.
+
+        The sleep happens outside _lock: holding it while sleeping would block
+        every other thread that touches the collector - including Streamlit UI
+        threads that only want to read the quota banner - for up to a minute.
         """
-        with cls._lock:
-            cls._reset_daily_count_if_new_day()
-            if cls._daily_count >= cls._daily_limit:
-                return False
+        while True:
+            with cls._lock:
+                cls._reset_daily_count_if_new_day()
+                if cls._daily_count >= cls._daily_limit:
+                    return False
 
-            now = time.monotonic()
-            while cls._request_times and now - cls._request_times[0] >= 60:
-                cls._request_times.popleft()
-
-            if len(cls._request_times) >= cls._minute_limit:
-                wait = 60 - (now - cls._request_times[0]) + 0.1
-                if wait > 0:
-                    logger.info(f"Twelve Data per-minute limit reached, waiting {wait:.1f}s")
-                    time.sleep(wait)
                 now = time.monotonic()
                 while cls._request_times and now - cls._request_times[0] >= 60:
                     cls._request_times.popleft()
 
-            cls._request_times.append(time.monotonic())
-            cls._daily_count += 1
-            cls._persist_daily_state()
-            return True
+                if len(cls._request_times) < cls._minute_limit:
+                    cls._request_times.append(now)
+                    cls._daily_count += 1
+                    cls._persist_daily_state()
+                    return True
+
+                wait = 60 - (now - cls._request_times[0]) + 0.1
+
+            if wait > 0:
+                logger.info(f"Twelve Data per-minute limit reached, waiting {wait:.1f}s")
+                time.sleep(wait)
+            # Loop: re-check under the lock so concurrent callers stay serialised.
 
     @classmethod
     def last_rate_limit_message(cls) -> Optional[str]:
@@ -200,8 +204,41 @@ class TwelveDataCollector:
 
         params["apikey"] = self.api_key
 
-        try:
-            response = requests.get(f"{self.base_url}/{endpoint}", params=params, timeout=30)
+        response = None
+        for attempt in range(3):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/{endpoint}", params=params, timeout=30
+                )
+            except requests.exceptions.RequestException as exc:
+                # Never log `str(exc)` directly - requests exceptions can include the
+                # full request URL, which would leak the API key.
+                failed_response = getattr(exc, "response", None)
+                if failed_response is not None:
+                    logger.error(
+                        f"Twelve Data API request failed ({failed_response.status_code} {failed_response.reason})"
+                    )
+                    try:
+                        body = failed_response.text[:500]
+                        if body:
+                            logger.error(f"Twelve Data response body: {body}")
+                    except Exception:
+                        pass
+                    return None
+                # No response at all - transport error (timeout/connection).
+                # These are worth retrying once or twice with backoff.
+                if attempt < 2:
+                    delay = 0.5 * (2 ** attempt)
+                    logger.warning(
+                        f"Twelve Data {endpoint} request failed "
+                        f"({exc.__class__.__name__}); retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.error(
+                    f"Twelve Data request failed before a response was received: {exc.__class__.__name__}"
+                )
+                return None
 
             # Twelve Data returns plan-gated symbols as a plain HTTP 404, identical to an
             # unknown/delisted symbol, unless the body is inspected before raise_for_status()
@@ -222,6 +259,18 @@ class TwelveDataCollector:
                 self._handle_rate_limited(response)
                 return None
 
+            if response.status_code >= 500 and attempt < 2:
+                delay = 0.5 * (2 ** attempt)
+                logger.warning(
+                    f"Twelve Data {endpoint} returned HTTP {response.status_code}; "
+                    f"retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+                continue
+
+            break
+
+        try:
             response.raise_for_status()
             data = response.json()
 
@@ -394,7 +443,10 @@ class TwelveDataCollector:
         if not symbols:
             return {}
         if len(symbols) > 10:
-            logger.warning("Twelve Data API supports maximum 10 symbols per request")
+            logger.warning(
+                f"get_multiple_quotes called with {len(symbols)} symbols; "
+                f"dropping {symbols[10:]} - chunk the call site instead"
+            )
             symbols = symbols[:10]
 
         data = self._make_request("quote", {"symbol": ",".join(symbols)})
@@ -411,7 +463,10 @@ class TwelveDataCollector:
             quote = data.get(symbol)
             if not isinstance(quote, dict) or quote.get("status") == "error":
                 continue
-            if quote.get("mic_code") and quote.get("mic_code") != JSE_MIC_CODE:
+            if quote.get("mic_code") != JSE_MIC_CODE:
+                # Same rule as get_quote: bare symbols must resolve to the JSE.
+                # A missing mic_code can't be verified, so it is discarded too -
+                # accepting it let same-named US/other-exchange quotes through.
                 logger.warning(
                     f"Twelve Data quote for '{symbol}' resolved to {quote.get('exchange')} "
                     f"({quote.get('mic_code')}), not JSE - discarding."

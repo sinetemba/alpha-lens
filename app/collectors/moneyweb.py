@@ -97,10 +97,14 @@ class MoneywebCollector:
             }
             r = s.post(login_url, data=data, timeout=20, allow_redirects=False)
 
-            # WordPress returns a 302 redirect on successful login.
+            # WordPress sets a wordpress_logged_in_* cookie only on success;
+            # a failed login also returns a 302 (back to wp-login.php), so the
+            # status code alone is not proof of authentication.
             if r.status_code in (302, 303):
-                self._authenticated = True
-                return True
+                if any(name.startswith("wordpress_logged_in") for name in s.cookies):
+                    self._authenticated = True
+                    return True
+                raise Exception("Login failed: no auth cookie returned (check credentials)")
 
             text = r.text.lower()
             if "login_error" in text or "invalid" in text or "incorrect" in text:
@@ -151,7 +155,8 @@ class MoneywebCollector:
         if rows is None:
             return 0
 
-        now = datetime.now(timezone.utc)
+        # Naive UTC to match the naive DateTime columns.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         watch_rows = []
         for row in rows:
             instrument = str(row.get("Instrument", "")).strip()
@@ -171,9 +176,14 @@ class MoneywebCollector:
         if not watch_rows:
             return 0
 
-        db.query(MoneywebDividendWatch).delete()
-        db.add_all(watch_rows)
-        db.commit()
+        try:
+            db.query(MoneywebDividendWatch).delete()
+            db.add_all(watch_rows)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error saving Moneyweb dividend watch rows: {e}")
+            return 0
         return len(watch_rows)
 
     @staticmethod

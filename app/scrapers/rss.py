@@ -1,4 +1,5 @@
 import feedparser
+import requests
 from email.utils import parsedate_to_datetime
 from typing import List, Dict, Optional
 from datetime import datetime, timezone
@@ -15,7 +16,11 @@ class RSSScraper:
     def fetch_feed(self, url: str) -> Optional[List[Dict]]:
         """Fetch and parse an RSS feed."""
         try:
-            feed = feedparser.parse(url)
+            # feedparser.parse(url) uses urllib with no timeout - a hung feed
+            # would block the whole update job, so fetch the bytes ourselves.
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            feed = feedparser.parse(response.content)
             
             if feed.bozo:
                 logger.warning(f"Error parsing RSS feed from {url}: {feed.bozo_exception}")

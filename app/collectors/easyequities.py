@@ -86,6 +86,14 @@ class EasyEquitiesCollector:
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
+            # The client package never passes a timeout, so a stalled socket
+            # would hang the retry loop forever. Wrap session.request with a
+            # default - this covers login, accounts.* and direct session.get calls.
+            original_request = client.session.request
+            def _request_with_timeout(method, url, **kwargs):
+                kwargs.setdefault("timeout", 30)
+                return original_request(method, url, **kwargs)
+            client.session.request = _request_with_timeout
             self._client = client
             self._client_authenticated = False
             return client

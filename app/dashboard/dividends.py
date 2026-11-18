@@ -1,11 +1,13 @@
 import streamlit as st
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from loguru import logger
 
 from app.models.dividend import Dividend, MoneywebDividendWatch
-from app.models.portfolio import PortfolioHolding
+from app.models.portfolio import PortfolioHolding, is_jse_tracked_account
 from app.models.stock import Stock
+from app.models.watchlist import WatchlistItem
 from app.services.data_service import DataService
 from app.collectors.moneyweb import MoneywebCollector
 from app.dashboard.utils import format_stock_label, render_last_fetch_caption, _to_display_tz
@@ -21,24 +23,38 @@ def show_dividends(db: Session):
     total_dividends = db.query(Dividend).count()
     total_amount = db.query(func.sum(Dividend.amount)).scalar() or 0.0
 
-    holdings = db.query(PortfolioHolding).options(
-        joinedload(PortfolioHolding.stock)
-    ).filter(
-        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
-    ).all()
+    holdings = [
+        h for h in db.query(PortfolioHolding).options(
+            joinedload(PortfolioHolding.stock)
+        ).filter(
+            ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
+        ).all()
+        # Dividend records are JSE-only; attributing them to a USD holding
+        # whose bare ticker happens to collide with a JSE symbol would
+        # fabricate income and mix currencies.
+        if is_jse_tracked_account(h.account_type)
+    ]
 
-    # One grouped query replaces a per-holding SUM (was 2xN queries per render).
-    dividends_per_share: dict[str, float] = {}
+    # Only dividends with ex-date on/after the holding's purchase date were
+    # actually received - earlier ones overstate income. One query fetches the
+    # per-symbol rows, then ex-dates are filtered per holding (account-type
+    # purchase dates differ).
+    dividends_by_symbol: dict[str, list] = {}
     if holdings:
-        dividends_per_share = {
-            symbol: total or 0.0
-            for symbol, total in db.query(Dividend.symbol, func.sum(Dividend.amount))
-            .filter(Dividend.symbol.in_({h.symbol for h in holdings}))
-            .group_by(Dividend.symbol)
-            .all()
-        }
+        for sym, amount, ex_date in db.query(
+            Dividend.symbol, Dividend.amount, Dividend.ex_dividend_date
+        ).filter(Dividend.symbol.in_({h.symbol for h in holdings})).all():
+            dividends_by_symbol.setdefault(sym, []).append((ex_date, amount or 0.0))
+
+    def _holding_dividends_per_share(h) -> float:
+        return sum(
+            amount
+            for ex_date, amount in dividends_by_symbol.get(h.symbol, [])
+            if h.purchase_date is None or (ex_date is not None and ex_date >= h.purchase_date)
+        )
+
     total_income = sum(
-        (h.quantity or 0.0) * dividends_per_share.get(h.symbol, 0.0) for h in holdings
+        (h.quantity or 0.0) * _holding_dividends_per_share(h) for h in holdings
     )
 
     col1, col2, col3 = st.columns(3)
@@ -47,7 +63,7 @@ def show_dividends(db: Session):
     with col2:
         st.metric("Total Dividends (per share)", f"R {total_amount:,.4f}")
     with col3:
-        st.metric("Portfolio Dividend Income", f"R {total_income:,.2f}")
+        st.metric("Dividend Income (since purchase)", f"R {total_income:,.2f}")
 
     st.markdown("---")
     render_last_fetch_caption(db, [h.symbol for h in holdings])
@@ -55,16 +71,29 @@ def show_dividends(db: Session):
     # Moneyweb Dividend Watch Calendar
     st.subheader("Dividends Watch Calendar")
 
+    # Fetch results are flashed after the rerun below - messages rendered in
+    # the same run as st.rerun() are discarded before the user sees them.
+    flash = st.session_state.pop("dividends_fetch_flash", None)
+    if flash:
+        level, message = flash
+        getattr(st, level)(message)
+
     if st.button("🌐 Fetch from Moneyweb"):
         with st.spinner("Pulling dividend watch data from Moneyweb..."):
             collector = MoneywebCollector()
             saved = collector.save_dividend_watch(db)
         if saved > 0:
-            st.success(f"Saved {saved} dividend calendar rows from Moneyweb.")
+            st.session_state["dividends_fetch_flash"] = (
+                "success", f"Saved {saved} dividend calendar rows from Moneyweb."
+            )
         elif collector.last_error:
-            st.warning(f"Could not fetch Moneyweb data: {collector.last_error}")
+            st.session_state["dividends_fetch_flash"] = (
+                "warning", f"Could not fetch Moneyweb data: {collector.last_error}"
+            )
         else:
-            st.info("No new Moneyweb dividend data found.")
+            st.session_state["dividends_fetch_flash"] = (
+                "info", "No new Moneyweb dividend data found."
+            )
         st.rerun()
 
     moneyweb_rows = db.query(MoneywebDividendWatch).order_by(
@@ -99,17 +128,34 @@ def show_dividends(db: Session):
         with st.spinner("Fetching dividend history from Yahoo Finance..."):
             try:
                 data_service = DataService(db)
-                saved = data_service.update_dividends()
+                # Restrict to tracked symbols - fetching for every active
+                # stock costs ~1 Twelve Data call per symbol (~72 calls).
+                tracked = sorted(
+                    {h.symbol for h in holdings}
+                    | {
+                        item.symbol
+                        for item in db.query(WatchlistItem)
+                        .filter(WatchlistItem.is_active == True)
+                        .all()
+                    }
+                )
+                saved = data_service.update_dividends(tracked)
                 if saved > 0:
-                    st.success(f"Saved {saved} new dividend records.")
+                    st.session_state["dividends_fetch_flash"] = (
+                        "success", f"Saved {saved} new dividend records."
+                    )
                 else:
-                    st.warning(
+                    st.session_state["dividends_fetch_flash"] = (
+                        "warning",
                         "No new dividend records found. This can happen if Yahoo Finance "
                         "has no data for the active symbols, rate-limits the request, or "
-                        "if no stocks are marked active. Try adding a dividend manually below."
+                        "if no stocks are marked active. Try adding a dividend manually below.",
                     )
             except Exception as e:
-                st.error(f"Error fetching dividends: {e}")
+                logger.error(f"Error fetching dividends: {e}")
+                st.session_state["dividends_fetch_flash"] = (
+                    "error", "Failed to fetch dividends - see logs for details."
+                )
         st.rerun()
 
     # All dividends table (most recent first, capped so the page stays light)
@@ -138,7 +184,7 @@ def show_dividends(db: Session):
         st.subheader("All Holdings")
         holdings_data = []
         for h in holdings:
-            per_share = dividends_per_share.get(h.symbol, 0.0)
+            per_share = _holding_dividends_per_share(h)
             income = (h.quantity or 0.0) * per_share
             holdings_data.append({
                 "Symbol": format_stock_label(h.symbol, h.stock.name if h.stock else None),
@@ -180,9 +226,12 @@ def show_dividends(db: Session):
                     db.flush()
 
                 ex_dt = datetime.combine(ex_date, datetime.min.time())
+                # Match on calendar day, not exact timestamp - legacy rows
+                # stored non-midnight ex-dates would slip past an == check.
                 existing = db.query(Dividend).filter(
                     Dividend.symbol == symbol,
-                    Dividend.ex_dividend_date == ex_dt,
+                    Dividend.ex_dividend_date >= ex_dt,
+                    Dividend.ex_dividend_date < ex_dt + timedelta(days=1),
                 ).first()
                 if existing:
                     st.warning(f"A dividend for {symbol} on {ex_date} already exists.")

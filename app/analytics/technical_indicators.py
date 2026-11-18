@@ -19,14 +19,19 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
-        """Calculate Relative Strength Index."""
+        """Calculate Relative Strength Index using Wilder's smoothing.
+
+        ewm(alpha=1/period) matches the recursive averaging in Wilder's
+        original definition - a plain rolling mean overstates swings and
+        disagrees with published RSI values.
+        """
         delta = data.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        
+        gain = delta.where(delta > 0, 0).ewm(alpha=1 / period, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1 / period, adjust=False).mean()
+
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
-        
+
         return rsi
     
     @staticmethod
@@ -68,8 +73,9 @@ class TechnicalIndicators:
         low_close = np.abs(low - close.shift())
         
         true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr = true_range.rolling(window=period).mean()
-        
+        # Wilder's smoothing, consistent with the RSI definition.
+        atr = true_range.ewm(alpha=1 / period, adjust=False).mean()
+
         return atr
     
     @staticmethod

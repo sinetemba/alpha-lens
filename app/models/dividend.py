@@ -1,7 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, Date, ForeignKey, Index
 from sqlalchemy.orm import relationship
-from datetime import datetime, timezone
-from .base import Base
+from .base import Base, utcnow_naive
 
 
 class Dividend(Base):
@@ -10,9 +9,9 @@ class Dividend(Base):
     __tablename__ = "dividends"
 
     id = Column(Integer, primary_key=True, index=True)
-    stock_id = Column(Integer, ForeignKey("stocks.id"), nullable=False)
+    stock_id = Column(Integer, ForeignKey("stocks.id"), nullable=False, index=True)
     symbol = Column(String(10), index=True, nullable=False)
-    
+
     # Dividend details
     amount = Column(Float, nullable=False)
     currency = Column(String(3), default="ZAR")
@@ -22,7 +21,7 @@ class Dividend(Base):
     payment_date = Column(DateTime)
     frequency = Column(String(20))  # monthly, quarterly, semi-annual, annual
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=utcnow_naive)
 
     # Relationships
     stock = relationship("Stock", back_populates="dividends")
@@ -48,8 +47,8 @@ class MoneywebDividendWatch(Base):
     pay_date = Column(Date)
     dividend_type = Column(String(20))
     value = Column(String(50))
-    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    fetched_at = Column(DateTime, default=utcnow_naive)
+    created_at = Column(DateTime, default=utcnow_naive)
 
     def __repr__(self):
         return f"<MoneywebDividendWatch(instrument='{self.instrument}', pay_date='{self.pay_date}', value='{self.value}')>"

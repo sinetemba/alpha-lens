@@ -11,8 +11,9 @@ from loguru import logger
 from app.analytics.technical_indicators import TechnicalIndicators
 from app.collectors.yfinance import JSE_PRICE_SCALE
 from app.dashboard.company import _get_company_news
-from app.dashboard.utils import format_stock_label, _to_display_tz
+from app.dashboard.utils import format_stock_label, _to_display_tz, render_last_fetch_caption
 from app.models.news import NewsArticle
+from app.models.portfolio import PortfolioHolding, is_jse_tracked_account
 from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
 
@@ -79,13 +80,25 @@ def show_penny_stocks(db: Session):
         "Select a row to see details below the grid."
     )
     st.caption("⚠️ Screening is heuristic and speculative — not financial advice.")
+    render_last_fetch_caption(db)
 
     # Merge the curated list with active DB stocks so user-tracked small caps
-    # are scanned too. Index/forex symbols (containing '.' or '^') are skipped.
+    # are scanned too. Index/forex symbols (containing '.' or '^') and
+    # synthetic pseudo-symbols (commodity rows like AV_*/XAU_*, which would
+    # resolve to nothing under a ".JO" suffix) are skipped.
+    # Symbols held only under non-JSE accounts (e.g. a bare "AAPL" from a USD
+    # holding) are not JSE tickers - scanning "<symbol>.JO" wastes a slot or
+    # worse, resolves a different instrument that shares the ticker.
+    non_jse_symbols = {
+        h.symbol
+        for h in db.query(PortfolioHolding.symbol, PortfolioHolding.account_type).all()
+        if not is_jse_tracked_account(h.account_type)
+    }
     db_stocks = {
         s.symbol: s.name
         for s in db.query(Stock).filter(Stock.is_active == True).all()
-        if s.symbol and "." not in s.symbol and "^" not in s.symbol
+        if s.symbol and "." not in s.symbol and "^" not in s.symbol and "_" not in s.symbol
+        and s.symbol not in non_jse_symbols
     }
     extra_symbols = tuple(sorted(s for s in db_stocks if s not in JSE_PENNY_CANDIDATES))
 
@@ -96,12 +109,16 @@ def show_penny_stocks(db: Session):
             st.rerun()
 
     with st.spinner("Scanning JSE penny stocks via Yahoo Finance..."):
-        results, scanned_at = _scan_penny_stocks(extra_symbols)
+        results, scanned_at, scan_error = _scan_penny_stocks(extra_symbols)
 
     for row in results:
         row["name"] = db_stocks.get(row["symbol"]) or JSE_PENNY_CANDIDATES.get(row["symbol"]) or row["symbol"]
 
     st.caption(f"Scanned at {_to_display_tz(scanned_at).strftime('%d %b %Y %H:%M')} SAST")
+
+    if scan_error:
+        st.warning(f"The penny-stock scan failed ({scan_error}) - try Rescan later.")
+        return
 
     if not results:
         st.info("No JSE shares currently trading below the threshold were found.")
@@ -175,7 +192,11 @@ def show_penny_stocks(db: Session):
 
 @st.cache_data(ttl=SCAN_TTL_SECONDS, show_spinner=False)
 def _scan_penny_stocks(extra_symbols: tuple) -> tuple:
-    """Batch-download 1y daily history for all candidates and score those below the threshold."""
+    """Batch-download 1y daily history for all candidates and score those below the threshold.
+
+    Returns (results, scanned_at, error) so the page can distinguish "no
+    candidates" from "the scan itself failed".
+    """
     symbols = sorted(set(JSE_PENNY_CANDIDATES) | set(extra_symbols))
     scanned_at = datetime.now(timezone.utc)
 
@@ -191,10 +212,10 @@ def _scan_penny_stocks(extra_symbols: tuple) -> tuple:
         )
     except Exception as e:
         logger.error(f"Penny stock scan failed: {e}")
-        return [], scanned_at
+        return [], scanned_at, str(e)
 
     if data is None or data.empty:
-        return [], scanned_at
+        return [], scanned_at, "Yahoo Finance returned no data"
 
     results = []
     for symbol in symbols:
@@ -203,7 +224,7 @@ def _scan_penny_stocks(extra_symbols: tuple) -> tuple:
             results.append(stats)
 
     results.sort(key=lambda r: r["score"], reverse=True)
-    return results, scanned_at
+    return results, scanned_at, None
 
 
 def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Optional[dict]:
@@ -428,7 +449,7 @@ def _influences(row: dict) -> list:
 def _render_penny_news(db: Session, symbol: str, name: Optional[str]):
     """Render up to 3 latest news articles for the selected stock."""
     with st.spinner("Loading company news..."):
-        news = _get_company_news(symbol, name)[:3]
+        news = _get_company_news(db, symbol, name)[:3]
 
     if not news:
         archived = db.query(NewsArticle).filter(

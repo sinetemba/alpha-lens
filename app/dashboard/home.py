@@ -1,29 +1,26 @@
 import streamlit as st
-from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 from app.models.base import SessionLocal
 from app.models.stock import Stock, StockPrice
 from app.models.news import NewsArticle
-from app.models.portfolio import Portfolio, PortfolioHolding
+from app.models.portfolio import Portfolio, PortfolioHolding, is_jse_tracked_account
 from app.models.watchlist import WatchlistItem
+from app.models.notification import Notification
 from app.config.settings import settings
 from app.collectors.moneyweb import MoneywebCollector
 from app.dashboard.utils import (
-    day_of,
     format_stock_label,
     PriceSnapshot,
-    get_latest_market_data_timestamp,
     get_latest_news_timestamp,
-    format_market_data_age,
+    render_market_data_refresh_control,
+    render_updater_status_banner,
     format_news_age,
     _to_display_tz,
 )
-from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
-from app.services.data_service import DataService
-from loguru import logger
+from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES, EXCLUDED_PORTFOLIO_SYMBOLS
+from app.services.price_queries import get_latest_and_previous_prices
 
 
 
@@ -33,29 +30,13 @@ PAGE_DATA_SOURCES = {
     "Watchlist": "Twelve Data, Yahoo Finance",
     "Portfolio": "EasyEquities, Twelve Data, Yahoo Finance",
     "Dividends": "Yahoo Finance, Moneyweb",
+    "Notifications": "Updater alerts",
     "Company View": "Twelve Data, Yahoo Finance",
     "Penny Stocks": "Yahoo Finance, RSS feeds",
     "Commodities": "Metals.dev, Yahoo Finance",
     "Krugerrands": "GoldAPI",
+    "Crypto": "CoinGecko",
 }
-
-# Thread pool for non-blocking home page price/news refreshes.
-_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="home_market_refresh_")
-
-
-def _run_refresh(symbols: list[str], fetch_news: bool) -> None:
-    """Background refresh of prices and, if allowed, news."""
-    db = SessionLocal()
-    try:
-        data_service = DataService(db)
-        data_service.update_stock_prices(symbols)
-        if fetch_news:
-            data_service.collect_news()
-        logger.info(f"Background refresh completed for {len(symbols)} symbols")
-    except Exception as e:
-        logger.error(f"Background refresh failed: {e}")
-    finally:
-        db.close()
 
 
 def _should_fetch_news(db: Session) -> bool:
@@ -83,9 +64,13 @@ def show_home():
         # Sidebar navigation
         page = st.sidebar.radio(
             "Navigate",
-            ["Home", "Watchlist", "Portfolio", "Dividends", "Company View", "Penny Stocks", "Commodities", "Krugerrands"],
+            ["Home", "Watchlist", "Portfolio", "Dividends", "Notifications", "Company View", "Penny Stocks", "Commodities", "Krugerrands", "Crypto"],
             index=0
         )
+
+        unread_count = db.query(Notification).filter(Notification.is_read == False).count()
+        if unread_count:
+            st.sidebar.caption(f"🔔 {unread_count} unread notification{'s' if unread_count != 1 else ''}")
 
         # Page-specific header with data sources
         data_source = PAGE_DATA_SOURCES.get(page, "Multiple sources")
@@ -113,6 +98,9 @@ def show_home():
             elif page == "Dividends":
                 from .dividends import show_dividends
                 show_dividends(db)
+            elif page == "Notifications":
+                from .notifications import show_notifications
+                show_notifications(db)
             elif page == "Company View":
                 from .company import show_company
                 show_company(db)
@@ -125,6 +113,9 @@ def show_home():
             elif page == "Krugerrands":
                 from .krugerrands import show_krugerrands
                 show_krugerrands(db)
+            elif page == "Crypto":
+                from .crypto import show_crypto
+                show_crypto(db)
 
     finally:
         db.close()
@@ -144,13 +135,18 @@ def _render_home(db: Session):
         h.symbol for h in db.query(PortfolioHolding).filter(
             ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
         ).all()
+        # Same guard as the headless updater: USD-account holdings are US
+        # listings under bare symbols, not JSE tickers.
+        if is_jse_tracked_account(h.account_type)
     ]
     refresh_symbols = sorted(set(watchlist_symbols + portfolio_symbols + [settings.jse_index_yf_symbol]))
 
+    render_updater_status_banner(db)
     _render_home_refresh_control(db, refresh_symbols)
 
     # Get latest market data
     col1, col2, col3 = st.columns(3)
+    holdings = _portfolio_holdings(db)
 
     with col1:
         st.metric(
@@ -160,19 +156,26 @@ def _render_home(db: Session):
         )
 
     with col2:
-        portfolio_value = _get_portfolio_value(db)
-        st.metric(
-            label="Portfolio Value",
-            value=f"R {portfolio_value:,.2f}",
-            delta=_get_portfolio_change(db)
-        )
+        if holdings:
+            st.metric(
+                label="Portfolio Value",
+                value=f"R {_holdings_market_value(db, holdings):,.2f}",
+                delta=_get_portfolio_change(db)
+            )
+        else:
+            # "R 0.00" looked like a real value; make the empty state explicit.
+            st.metric(label="Portfolio Value", value="—")
+            st.caption("Add holdings on the Portfolio page.")
 
     with col3:
-        st.metric(
-            label="Daily Gain",
-            value=f"R {_get_daily_gain(db):,.2f}",
-            delta=_get_daily_gain_percentage(db)
-        )
+        if holdings:
+            st.metric(
+                label="Daily Gain",
+                value=f"R {_get_daily_gain(db):,.2f}",
+                delta=_get_daily_gain_percentage(db)
+            )
+        else:
+            st.metric(label="Daily Gain", value="—")
 
     st.markdown("---")
 
@@ -188,20 +191,18 @@ def _render_home(db: Session):
 
 
 def _render_home_refresh_control(db: Session, symbols: list[str]) -> None:
-    """Render a non-blocking refresh control with last fetch times."""
-    latest_price_ts = get_latest_market_data_timestamp(db, symbols)
-    latest_news_ts = get_latest_news_timestamp(db)
+    """Render the shared blocking refresh control plus the news-fetch age.
+
+    Uses the same spinner/result/quota control as the other data pages - a
+    fire-and-forget background refresh gave no feedback and left the user
+    guessing whether anything happened.
+    """
     fetch_news = _should_fetch_news(db)
-
-    _, refresh_col = st.columns([3, 1])
-    with refresh_col:
-        if st.button("🔄 Refresh Prices", key="home_market_data_refresh"):
-            _REFRESH_EXECUTOR.submit(_run_refresh, symbols, fetch_news)
-            st.info("Refresh started in the background; data will appear on the next page load.")
-
-        price_age = format_market_data_age(latest_price_ts)
-        news_age = format_news_age(latest_news_ts)
-        st.caption(f"{price_age} | {news_age}")
+    render_market_data_refresh_control(
+        db, key="home_market_data_refresh", symbols=symbols, include_news=fetch_news
+    )
+    latest_news_ts = get_latest_news_timestamp(db)
+    st.caption(format_news_age(latest_news_ts))
 
 
 @st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
@@ -231,29 +232,58 @@ def _get_jse_change(db: Session) -> str:
     return "N/A"
 
 
-def _get_portfolio_value(db: Session) -> float:
-    """Get total portfolio value, excluding demo account types."""
+def _portfolio_holdings(db: Session) -> list:
+    """JSE-tracked holdings in the primary portfolio, minus exclusions.
+
+    The Home metrics are Rand-denominated like the updater's tracked set, so
+    USD-account holdings (bare US symbols priced in dollars) and excluded
+    pseudo-symbols must not leak into them - a dollar `current_value` summed
+    into an "R" total, or a bare US ticker colliding with a JSE bar, both
+    produce quietly wrong metrics.
+    """
     portfolio = db.query(Portfolio).first()
     if not portfolio:
-        return 0.0
-    holdings = db.query(PortfolioHolding).filter(
-        PortfolioHolding.portfolio_id == portfolio.id,
-        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
-    ).all()
-    return sum(h.current_value or 0.0 for h in holdings)
+        return []
+    return [
+        h for h in db.query(PortfolioHolding).filter(
+            PortfolioHolding.portfolio_id == portfolio.id,
+            ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
+            ~PortfolioHolding.symbol.in_(EXCLUDED_PORTFOLIO_SYMBOLS),
+        ).all()
+        if is_jse_tracked_account(h.account_type)
+    ]
+
+
+def _holdings_market_value(db: Session, holdings) -> float:
+    """Value holdings at their latest stored market close.
+
+    holding.current_value is only refreshed by an EasyEquities sync or a
+    Portfolio-page visit; the bars the updater writes are fresher, so the Home
+    metrics stay current without requiring either.
+    """
+    prices = _get_latest_and_previous_prices(db, [h.symbol for h in holdings])
+    total = 0.0
+    for h in holdings:
+        latest, _ = prices.get(h.symbol, (None, None))
+        if latest and latest.close_price is not None and h.quantity:
+            total += latest.close_price * h.quantity
+        else:
+            total += h.current_value or 0.0
+    return total
+
+
+def _get_portfolio_value(db: Session) -> float:
+    """Get total portfolio value, excluding demo account types."""
+    return _holdings_market_value(db, _portfolio_holdings(db))
 
 
 def _get_portfolio_change(db: Session) -> str:
     """Get portfolio gain/loss percentage, excluding demo account types."""
-    portfolio = db.query(Portfolio).first()
-    if not portfolio:
+    holdings = _portfolio_holdings(db)
+    if not holdings:
         return "0.0%"
-    holdings = db.query(PortfolioHolding).filter(
-        PortfolioHolding.portfolio_id == portfolio.id,
-        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
-    ).all()
-    total_value = sum(h.current_value or 0.0 for h in holdings)
-    total_cost = sum(h.quantity * h.purchase_price for h in holdings)
+    total_value = _holdings_market_value(db, holdings)
+    total_cost = sum(h.quantity * h.purchase_price for h in holdings if h.quantity and h.purchase_price)
     pct = (
         ((total_value - total_cost) / total_cost) * 100
         if total_cost else 0.0
@@ -263,9 +293,7 @@ def _get_portfolio_change(db: Session) -> str:
 
 def _get_daily_gain(db: Session) -> float:
     """Get daily portfolio gain/loss by comparing current prices to previous day's close."""
-    holdings = db.query(PortfolioHolding).filter(
-        ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
-    ).all()
+    holdings = _portfolio_holdings(db)
     if not holdings:
         return 0.0
 
@@ -273,7 +301,7 @@ def _get_daily_gain(db: Session) -> float:
     daily_gain = 0.0
 
     for h in holdings:
-        if not h.current_price or not h.quantity:
+        if not h.quantity:
             continue
         latest, prev = prices.get(h.symbol, (None, None))
         if not latest:
@@ -286,10 +314,10 @@ def _get_daily_gain(db: Session) -> float:
 
 def _get_daily_gain_percentage(db: Session) -> str:
     """Get daily gain as a percentage of portfolio value."""
-    portfolio = db.query(Portfolio).first()
-    if portfolio and portfolio.current_value and portfolio.current_value > 0:
+    total_value = _get_portfolio_value(db)
+    if total_value > 0:
         daily_gain = _get_daily_gain(db)
-        pct = (daily_gain / portfolio.current_value) * 100
+        pct = (daily_gain / total_value) * 100
         return f"{pct:+.2f}%"
     return "0.0%"
 
@@ -305,95 +333,52 @@ def _get_daily_gain_percentage(db: Session) -> str:
 def _get_latest_and_previous_prices(
     db: Session, symbols: list[str]
 ) -> dict[str, tuple[Optional[PriceSnapshot], Optional[PriceSnapshot]]]:
-    """Batch-fetch each symbol's latest price and its most recent prior-day price.
-
-    Uses a single windowed CTE to pull only the latest and prior-day rows per
-    requested symbol, avoiding full scans and per-symbol N+1 queries.
-    """
-    if not symbols:
-        return {}
-
-    ranked = db.query(
-        StockPrice.symbol,
-        StockPrice.timestamp,
-        StockPrice.close_price,
-        StockPrice.volume,
-        StockPrice.rsi,
-        StockPrice.macd,
-        StockPrice.macd_signal,
-        func.dense_rank().over(
-            partition_by=StockPrice.symbol,
-            order_by=day_of(db, StockPrice.timestamp).desc(),
-        ).label('day_rank'),
-        func.row_number().over(
-            partition_by=[StockPrice.symbol, day_of(db, StockPrice.timestamp)],
-            order_by=StockPrice.timestamp.desc(),
-        ).label('intra_rank'),
-    ).filter(StockPrice.symbol.in_(symbols)).cte('ranked')
-
-    rows = db.query(
-        ranked.c.symbol,
-        ranked.c.timestamp,
-        ranked.c.close_price,
-        ranked.c.volume,
-        ranked.c.rsi,
-        ranked.c.macd,
-        ranked.c.macd_signal,
-        ranked.c.day_rank,
-    ).filter(or_(
-        and_(ranked.c.day_rank == 1, ranked.c.intra_rank == 1),
-        and_(ranked.c.day_rank == 2, ranked.c.intra_rank == 1),
-    )).order_by(ranked.c.symbol, ranked.c.day_rank).all()
-
-    result: dict[str, tuple[Optional[PriceSnapshot], Optional[PriceSnapshot]]] = {}
-    for row in rows:
-        sym = row.symbol
-        latest, prev = result.get(sym, (None, None))
-        snapshot = PriceSnapshot(
-            close_price=row.close_price,
-            timestamp=row.timestamp,
-            volume=row.volume,
-            rsi=row.rsi,
-            macd=row.macd,
-            macd_signal=row.macd_signal,
-        )
-        if row.day_rank == 1:
-            latest = snapshot
-        else:
-            prev = snapshot
-        result[sym] = (latest, prev)
-    return result
+    """Cached wrapper around the shared latest/previous-day price query."""
+    return get_latest_and_previous_prices(db, symbols)
 
 
 @st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
-def _get_daily_movers(db: Session, limit: int = 10) -> tuple[list, list]:
-    """Return the top daily winners and losers from Moneyweb (always used, no fallback)."""
+def _get_daily_movers(db: Session, limit: int = 10) -> Optional[tuple[list, list]]:
+    """Return the top daily winners and losers from Moneyweb, or None on failure."""
     collector = MoneywebCollector()
     result = collector.get_winners_and_losers()
 
-    if result is not None:
-        winners, losers = result
-        return (
-            [{
-                "Symbol": format_stock_label(m["Symbol"], m.get("Name")),
-                "Price": m["Price"],
-                "Move": m["Move"],
-                "Change": m["Change"],
-            } for m in winners[:limit]],
-            [{
-                "Symbol": format_stock_label(m["Symbol"], m.get("Name")),
-                "Price": m["Price"],
-                "Move": m["Move"],
-                "Change": m["Change"],
-            } for m in losers[:limit]],
-        )
+    if result is None:
+        return None
 
-    return [], []
+    winners, losers = result
+
+    # Prefer full company names from the stocks table over Moneyweb's
+    # short names (which are sometimes just the share code, e.g. MTU/PHP).
+    db_names = dict(
+        db.query(Stock.symbol, Stock.name)
+        .filter(Stock.symbol.in_({m["Symbol"] for m in winners + losers}))
+        .all()
+    )
+
+    def _mover_rows(movers: list) -> list:
+        return [{
+            "Symbol": format_stock_label(m["Symbol"], db_names.get(m["Symbol"]) or m.get("Name")),
+            "Price": m["Price"],
+            "Move": m["Move"],
+            "Change": m["Change"],
+        } for m in movers[:limit]]
+
+    return _mover_rows(winners), _mover_rows(losers)
 
 
 def _render_top_movers(db: Session):
     """Render the top 10 winners and losers of the day side by side."""
-    winners, losers = _get_daily_movers(db)
+    movers = _get_daily_movers(db)
+
+    if movers is None:
+        st.warning(
+            "Couldn't fetch today's movers from Moneyweb. Check Moneyweb "
+            "credentials/connectivity or try again later."
+        )
+        return
+
+    winners, losers = movers
 
     col_winners, col_losers = st.columns(2)
 
@@ -413,7 +398,7 @@ def _render_top_movers(db: Session):
                 column_config=column_config,
             )
         else:
-            st.info("No winners from Moneyweb. Check Moneyweb credentials or try again later.")
+            st.info("No winners reported by Moneyweb today.")
 
     with col_losers:
         st.markdown("**🔴 Top 10 Losers**")
@@ -425,7 +410,7 @@ def _render_top_movers(db: Session):
                 column_config=column_config,
             )
         else:
-            st.info("No losers from Moneyweb. Check Moneyweb credentials or try again later.")
+            st.info("No losers reported by Moneyweb today.")
 
 
 def _render_news_feed(db: Session):

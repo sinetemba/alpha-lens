@@ -1,7 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
-from datetime import datetime, timezone
-from .base import Base
+from .base import Base, utcnow_naive
 
 
 class WatchlistItem(Base):
@@ -10,7 +9,7 @@ class WatchlistItem(Base):
     __tablename__ = "watchlist_items"
 
     id = Column(Integer, primary_key=True, index=True)
-    stock_id = Column(Integer, ForeignKey("stocks.id"), nullable=False)
+    stock_id = Column(Integer, ForeignKey("stocks.id"), nullable=False, index=True)
     symbol = Column(String(10), index=True, nullable=False)
     
     # User-defined fields
@@ -26,8 +25,8 @@ class WatchlistItem(Base):
     notify_news = Column(Boolean, default=True)
     
     is_active = Column(Boolean, default=True, index=True)
-    added_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    added_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
 
     # Relationships
     stock = relationship("Stock", back_populates="watchlist_items")

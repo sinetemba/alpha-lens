@@ -1,6 +1,16 @@
+from datetime import datetime, timezone
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from app.config.settings import settings
+
+
+def utcnow_naive() -> datetime:
+    """Current UTC time as a naive datetime.
+
+    The DateTime columns are naive; writing aware values works on Postgres
+    (UTC session) but stores a '+00:00' suffix on SQLite, breaking ordering.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # Create SQLAlchemy engine. For Postgres, pin the session timezone to UTC:
 # the DateTime columns are naive, and a non-UTC session timezone silently
@@ -12,6 +22,9 @@ engine = create_engine(
         if "sqlite" in settings.database_url
         else {"options": "-c timezone=UTC"}
     ),
+    # Recycle stale pooled connections: after a Postgres restart or idle
+    # timeout the first checkout otherwise fails with OperationalError.
+    pool_pre_ping=True,
     echo=False,
 )
 

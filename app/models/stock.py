@@ -1,7 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, Index, ForeignKey
 from sqlalchemy.orm import relationship
-from datetime import datetime, timezone
-from .base import Base
+from .base import Base, utcnow_naive
 
 
 class Stock(Base):
@@ -19,8 +18,8 @@ class Stock(Base):
     description = Column(Text)
     website = Column(String(500))
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
 
     # Relationships
     prices = relationship("StockPrice", back_populates="stock", cascade="all, delete-orphan")
@@ -64,12 +63,12 @@ class StockPrice(Base):
     atr = Column(Float)
     obv = Column(Float)
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=utcnow_naive)
 
     # When this row was last (re)fetched from a provider. Unlike ``timestamp``
     # (the bar's as-of time), this advances on every refresh, including when an
     # existing bar is re-fetched and deduplicated.
-    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    fetched_at = Column(DateTime, default=utcnow_naive, index=True)
 
     # Relationships
     stock = relationship("Stock", back_populates="prices")

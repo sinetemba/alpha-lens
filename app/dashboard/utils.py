@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, NamedTuple, Optional
+import json
+from pathlib import Path
+from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
@@ -8,33 +10,19 @@ from sqlalchemy.orm import Session
 from app.config.settings import settings
 from app.models.news import NewsArticle
 from app.models.stock import StockPrice
-from app.services.data_service import DataService
-
-
-class PriceSnapshot(NamedTuple):
-    """Lightweight, hashable price row for cache-friendly lookups."""
-    close_price: float
-    timestamp: datetime
-    volume: Optional[int] = None
-    rsi: Optional[float] = None
-    macd: Optional[float] = None
-    macd_signal: Optional[float] = None
-
-
-def day_of(db: Session, col):
-    """Return a cross-DB expression for the date (day) of a timestamp column.
-
-    SQLite uses strftime; PostgreSQL uses date_trunc. The choice is made from
-    the session's engine dialect, not settings, so tests running on SQLite
-    still work when .env points at PostgreSQL.
-    """
-    if db.bind.dialect.name == "sqlite":
-        return func.strftime('%Y-%m-%d', col)
-    return func.date_trunc('day', col)
+from app.models.updater_run import UpdaterRun
+from app.services.data_service import COMPANY_NAME_OVERRIDES, DataService
+# Re-exported from the Streamlit-free module so non-UI consumers (the headless
+# updater's NotificationService) share one implementation.
+from app.services.price_queries import PriceSnapshot, day_of  # noqa: F401
 
 
 def format_stock_label(symbol: str, name: Optional[str] = None) -> str:
     """Format a stock symbol with its company name, e.g. 'SOL - Sasol Limited'."""
+    if not name or name == symbol:
+        # Some feeds (e.g. Moneyweb movers) only return the share code for
+        # certain symbols; use known overrides so they still render with a name.
+        name = COMPANY_NAME_OVERRIDES.get(symbol)
     if name and name != symbol:
         return f"{symbol} - {name}"
     return symbol
@@ -161,8 +149,75 @@ def format_news_age(timestamp: Optional[datetime]) -> str:
     return f"Last news fetch: {display_timestamp.strftime('%d %b %Y %H:%M')} ({age_label})"
 
 
+# The price+news job runs 3x/day; the longest normal gap is ~16h (17:00 ->
+# 09:00 next morning). Beyond this the data is almost certainly stale.
+UPDATER_STALE_AGE = timedelta(hours=20)
+
+
+# Same on-disk counter the TwelveDataCollector shares across processes -
+# read it directly rather than instantiating a collector just to display it.
+_TWELVE_DATA_USAGE_FILE = Path(__file__).resolve().parents[2] / "data" / ".twelve_data_usage"
+_TWELVE_DATA_DAILY_LIMIT = 800
+
+
+def format_twelve_data_quota() -> Optional[str]:
+    """'Twelve Data today: 123/800' from the shared counter, or None if unused."""
+    try:
+        data = json.loads(_TWELVE_DATA_USAGE_FILE.read_text(encoding="utf-8"))
+        if data.get("date") != str(datetime.now(timezone.utc).date()):
+            return None
+        return f"Twelve Data today: {int(data.get('count', 0))}/{_TWELVE_DATA_DAILY_LIMIT}"
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def render_updater_status_banner(db: Session) -> None:
+    """Warn when the headless updater's heartbeat says prices aren't refreshing.
+
+    Reads the updater_runs table written by scripts/run_updater.py. When the
+    table is empty the updater has never run (or the dashboard points at a
+    different DB): a once-per-session info note is shown so a fresh install
+    knows where prices come from instead of silently showing stale data.
+    """
+    latest = (
+        db.query(UpdaterRun)
+        .filter(UpdaterRun.job_name == "price_news_update")
+        .order_by(UpdaterRun.finished_at.desc())
+        .first()
+    )
+    if latest is None:
+        if not st.session_state.get("_updater_never_ran_noted"):
+            st.session_state["_updater_never_ran_noted"] = True
+            st.info(
+                "No automatic price updates have run yet - start the "
+                "AlphaLensUpdater task (scripts\\install_updater_task.ps1) or "
+                "use Refresh Prices below."
+            )
+        return
+
+    finished = _ensure_aware(latest.finished_at)
+    display = _to_display_tz(finished).strftime("%d %b %H:%M")
+    if not latest.success:
+        st.warning(
+            f"⚠️ The last price update ({display} SAST) failed"
+            f"{': ' + latest.detail if latest.detail else ''} - "
+            "data may be stale. Check data/logs/updater.log."
+        )
+        return
+
+    age = datetime.now(timezone.utc) - finished
+    if age > UPDATER_STALE_AGE:
+        hours = age.days * 24 + age.seconds // 3600
+        st.warning(
+            f"⚠️ Market data may be stale - the price updater last ran {hours}h ago "
+            f"({display} SAST; it normally runs 3x/day). "
+            "Check that the AlphaLensUpdater task/service is running."
+        )
+
+
 def render_last_fetch_caption(db: Session, symbols: Optional[Iterable[str]] = None) -> None:
     """Render a caption showing the last market data fetch for the given symbols."""
+    render_updater_status_banner(db)
     timestamp = get_latest_market_data_timestamp(db, symbols)
     st.caption(format_market_data_age(timestamp))
 
@@ -194,7 +249,7 @@ def render_market_data_refresh_control(
             )
             with st.spinner(spinner_text):
                 data_service = DataService(db)
-                updated_prices = data_service.update_stock_prices(symbol_list)
+                updated_prices = data_service.update_stock_prices(symbol_list or [])
                 new_articles = data_service.collect_news() if include_news else 0
             if data_service.quota_message:
                 st.warning(
@@ -208,4 +263,6 @@ def render_market_data_refresh_control(
                 st.success(status)
                 st.rerun()
             latest_timestamp = get_latest_market_data_timestamp(db, symbol_list)
-        st.caption(format_market_data_age(latest_timestamp))
+        quota = format_twelve_data_quota()
+        age_caption = format_market_data_age(latest_timestamp)
+        st.caption(f"{age_caption} | {quota}" if quota else age_caption)

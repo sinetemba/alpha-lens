@@ -1,8 +1,10 @@
 from typing import List, Dict, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import requests
+from sqlalchemy.orm import Session
 from app.collectors.yfinance import YFinanceCollector
 from app.scrapers.rss import RSSScraper
+from app.models.news import NewsArticle
 from app.config.settings import settings
 from loguru import logger
 
@@ -13,7 +15,8 @@ NEWSDATA_URL = "https://newsdata.io/api/1/news"
 class CompanyNewsService:
     """Fetch and aggregate on-demand company news from free sources."""
 
-    def __init__(self, limit: int = 10):
+    def __init__(self, db: Optional[Session] = None, limit: int = 10):
+        self.db = db
         self.limit = limit
         self.yahoo = YFinanceCollector()
         self.rss = RSSScraper()
@@ -82,8 +85,45 @@ class CompanyNewsService:
             logger.error(f"Error fetching Yahoo news for {symbol}: {e}")
             return []
 
+    def _fetch_from_db(self, search_terms: List[str]) -> List[Dict]:
+        """Match stored news_articles (scraped by the scheduled updater)."""
+        if self.db is None:
+            return []
+        try:
+            cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)
+            rows = (
+                self.db.query(NewsArticle)
+                .filter(NewsArticle.published_at >= cutoff)
+                .order_by(NewsArticle.published_at.desc())
+                .limit(500)
+                .all()
+            )
+            articles = []
+            for article in rows:
+                text = f"{article.title or ''} {article.summary or ''}"
+                if not self._is_relevant(text, search_terms):
+                    continue
+                articles.append({
+                    "title": article.title,
+                    "summary": article.summary,
+                    "url": article.url,
+                    "source": article.source,
+                    "published_at": article.published_at,
+                })
+            return articles
+        except Exception as e:
+            logger.error(f"Error reading stored news articles: {e}")
+            return []
+
     def _fetch_rss(self, search_terms: List[str]) -> List[Dict]:
         try:
+            # The scheduled updater already scrapes these feeds into
+            # news_articles several times a day - prefer that store and only
+            # hit the live feeds when it has nothing recent to match. A live
+            # scrape costs one HTTP fetch per feed per lookup.
+            stored = self._fetch_from_db(search_terms)
+            if stored:
+                return stored
             raw = self.rss.fetch_all_feeds()
             articles = []
             for article in raw:

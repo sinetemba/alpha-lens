@@ -102,6 +102,41 @@ python scripts\migrate_sqlite_to_postgres.py
 
 It truncates the Postgres tables and copies all rows from the SQLite file, preserving primary keys and resetting `id` sequences. It is idempotent.
 
+## Planned feature: Upcoming JSE IPOs / new listings
+
+Researched 2026-11-17; not yet built. Goal: alert the user when a company IPO is
+announced so they can subscribe during the offer window (before listing day).
+
+- **Source:** Moneyweb SENS archive at
+  `https://www.moneyweb.co.za/tools-and-data/moneyweb-sens/` — public (no login
+  needed), lists every SENS announcement with timestamp, ticker, headline, and
+  link to the official `senspdf.jse.co.za` PDF. Official JSE SENS feed is paid.
+- **Filter:** whitelist real-IPO phrases: "proposed listing", "pre-listing
+  statement", "intention to list", "admission to listing", "initial public
+  offer". Must EXCLUDE daily noise: "New Financial Instrument Listing"
+  (warrants/notes), "Listing of Additional ... Securities", interest payments.
+  Genuine company IPOs are ~5-10/year, so precision > recall.
+- **Pieces** (all patterns already exist):
+  - Model `app/models/upcoming_listing.py` — symbol, name, listing_date,
+    offer_open/close, status, unique `source_url` for dedup. `create_all` makes
+    the table; add indexes to `_ensure_plain_indexes` if needed.
+  - `MoneywebCollector.get_sens_announcements()` — reuse its session/retry/
+    BeautifulSoup pattern.
+  - `UpdaterService._update_ipo_listings()` daily ~08:00, modelled on
+    `_weekly_cleanup`, `_record_run(db, "ipo_listings", ...)`; optional `--ipo`
+    flag in `run_updater.py`.
+  - `NotificationService.create_notification(type="ipo", ...)` — dedup and
+    delivery (email/ntfy/Discord/Telegram) come free; add icon to
+    `_TYPE_ICONS` in `app/dashboard/notifications.py`.
+  - Page `app/dashboard/upcoming_ipos.py` + radio label, `elif` dispatch and
+    `PAGE_DATA_SOURCES` entry in `app/dashboard/home.py`.
+  - On listing day: probe `<symbol>.JO` via `yf.download` (penny-stocks batch
+    pattern); first bars -> status "listed", create `Stock` row via
+    `get_company_name`, notify "now trading".
+- **Phase 2:** the EasyEquities collector could surface their retail IPO offers.
+- **Caveat for users:** this gives early warning only — subscribing still goes
+  through a broker during the offer window in the pre-listing statement.
+
 ## Cross-DB SQL expressions
 
 The `strftime('%Y-%m-%d', timestamp)` function is SQLite-only. For PostgreSQL, use `func.date_trunc('day', timestamp)`. The `app/dashboard/utils.py` helper `day_of(db, col)` selects the right one from the session's engine dialect (not `settings.database_url`, so SQLite tests work against a Postgres-configured `.env`).
@@ -109,8 +144,32 @@ The `strftime('%Y-%m-%d', timestamp)` function is SQLite-only. For PostgreSQL, u
 ## Data-write conventions
 
 - Daily bars are keyed by naive exchange-local midnight (`YYYY-MM-DD 00:00`), not UTC instants. Re-fetches overwrite the same bar in place — never insert a duplicate row for the same `(symbol, timestamp)`; that pair has a unique index.
-- Save helpers in `data_service.py` (`_save_price_from_quote`, `_save_price_from_history`) return `bool` and roll back on error. `update_stock_prices` batches Twelve Data quotes 10-per-request and Yahoo fallbacks via `yf.download`.
-- The Twelve Data daily counter is shared across processes via `data/.twelve_data_usage`.
+- All `DateTime` columns are naive and store UTC. Use `utcnow_naive()` from `app/models/base.py` for defaults/writes — never write `datetime.now(timezone.utc)` (aware) into a naive column; SQLite would store a `+00:00` suffix and break ordering.
+- Save helpers in `data_service.py` (`_save_price_from_quote`, `_save_recent_bars`) return `bool` and roll back on error. `_save_recent_bars` writes every bar in the fetched Yahoo frame (gap-filling missed days), not just the latest. `update_stock_prices`/`update_dividends` **require** an explicit symbol list (no all-stocks fallback — that was a quota trap); they batch Twelve Data quotes 10-per-request and Yahoo fallbacks via `yf.download`. Batched quotes must carry `mic_code == XJSE` per result — same strict check as `get_quote`.
+- `_get_tracked_symbols` (updater) returns watchlist + JSE-eligible portfolio symbols **intersected with `Stock.is_active`** — a deactivated stock is not fetched even if still on a watchlist. Deactivation is the bad-ticker/delisting kill switch: the add paths set it automatically when a symbol has no backfill and no stored prices, re-adding reactivates, and Company View's "Manage tracked stocks" expander toggles it manually.
+- `update_historical_data` is incremental: once a backfill exists it fetches only ~the last stored bar + 7-day overlap, not the full window. `_update_technical_indicators(symbol, full=?, tail=N)` — `full=True` recomputes all history (backfills); `tail` controls how many trailing bars get persisted indicator values on incremental runs (pass `new_bars + 1`).
+- Implausible closes (>3x vs previous stored close, `MAX_CLOSE_RATIO`) are cross-checked against the *other* provider before rejection (`_close_corroborated`): corroborated moves (crashes, splits/consolidations) are accepted, uncorroborated ones rejected, and both raise a `type="system"` in-app Notification. Corroboration applies to both single-bar and bulk-save paths.
+- Yahoo JSE dividend amounts may be cents or Rand per ticker; `update_dividends` rescales amounts >50% of the contemporaneous share price (within 730 days of ex-date) to Rand. Dividend dedup is per calendar day, not exact timestamp — `scripts/fix_dividend_amounts.py --apply` already repaired legacy duplicates/cent amounts once; don't re-run it blindly.
+- Alert Notification rows are created on every check run regardless of `notification_enabled` (the dashboard page is an in-app channel); only external delivery via Apprise is gated on the setting.
+- `get_latest_and_previous_prices` (`services/price_queries.py`) scopes its window CTE to 92 days back from each symbol's own latest bar — don't widen it without a reason; symbols suspended longer than that simply get no previous-day snapshot.
+- `_ensure_stock` backfills sector/industry/market_cap/shares/description/website from Yahoo `get_info` once per stock (skipped once `sector` is set) — new stocks get fundamentals for free.
+- RSI/ATR use Wilder smoothing (`ewm(alpha=1/n)`). Rows stored before 2026-11-18 still hold SMA-based values until recomputed — see improvement.md "still open" #7 for the optional normalisation pass.
+- USD-account portfolio holdings (`is_jse_tracked_account` == False) are never priced/valued from JSE bars — `_update_holding_values` and Home's metrics only apply stored JSE closes to JSE-tracked accounts; EE-synced USD values pass through untouched. Holdings priced from `account_type` appear in Rand totals everywhere.
+- `PortfolioHolding.account_type == "Manual"` marks dashboard-added holdings — EasyEquities reconciliation deletes any holding under an EE-reported account type that EE stops reporting, so manual rows must never carry a real EE account name or the next sync deletes them.
+- When a JSE price lookup finds no stored bar, holdings keep their last-known (EE-synced) values — never null fields on a missing fetch.
+- The updater writes a heartbeat row to the `updater_runs` table on every job completion (`_record_run`). The dashboard's `render_updater_status_banner` (rendered via `render_last_fetch_caption` on data pages + directly on Home/Notifications) warns when the last `price_news_update` run failed or is >20h old.
+- The Twelve Data daily counter is shared across processes via `data/.twelve_data_usage`; `format_twelve_data_quota()` (utils.py) renders it as `Twelve Data today: N/800` inside `render_market_data_refresh_control` captions.
 - `run_updater.py --price-news|--full|--logon` exits non-zero when a run fails — Task Scheduler will show failure.
 - The daemon checks market-data freshness every 60s and runs a catch-up update when the last fetch is >4h old (covers jobs misfired while the machine slept — APScheduler drops those past `misfire_grace_time`). Catch-up retries no more than once per 30min and can't overlap a scheduled run (`_job_lock`).
 - APScheduler's own logging (misfires, job errors) is routed into `updater.log` via a stdlib→loguru handler in `setup()`.
+
+- Bullion products on the Krugerrands page are valued by `fine_oz_per_unit` from `PRODUCT_CATALOG` (fine troy ounces per item) — value = fine_oz x metal spot/oz, which prices 22k coins, .9999 gold bars and .999 silver uniformly. Holdings are stored in `krugerrand_holdings` with the fine-oz content denormalised, so catalogue edits never corrupt recorded purchases.
+- Crypto holdings (`crypto_holdings` table) are keyed by **CoinGecko id** (`coin_id`, e.g. "bitcoin"), not ticker — `symbol` is display-only. `CoinGeckoCollector` needs no API key (public tier, ~30 req/min); the page caches market data 60s and search results 1h. Prices are ZAR via `vs_currency=zar`.
+
+## Dashboard/UI conventions
+
+- **Post-rerun flash:** `st.success()`/`st.warning()` called immediately before `st.rerun()` is never seen. Store `("success"|"warning"|"info", message)` in `st.session_state` before the rerun and pop/render it near the top of the form on the next run (`watchlist_add_flash`, `portfolio_add_flash`, `dividends_fetch_flash` are the existing examples).
+- **Refresh control:** pages use the shared `render_market_data_refresh_control(db, key=..., symbols=..., include_news=...)` — blocking spinner + result feedback + quota caption. Don't reintroduce fire-and-forget thread refreshes (the old Home one gave no feedback).
+- **Notification types** shown by `_TYPE_ICONS` in `app/dashboard/notifications.py`: `price`, `technical`, `news`, `dividend`, `portfolio`, `ipo`, `system`. New alert types need an icon entry or they render iconless.
+- **Failure vs empty:** helpers that fetch remote data should return a distinguishable error (None/flag/message), not an empty list — pages show "fetch failed" warnings only on real failures and honest "no data" info otherwise (`_get_daily_movers`, `_scan_penny_stocks` are the pattern).
+- Watchlist alert preferences (`notify_price_increase`/`_decrease`/`price_change_threshold`) are set in the Watchlist Add/Edit forms; `notify_news` still has no consumer.

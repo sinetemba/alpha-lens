@@ -1,6 +1,5 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean
-from datetime import datetime, timezone
-from .base import Base
+from .base import Base, utcnow_naive
 
 
 class Notification(Base):
@@ -23,12 +22,14 @@ class Notification(Base):
     is_sent = Column(Boolean, default=False)
     sent_at = Column(DateTime)
     delivery_channel = Column(String(50))  # email, ntfy, discord, telegram, desktop
+    # Failed delivery attempts - send_pending_notifications skips rows past the cap.
+    attempts = Column(Integer, default=0)
     
     # User interaction
     is_read = Column(Boolean, default=False)
     read_at = Column(DateTime)
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    created_at = Column(DateTime, default=utcnow_naive, index=True)
 
     def __repr__(self):
         return f"<Notification(type='{self.type}', title='{self.title[:50]}...', is_sent={self.is_sent})>"

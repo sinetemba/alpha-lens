@@ -38,8 +38,13 @@ from app.config.settings import settings
 from app.database.init_db import init_database
 from app.models.base import SessionLocal
 from app.models.watchlist import WatchlistItem
-from app.models.portfolio import PortfolioHolding
-from app.models.stock import StockPrice
+from app.models.portfolio import (
+    PortfolioHolding,
+    EXCLUDED_ACCOUNT_TYPES as PORTFOLIO_EXCLUDED_ACCOUNT_TYPES,
+    is_jse_tracked_account,
+)
+from app.models.stock import Stock, StockPrice
+from app.models.updater_run import UpdaterRun
 from app.services.data_service import DataService
 from app.scrapers.news import NewsScraper
 from app.collectors.twelve_data import TwelveDataCollector
@@ -48,8 +53,9 @@ from app.collectors.twelve_data import TwelveDataCollector
 def _run_notification_checks(db: Session) -> None:
     """Fire watchlist price/technical alerts after fresh prices are saved.
 
-    NotificationService no-ops when notifications are disabled; failures here
-    must never fail the update run.
+    Alert rows are always created (the dashboard Notifications page is an
+    in-app channel); only external delivery is gated on
+    notification_enabled. Failures here must never fail the update run.
     """
     try:
         from app.notifications.notification_service import NotificationService
@@ -66,39 +72,98 @@ def _run_notification_checks(db: Session) -> None:
 # works for both SQLite and PostgreSQL.
 LAST_LOGON_FILE = ROOT / "data" / ".updater_last_logon"
 
-# Portfolio account types the updater should ignore (kept in sync with
-# app/dashboard/portfolio.py so the headless updater can avoid importing Streamlit).
-EXCLUDED_ACCOUNT_TYPES = {"Demo ZAR"}
+# Shared with the dashboard so the headless updater and UI never drift apart.
+EXCLUDED_ACCOUNT_TYPES = PORTFOLIO_EXCLUDED_ACCOUNT_TYPES
 
 
 def _get_tracked_symbols(db: Session) -> list:
-    """Symbols relevant to the user: watchlist + non-excluded portfolio holdings + JSE index."""
+    """Symbols relevant to the user: watchlist + non-excluded portfolio holdings + JSE index.
+
+    Stocks deactivated as dead/delisted/bad tickers are excluded even when a
+    watchlist item or holding still references them - otherwise deactivation
+    is cosmetic and the updater keeps burning provider calls on them.
+    """
+    active_stocks = {
+        s for (s,) in db.query(Stock.symbol).filter(Stock.is_active == True).all()
+    }
     watchlist_symbols = [
         item.symbol for item in db.query(WatchlistItem).filter(WatchlistItem.is_active == True).all()
+        if item.symbol in active_stocks
     ]
     portfolio_symbols = [
         h.symbol for h in db.query(PortfolioHolding).filter(
             ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES)
         ).all()
-        # EasyEquities USD-account holdings are stored under bare symbols
-        # (e.g. "AAPL"); they are not JSE listings, so tracking them would
-        # save wrong-exchange prices via the Yahoo ".JO" fallback.
-        if "USD" not in (h.account_type or "").upper()
+        if is_jse_tracked_account(h.account_type) and h.symbol in active_stocks
     ]
     tracked = {settings.jse_index_yf_symbol}
     tracked.update(watchlist_symbols)
     tracked.update(portfolio_symbols)
-    if tracked:
-        return sorted(tracked)
-    # No user data yet; fall back to the configured default watchlist.
-    return list(settings.default_watchlist_symbols)
+    # No user data yet (the index alone doesn't count): fall back to the
+    # configured default watchlist.
+    if len(tracked) == 1:
+        return sorted(set(settings.default_watchlist_symbols) | {settings.jse_index_yf_symbol})
+    return sorted(tracked)
+
+
+# A stock whose newest stored bar is older than this is treated as dead
+# (delisted or an invalid ticker) and deactivated so daily jobs stop
+# retrying it forever.
+STALE_SYMBOL_MAX_AGE = timedelta(days=45)
+
+
+def _record_run(db: Session, job_name: str, success: bool, detail: str = None) -> None:
+    """Write a heartbeat row for the dashboard's stale-run banner.
+
+    Best-effort - a logging failure here must never fail the job itself.
+    """
+    try:
+        db.add(UpdaterRun(job_name=job_name, success=success, detail=detail))
+        # Prune old rows so the table stays small.
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)
+        db.query(UpdaterRun).filter(UpdaterRun.finished_at < cutoff).delete()
+        db.commit()
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning(f"Could not record updater run: {e}")
+
+
+def _maybe_deactivate_dead_symbol(db: Session, symbol: str) -> None:
+    """Deactivate a Stock whose feed produces no recent bars.
+
+    Called when a historical update saves nothing. The >45d staleness guard
+    means transient feed outages and healthy up-to-date symbols (which also
+    save 0 rows) are never affected. Symbols with no bars at all are left
+    alone - the user is warned at add time.
+    """
+    latest = db.query(func.max(StockPrice.timestamp)).filter(
+        StockPrice.symbol == symbol
+    ).scalar()
+    if latest is None:
+        return
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if now - latest <= STALE_SYMBOL_MAX_AGE:
+        return
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    if stock and stock.is_active:
+        stock.is_active = False
+        db.commit()
+        logger.warning(
+            f"Deactivated {symbol}: newest stored bar is {latest:%Y-%m-%d} "
+            f"(>{STALE_SYMBOL_MAX_AGE.days}d old) - likely delisted or invalid ticker"
+        )
 
 
 def _estimate_api_calls(symbols: list, include_historical: bool = False) -> int:
     """Rough upper-bound of Twelve Data calls for the next run."""
     calls = -(-len(symbols) // 10)  # quotes are batched 10 symbols per request
     if include_historical:
-        calls += len(symbols)
+        # The daily job also calls the history and dividends endpoints once
+        # per symbol (before any Yahoo fallback).
+        calls += 2 * len(symbols)
     return calls
 
 
@@ -172,9 +237,15 @@ class UpdaterService:
 
         db = SessionLocal()
         try:
+            symbols = _get_tracked_symbols(db)
+            if not symbols:
+                return
+            # Scope to tracked symbols: commodity/gold snapshot rows (AV_*,
+            # XAU_* written by dashboard page visits) must not make stale JSE
+            # data look fresh.
             latest_fetched, latest_bar = db.query(
                 func.max(StockPrice.fetched_at), func.max(StockPrice.timestamp)
-            ).first()
+            ).filter(StockPrice.symbol.in_(symbols)).first()
         except Exception as e:
             logger.warning(f"Catch-up freshness check failed: {e}")
             return
@@ -217,18 +288,22 @@ class UpdaterService:
             return False
         logger.info("Running scheduled price + news update")
         db = SessionLocal()
+        ok = False
+        detail = None
         try:
             symbols = _get_tracked_symbols(db)
-            ok, msg = _has_quota(symbols, include_historical=False)
+            quota_ok, msg = _has_quota(symbols, include_historical=False)
             logger.info(msg)
 
             data_service = DataService(db)
             updated = data_service.update_stock_prices(symbols)
             logger.info(f"Updated {updated} tracked stock prices")
             if symbols and updated == 0:
+                detail = "0 symbols updated"
                 logger.error("Price update refreshed 0 symbols - treating the run as failed")
                 return False
             if data_service.last_failed_symbols:
+                detail = f"no price for: {','.join(data_service.last_failed_symbols)}"[:200]
                 logger.warning(
                     f"Symbols with no fresh price this run: {data_service.last_failed_symbols}"
                 )
@@ -238,28 +313,37 @@ class UpdaterService:
             logger.info(f"Collected {len(articles)} news articles")
 
             _run_notification_checks(db)
+            ok = True
             return True
         except Exception as e:
+            detail = str(e)[:200]
             logger.error(f"Price + news update failed: {e}")
             return False
         finally:
-            db.close()
-            self._job_lock.release()
+            try:
+                _record_run(db, "price_news_update", ok, detail)
+            finally:
+                db.close()
+                self._job_lock.release()
 
     def _update_historical(self) -> bool:
         """Daily job: update historical data and dividends for tracked symbols."""
         logger.info("Running daily historical update")
         db = SessionLocal()
+        ok = False
+        detail = None
         try:
             symbols = _get_tracked_symbols(db)
-            ok, msg = _has_quota(symbols, include_historical=True)
+            quota_ok, msg = _has_quota(symbols, include_historical=True)
             logger.info(msg)
 
             data_service = DataService(db)
             failed = 0
             for symbol in symbols:
                 try:
-                    data_service.update_historical_data(symbol, days=365)
+                    saved_hist = data_service.update_historical_data(symbol, days=365)
+                    if saved_hist == 0:
+                        _maybe_deactivate_dead_symbol(db, symbol)
                 except Exception as e:
                     failed += 1
                     logger.error(f"Historical update failed for {symbol}: {e}")
@@ -267,29 +351,43 @@ class UpdaterService:
             data_service.update_dividends(symbols)
             logger.info(f"Daily historical update completed for {len(symbols)} symbols")
             if symbols and failed == len(symbols):
+                detail = f"historical failed for all {failed} symbols"
                 logger.error("Historical update failed for every symbol - treating the run as failed")
                 return False
+            detail = f"{failed}/{len(symbols)} failed" if failed else None
+            ok = True
             return True
         except Exception as e:
+            detail = str(e)[:200]
             logger.error(f"Daily historical update failed: {e}")
             return False
         finally:
-            db.close()
+            try:
+                _record_run(db, "daily_historical", ok, detail)
+            finally:
+                db.close()
 
     def _weekly_cleanup(self) -> bool:
         """Weekly job: delete old news articles."""
         logger.info("Running weekly cleanup")
         db = SessionLocal()
+        ok = False
+        detail = None
         try:
             news_scraper = NewsScraper(db)
             deleted = news_scraper.clean_old_articles(days=90)
             logger.info(f"Cleaned up {deleted} old news articles")
+            ok = True
             return True
         except Exception as e:
+            detail = str(e)[:200]
             logger.error(f"Weekly cleanup failed: {e}")
             return False
         finally:
-            db.close()
+            try:
+                _record_run(db, "weekly_cleanup", ok, detail)
+            finally:
+                db.close()
 
     def configure(self):
         """Register the default 3x/day + logon schedule."""

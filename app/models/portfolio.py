@@ -1,7 +1,22 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey
 from sqlalchemy.orm import relationship
-from datetime import datetime, timezone
-from .base import Base
+from .base import Base, utcnow_naive
+
+
+# Holdings excluded from portfolio value, watchlist aggregation and price
+# tracking. Defined here (not in dashboard code) so the headless updater
+# shares the same lists - the dashboard and updater must never drift apart.
+EXCLUDED_ACCOUNT_TYPES = {"Demo ZAR"}
+EXCLUDED_PORTFOLIO_SYMBOLS = {"SZK"}
+
+
+def is_jse_tracked_account(account_type: str | None) -> bool:
+    """Whether holdings under this account type are JSE listings worth tracking.
+
+    USD-account holdings are stored under bare symbols (e.g. "AAPL"); fetching
+    prices for them resolves the wrong exchange via the Yahoo ".JO" fallback.
+    """
+    return "USD" not in (account_type or "").upper()
 
 
 class Portfolio(Base):
@@ -19,8 +34,8 @@ class Portfolio(Base):
     total_gain_loss = Column(Float, default=0.0)
     total_gain_loss_percentage = Column(Float, default=0.0)
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
 
     # Set only on a successful EasyEquities sync (not bumped by unrelated
     # writes like updated_at), so sync staleness can be tracked persistently
@@ -59,8 +74,8 @@ class PortfolioHolding(Base):
     # Dividend tracking
     total_dividends_received = Column(Float, default=0.0)
     
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
 
     # Relationships
     portfolio = relationship("Portfolio", back_populates="holdings")
