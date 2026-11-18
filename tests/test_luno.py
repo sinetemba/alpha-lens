@@ -9,8 +9,8 @@ from app.collectors import luno as luno_module
 from app.collectors.luno import LunoCollector, luno_asset_for, luno_coin_id
 from app.config.settings import settings
 from app.dashboard.crypto import _holding_price
-from app.models.crypto import CryptoHolding
-from app.services.luno_sync import sync_luno_holdings
+from app.models.crypto import CryptoBundle, CryptoHolding
+from app.services.luno_sync import BUNDLE_NAME, sync_luno_holdings
 
 
 def _response(status, payload):
@@ -102,8 +102,13 @@ def test_asset_key_round_trip():
 
 # --- sync ----------------------------------------------------------------
 
-def _fake_collector(balances):
-    return SimpleNamespace(get_balances=lambda: balances, last_error=None)
+def _fake_collector(balances, bundle=None):
+    """Wallet balances {asset: amount}, optional bundle {asset: amount}; None = fetch failed."""
+    if balances is None:
+        return SimpleNamespace(get_account_balances=lambda: None, last_error="down")
+    accounts = [(a, "TRANSACTIONAL", v) for a, v in balances.items()]
+    accounts += [(a, "BUNDLE", v) for a, v in (bundle or {}).items()]
+    return SimpleNamespace(get_account_balances=lambda: accounts, last_error=None)
 
 
 def test_sync_creates_luno_rows_and_reports_cash(db_session):
@@ -184,3 +189,51 @@ def test_luno_row_without_luno_price_falls_back_to_coingecko():
     row = SimpleNamespace(source="luno", coin_id="binancecoin")
     markets = {"binancecoin": {"current_price": 9981.34}}
     assert _holding_price(row, markets, luno_prices={}) == 9981.34
+
+
+def test_account_balances_keep_account_type(collector, monkeypatch):
+    _mock_get(monkeypatch, _response(200, {"balance": [
+        {"asset": "XRP", "balance": "10", "account_type": "TRANSACTIONAL"},
+        {"asset": "XRP", "balance": "2", "account_type": "BUNDLE"},
+        {"asset": "BNB", "balance": "0.004", "account_type": "BUNDLE"},
+    ]}))
+    assert collector.get_account_balances() == [
+        ("XRP", "TRANSACTIONAL", 10.0), ("XRP", "BUNDLE", 2.0), ("BNB", "BUNDLE", 0.004),
+    ]
+
+
+def test_bundle_coins_kept_apart_from_wallet_coins(db_session):
+    """The user's real layout: ADA/XLM/XRP in wallets, a 5-coin bundle that also holds XRP."""
+    sync_luno_holdings(db_session, _fake_collector(
+        {"ADA": 100.0, "XLM": 50.0, "XRP": 10.0, "XBT": 0.0, "ETH": 0.0},
+        bundle={"XBT": 0.0006, "ETH": 0.0036, "XRP": 1.9, "SOL": 0.017, "BNB": 0.004, "ADA": 0.0},
+    ))
+
+    rows = {(r.symbol, r.bundle): r.quantity for r in db_session.query(CryptoHolding)}
+    assert rows == {
+        ("ADA", None): 100.0, ("XLM", None): 50.0, ("XRP", None): 10.0,
+        ("BTC", BUNDLE_NAME): 0.0006, ("ETH", BUNDLE_NAME): 0.0036, ("XRP", BUNDLE_NAME): 1.9,
+        ("SOL", BUNDLE_NAME): 0.017, ("BNB", BUNDLE_NAME): 0.004,
+    }
+    assert db_session.query(CryptoBundle).filter_by(name=BUNDLE_NAME).count() == 1
+
+
+def test_bundle_cost_survives_resync(db_session):
+    sync_luno_holdings(db_session, _fake_collector({}, bundle={"XBT": 0.0006}))
+    db_session.query(CryptoBundle).one().purchase_cost = 800.0
+    db_session.commit()
+
+    sync_luno_holdings(db_session, _fake_collector({}, bundle={"XBT": 0.0007}))
+
+    assert db_session.query(CryptoBundle).one().purchase_cost == pytest.approx(800.0)
+    assert db_session.query(CryptoHolding).one().quantity == pytest.approx(0.0007)
+
+
+def test_bundle_value_sums_coins():
+    from app.dashboard.crypto import _bundle_value
+    coins = [
+        SimpleNamespace(source="luno", coin_id="bitcoin", quantity=0.0006, purchase_price=None),
+        SimpleNamespace(source="luno", coin_id="binancecoin", quantity=0.004, purchase_price=None),
+    ]
+    value = _bundle_value(coins, markets={}, luno_prices={"XBT": 1_000_000.0, "BNB": 9_500.0})
+    assert value == pytest.approx(600.0 + 38.0)

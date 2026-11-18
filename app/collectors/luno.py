@@ -120,10 +120,12 @@ class LunoCollector:
         logger.error(f"Luno {path}: {self.last_error}")
         return None
 
-    def get_balances(self) -> Optional[dict[str, float]]:
-        """Total balance per asset, summed across accounts; None on failure.
+    def get_account_balances(self) -> Optional[list[tuple[str, str, float]]]:
+        """(asset, account_type, balance) per Luno account; None on failure.
 
-        `balance` already includes funds reserved in open orders. Zero
+        `account_type` is "TRANSACTIONAL" for normal wallets and "BUNDLE" for
+        coins held inside a Luno Bundle - the same asset can have one of
+        each. `balance` already includes funds reserved in open orders. Zero
         balances are kept so callers can tell "sold out" from "missing".
         """
         if not self.enabled:
@@ -132,7 +134,7 @@ class LunoCollector:
         data = self._get("balance", auth=True)
         if data is None:
             return None
-        totals: dict[str, float] = {}
+        accounts = []
         for account in data.get("balance") or []:
             asset = (account.get("asset") or "").upper()
             if not asset:
@@ -141,6 +143,16 @@ class LunoCollector:
                 amount = float(account.get("balance") or 0)
             except (TypeError, ValueError):
                 continue
+            accounts.append((asset, (account.get("account_type") or "TRANSACTIONAL").upper(), amount))
+        return accounts
+
+    def get_balances(self) -> Optional[dict[str, float]]:
+        """Total balance per asset across all accounts (wallet + bundle)."""
+        accounts = self.get_account_balances()
+        if accounts is None:
+            return None
+        totals: dict[str, float] = {}
+        for asset, _, amount in accounts:
             totals[asset] = totals.get(asset, 0.0) + amount
         return totals
 

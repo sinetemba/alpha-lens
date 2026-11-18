@@ -8,7 +8,7 @@ from .dividend import Dividend, MoneywebDividendWatch
 from .notification import Notification
 from .updater_run import UpdaterRun
 from .krugerrand import KrugerrandHolding
-from .crypto import CryptoHolding
+from .crypto import CryptoBundle, CryptoHolding
 from .schema_meta import SchemaMeta
 
 __all__ = [
@@ -26,5 +26,6 @@ __all__ = [
     "UpdaterRun",
     "KrugerrandHolding",
     "CryptoHolding",
+    "CryptoBundle",
     "SchemaMeta",
 ]

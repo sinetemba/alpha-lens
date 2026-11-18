@@ -7,7 +7,7 @@ from app.collectors.coingecko import CoinGeckoCollector
 from app.collectors.luno import LunoCollector, luno_asset_for
 from app.dashboard.utils import _to_display_tz, holding_totals, price_column_format, render_holding_totals
 from app.models.base import utcnow_naive
-from app.models.crypto import CryptoHolding
+from app.models.crypto import CryptoBundle, CryptoHolding
 from app.services.luno_sync import LUNO_SOURCE, last_luno_sync, sync_luno_holdings
 
 # Luno balances are re-synced on page load when the last sync is older than this.
@@ -157,14 +157,45 @@ def _holding_price(holding: CryptoHolding, markets: dict, luno_prices: dict) -> 
     return gecko
 
 
+def _bundle_value(coins: list, markets: dict, luno_prices: dict) -> Optional[float]:
+    """Combined ZAR value of a bundle's coins; None if no coin could be priced."""
+    values = [
+        _holding_valuation(h, _holding_price(h, markets, luno_prices))[1] for h in coins
+    ]
+    known = [v for v in values if v is not None]
+    return sum(known) if known else None
+
+
 def _render_holdings(db: Session, holdings: list, markets: dict, luno_prices: dict):
-    """Holdings table with live valuation plus add/remove flows."""
+    """Holdings table with live valuation plus add/remove flows.
+
+    Coins held directly (wallets, manual records) are listed one per row;
+    Luno Bundle coins are grouped under their bundle and count as a single
+    holding in the totals.
+    """
     st.subheader("My Holdings")
+
+    direct = [h for h in holdings if not h.bundle]
+    bundles: dict[str, list] = {}
+    for h in holdings:
+        if h.bundle:
+            bundles.setdefault(h.bundle, []).append(h)
+    bundle_records = {
+        b.name: b for b in db.query(CryptoBundle).filter(CryptoBundle.name.in_(list(bundles)))
+    } if bundles else {}
 
     if holdings:
         rows = []
-        valued = []
-        for h in holdings:
+        # Each bundle is ONE (cost, value) pair: what was paid for the bundle
+        # against its combined value.
+        valued = [
+            (
+                (bundle_records[name].purchase_cost if name in bundle_records else None) or None,
+                _bundle_value(coins, markets, luno_prices),
+            )
+            for name, coins in bundles.items()
+        ]
+        for h in direct:
             market = markets.get(h.coin_id) or {}
             price = _holding_price(h, markets, luno_prices)
             change_24h = market.get("price_change_percentage_24h")
@@ -185,23 +216,11 @@ def _render_holdings(db: Session, holdings: list, markets: dict, luno_prices: di
             })
 
         render_holding_totals(holding_totals(valued))
-        price_fmt = price_column_format(
-            [r["Price (ZAR)"] for r in rows], [r["Paid per coin"] for r in rows]
-        )
-        # Numeric cells (not "R x" strings) so column sorting works.
-        st.dataframe(
-            rows, use_container_width=True, hide_index=True,
-            column_config={
-                "Qty": st.column_config.NumberColumn(format="%g"),
-                "Price (ZAR)": st.column_config.NumberColumn(format=price_fmt),
-                "24h %": st.column_config.NumberColumn(format="%+.1f%%"),
-                "Paid per coin": st.column_config.NumberColumn(format=price_fmt),
-                "Current value": st.column_config.NumberColumn(format="R %.2f"),
-                "Gain/Loss": st.column_config.NumberColumn(format="R %+.2f"),
-                "Gain %": st.column_config.NumberColumn(format="%+.1f%%"),
-            },
-        )
-        if any(h.source == LUNO_SOURCE and not h.purchase_price for h in holdings):
+        if rows:
+            _render_direct_table(rows)
+        for name, coins in bundles.items():
+            _render_bundle(db, name, coins, bundle_records.get(name), markets, luno_prices)
+        if any(h.source == LUNO_SOURCE and not h.purchase_price for h in direct):
             st.caption(
                 "Luno doesn't report what you paid - set a cost per coin below to see "
                 "gain/loss for Luno holdings."
@@ -209,47 +228,137 @@ def _render_holdings(db: Session, holdings: list, markets: dict, luno_prices: di
     else:
         st.info("No crypto holdings yet - connect Luno or record a purchase below.")
 
-    _render_luno_cost_basis(db, [h for h in holdings if h.source == LUNO_SOURCE])
+    _render_luno_cost_basis(db, [h for h in direct if h.source == LUNO_SOURCE])
     _render_add_form(db)
+    _render_remove_manual(db, [h for h in holdings if h.source != LUNO_SOURCE])
 
-    manual = [h for h in holdings if h.source != LUNO_SOURCE]
-    if manual:
-        remove_options = {
-            f"{h.quantity:g} {h.symbol} — {h.name or h.coin_id} (#{h.id})": h.id
-            for h in manual
-        }
-        with st.expander("🗑️ Remove a manual holding"):
-            st.caption("Luno holdings follow your Luno balance and can't be removed here.")
-            to_remove = st.multiselect(
-                "Select holdings to remove",
-                list(remove_options.keys()),
-                key="crypto_remove_select",
+
+def _render_direct_table(rows: list) -> None:
+    """Coins held directly - Luno wallets and manual records, one row each."""
+    price_fmt = price_column_format(
+        [r["Price (ZAR)"] for r in rows], [r["Paid per coin"] for r in rows]
+    )
+    # Numeric cells (not "R x" strings) so column sorting works.
+    st.dataframe(
+        rows, use_container_width=True, hide_index=True,
+        column_config={
+            "Qty": st.column_config.NumberColumn(format="%g"),
+            "Price (ZAR)": st.column_config.NumberColumn(format=price_fmt),
+            "24h %": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Paid per coin": st.column_config.NumberColumn(format=price_fmt),
+            "Current value": st.column_config.NumberColumn(format="R %.2f"),
+            "Gain/Loss": st.column_config.NumberColumn(format="R %+.2f"),
+            "Gain %": st.column_config.NumberColumn(format="%+.1f%%"),
+        },
+    )
+
+
+def _render_bundle(
+    db: Session, name: str, coins: list, record: Optional[CryptoBundle],
+    markets: dict, luno_prices: dict,
+) -> None:
+    """A Luno Bundle as one holding: value, cost, gain and its coin breakdown."""
+    priced = []
+    for h in coins:
+        price = _holding_price(h, markets, luno_prices)
+        priced.append((h, price, _holding_valuation(h, price)[1]))
+    total = sum(v for _, _, v in priced if v is not None)
+    cost = record.purchase_cost if record else None
+
+    st.markdown(f"**📦 {name}**")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Bundle value", f"R {total:,.2f}" if total else "N/A")
+    c2.metric("Paid for bundle", f"R {cost:,.2f}" if cost else "Not set")
+    if cost and total:
+        gain = total - cost
+        c3.metric("Gain/Loss", f"R {gain:+,.2f}", delta=f"{gain / cost * 100:+.1f}%")
+    else:
+        c3.metric("Gain/Loss", "N/A")
+
+    breakdown = sorted(
+        (
+            {
+                "Coin": f"{h.symbol} — {h.name or h.coin_id}",
+                "Weight %": value / total * 100 if value is not None and total else None,
+                "Value": value,
+                "Qty": h.quantity,
+                "Price (ZAR)": price,
+            }
+            for h, price, value in priced
+        ),
+        key=lambda r: r["Value"] or 0,
+        reverse=True,
+    )
+    st.dataframe(
+        breakdown, use_container_width=True, hide_index=True,
+        column_config={
+            "Weight %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Value": st.column_config.NumberColumn(format="R %.2f"),
+            "Qty": st.column_config.NumberColumn(format="%g"),
+            "Price (ZAR)": st.column_config.NumberColumn(
+                format=price_column_format([r["Price (ZAR)"] for r in breakdown])
+            ),
+        },
+    )
+
+    with st.expander(f"✏️ Set what you paid for {name}"):
+        paid = st.number_input(
+            "Total paid for the bundle (R)", min_value=0.0, value=float(cost or 0.0),
+            step=100.0, key=f"bundle_cost_{name}",
+            help="The Rand amount you invested in the bundle (Luno's Transactions history "
+                 "shows it). Top-ups: enter the running total. Set 0 to clear.",
+        )
+        if st.button("Save bundle cost", key=f"bundle_cost_save_{name}"):
+            record = record or db.query(CryptoBundle).filter_by(name=name).first()
+            if record is None:
+                record = CryptoBundle(name=name)
+                db.add(record)
+            record.purchase_cost = paid or None
+            db.commit()
+            st.session_state["crypto_flash"] = ("success", f"Saved cost for {name}.")
+            st.rerun()
+
+
+def _render_remove_manual(db: Session, manual: list) -> None:
+    """Remove manual records (two-step confirm). Luno rows follow the balance."""
+    if not manual:
+        return
+    remove_options = {
+        f"{h.quantity:g} {h.symbol} — {h.name or h.coin_id} (#{h.id})": h.id
+        for h in manual
+    }
+    with st.expander("🗑️ Remove a manual holding"):
+        st.caption("Luno holdings follow your Luno balance and can't be removed here.")
+        to_remove = st.multiselect(
+            "Select holdings to remove",
+            list(remove_options.keys()),
+            key="crypto_remove_select",
+        )
+        remove_key = "crypto_remove_pending"
+        if st.button("Remove selected", key="crypto_remove_btn", disabled=not to_remove):
+            st.session_state[remove_key] = tuple(to_remove)
+
+        pending = st.session_state.get(remove_key)
+        if pending:
+            st.warning(
+                f"Remove {len(pending)} holding(s) ({', '.join(pending)})? "
+                "This deletes the purchase record(s)."
             )
-            remove_key = "crypto_remove_pending"
-            if st.button("Remove selected", key="crypto_remove_btn", disabled=not to_remove):
-                st.session_state[remove_key] = tuple(to_remove)
-
-            pending = st.session_state.get(remove_key)
-            if pending:
-                st.warning(
-                    f"Remove {len(pending)} holding(s) ({', '.join(pending)})? "
-                    "This deletes the purchase record(s)."
-                )
-                confirm_col, cancel_col = st.columns(2)
-                with confirm_col:
-                    if st.button("Yes, remove", key="crypto_confirm_remove"):
-                        ids = {remove_options[k] for k in pending if k in remove_options}
-                        for h in manual:
-                            if h.id in ids:
-                                db.delete(h)
-                        db.commit()
-                        st.session_state[remove_key] = None
-                        st.session_state["crypto_flash"] = ("success", f"Removed {len(ids)} holding(s).")
-                        st.rerun()
-                with cancel_col:
-                    if st.button("Cancel", key="crypto_cancel_remove"):
-                        st.session_state[remove_key] = None
-                        st.rerun()
+            confirm_col, cancel_col = st.columns(2)
+            with confirm_col:
+                if st.button("Yes, remove", key="crypto_confirm_remove"):
+                    ids = {remove_options[k] for k in pending if k in remove_options}
+                    for h in manual:
+                        if h.id in ids:
+                            db.delete(h)
+                    db.commit()
+                    st.session_state[remove_key] = None
+                    st.session_state["crypto_flash"] = ("success", f"Removed {len(ids)} holding(s).")
+                    st.rerun()
+            with cancel_col:
+                if st.button("Cancel", key="crypto_cancel_remove"):
+                    st.session_state[remove_key] = None
+                    st.rerun()
 
 
 def _render_luno_cost_basis(db: Session, luno_holdings: list) -> None:
