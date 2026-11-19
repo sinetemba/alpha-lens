@@ -28,6 +28,12 @@ SCAN_TTL_SECONDS = 1800
 PROJECTION_DAYS = 30
 MIN_HISTORY_ROWS = 30
 FUNDAMENTALS_TTL_SECONDS = 6 * 3600
+# Liquidity = median daily Rand value traded over the last N sessions (a
+# no-trade day counts as R0, so a mostly-dormant stock's median is ~0). Mean
+# is skewed by one-off block trades (ISA: R38k mean, R26 median).
+LIQUIDITY_WINDOW = 20
+# (minimum median R/day, score penalty) - checked in order.
+LIQUIDITY_PENALTIES = ((10_000, 30), (100_000, 15))
 # A trailing yield above this is a cents/Rand unit glitch, not a real payout.
 DIVIDEND_YIELD_CEILING = 50.0
 
@@ -83,7 +89,7 @@ def show_penny_stocks(db: Session):
     st.header("💰 Penny Stocks")
     st.markdown(
         f"Top {TOP_N} JSE shares trading below **R {PENNY_PRICE_LIMIT:.2f}**, ranked by a "
-        "heuristic potential score (momentum, trend, RSI, volume). "
+        "heuristic potential score (momentum, trend, RSI, volume), penalised for thin trading. "
         "Select a row to see details below the grid."
     )
     st.caption("⚠️ Screening is heuristic and speculative — not financial advice.")
@@ -159,6 +165,7 @@ def show_penny_stocks(db: Session):
         "Above Low %": r["off_low"],
         "RSI": r["rsi"],
         "3m %": r["mom_3m"],
+        "Traded/day": r.get("traded_value"),
         "Potential": r["score"],
     } for r in top])
 
@@ -205,9 +212,19 @@ def show_penny_stocks(db: Session):
                 "3m %", format="%+.1f%%",
                 help="3-month price momentum (change vs ~63 trading days ago)",
             ),
+            "Traded/day": st.column_config.NumberColumn(
+                "Traded R/day", format="compact",
+                help=(
+                    f"Median Rand value traded per day over the last {LIQUIDITY_WINDOW} sessions "
+                    "(no-trade days count as R0). Low = hard to buy or sell without moving the price."
+                ),
+            ),
             "Potential": st.column_config.ProgressColumn(
                 "Potential", min_value=0, max_value=100, format="%d",
-                help="Heuristic 0-100 upside score: MACD, RSI, price vs SMA-20/50, 3-month momentum, recent volume",
+                help=(
+                    "Heuristic 0-100 upside score: MACD, RSI, price vs SMA-20/50, 3-month momentum, "
+                    "recent volume - minus up to 30 points for thin trading"
+                ),
             ),
         },
     )
@@ -297,6 +314,9 @@ def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Option
     sma_50 = _last(close.rolling(50).mean())
     vol_recent = float(volume.tail(10).mean())
     vol_base = float(volume.tail(60).mean())
+    traded_value = float((volume * close).tail(LIQUIDITY_WINDOW).median())
+    zero_volume_days = int((volume.tail(LIQUIDITY_WINDOW) == 0).sum())
+    liquidity_penalty = _liquidity_penalty(traded_value)
 
     score = _potential_score(
         rsi=rsi, macd=macd_val, macd_signal=macd_sig, macd_hist=macd_hist,
@@ -304,6 +324,8 @@ def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Option
         mom_3m=((current - close_3m) / close_3m * 100) if close_3m else 0.0,
         vol_recent=vol_recent, vol_base=vol_base,
     )
+    # A great chart is worthless if you can't get out of the position.
+    score = max(0, score - liquidity_penalty)
 
     return {
         "symbol": symbol,
@@ -322,6 +344,9 @@ def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Option
         "mom_3m": ((current - close_3m) / close_3m * 100) if close_3m else 0.0,
         "vol_recent": vol_recent,
         "vol_base": vol_base,
+        "traded_value": traded_value,
+        "zero_volume_days": zero_volume_days,
+        "liquidity_penalty": liquidity_penalty,
         "div_yield": _trailing_dividend_yield(df, current),
         "score": score,
         "dates": [d.strftime("%Y-%m-%d") for d in close.index],
@@ -385,6 +410,14 @@ def _last(series: pd.Series) -> Optional[float]:
     """Last non-NaN value of a series, or None."""
     value = series.iloc[-1]
     return None if pd.isna(value) else float(value)
+
+
+def _liquidity_penalty(traded_value: float) -> int:
+    """Score points removed for thin trading (median Rand value per day)."""
+    for minimum, penalty in LIQUIDITY_PENALTIES:
+        if traded_value < minimum:
+            return penalty
+    return 0
 
 
 def _potential_score(rsi, macd, macd_signal, macd_hist, close, sma_20, sma_50, mom_3m, vol_recent, vol_base) -> int:
@@ -665,6 +698,19 @@ def _influences(row: dict) -> list:
         influences.append(f"Positive 3-month momentum ({row['mom_3m']:+.1f}%)")
     else:
         influences.append(f"Negative 3-month momentum ({row['mom_3m']:+.1f}%)")
+
+    traded_value = row.get("traded_value")
+    if traded_value is not None:
+        zero_days = row.get("zero_volume_days", 0)
+        no_trades = f", no trades on {zero_days} of the last {LIQUIDITY_WINDOW} days" if zero_days else ""
+        penalty = row.get("liquidity_penalty", 0)
+        if penalty:
+            influences.append(
+                f"Thinly traded — typical day R {traded_value:,.0f}{no_trades}; "
+                f"hard to exit (−{penalty} score)"
+            )
+        else:
+            influences.append(f"Liquid — typical day R {traded_value:,.0f} traded{no_trades}")
 
     if row["vol_base"] > 0 and row["vol_recent"] > row["vol_base"] * 1.2:
         influences.append("Recent volume rising vs 60-day average — growing interest")

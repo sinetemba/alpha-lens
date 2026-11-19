@@ -8,6 +8,8 @@ import pytest
 from app.dashboard.penny_stocks import (
     _build_fundamentals,
     _drop_unit_glitches,
+    _influences,
+    _liquidity_penalty,
     _sane_high_low,
     _summarise_symbol,
     _format_rand_compact,
@@ -86,6 +88,44 @@ def test_52w_low_ignores_intraday_glitch_but_keeps_real_lows():
     stats = _summarise_symbol(df, "HUG.JO", "HUG")
     assert stats["low_52w"] == pytest.approx(0.80)  # 85c bar's 80c intraday low
     assert stats["high_52w"] == pytest.approx(1.55)
+
+
+# --- liquidity -------------------------------------------------------------
+
+@pytest.mark.parametrize("traded, penalty", [
+    (0.0, 30), (9_999, 30), (10_000, 15), (99_999, 15), (100_000, 0), (5e6, 0),
+])
+def test_liquidity_penalty_tiers(traded, penalty):
+    assert _liquidity_penalty(traded) == penalty
+
+
+def _bars(volumes, close_cents=200.0):
+    n = len(volumes)
+    closes = [close_cents] * n
+    return pd.DataFrame({
+        "Open": closes, "High": closes, "Low": closes, "Close": closes, "Volume": volumes,
+    }, index=pd.date_range("2026-01-01", periods=n))
+
+
+def test_dormant_stock_is_penalised_and_block_trade_does_not_rescue_it():
+    """ISA-like: one big block trade, otherwise mostly no trades."""
+    volumes = [100_000] * 40 + [0] * 12 + [10] * 7 + [5_000_000]
+    liquid = _summarise_symbol(_bars([100_000] * 60), "X.JO", "X")
+    dormant = _summarise_symbol(_bars(volumes), "Y.JO", "Y")
+
+    assert liquid["traded_value"] == pytest.approx(200_000)  # 100k shares x R2
+    assert liquid["liquidity_penalty"] == 0
+    assert dormant["traded_value"] == 0  # median of 20 sessions, 12 of them R0
+    assert dormant["zero_volume_days"] == 12
+    assert dormant["liquidity_penalty"] == 30
+    assert dormant["score"] <= max(0, liquid["score"] - 30) + 10  # only volume rule differs
+
+
+def test_influences_flag_thin_trading():
+    row = _summarise_symbol(_bars([0] * 15 + [1_000] * 45), "Y.JO", "Y")
+    row["zero_volume_days"] = 14
+    text = " ".join(_influences(row))
+    assert "Thinly traded" in text and "no trades on 14 of the last 20 days" in text
 
 
 # --- dividend yield --------------------------------------------------------
