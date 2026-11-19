@@ -47,6 +47,7 @@ data/backups/
 # Runtime state
 data/.twelve_data_usage
 data/.updater_last_logon
+data/.updater.lock
 
 # Logs
 *.log

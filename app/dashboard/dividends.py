@@ -12,7 +12,7 @@ from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
 from app.services.data_service import DataService
 from app.collectors.moneyweb import MoneywebCollector
-from app.dashboard.utils import format_stock_label, render_csv_download, render_last_fetch_caption, _to_display_tz
+from app.dashboard.utils import format_stock_label, render_csv_download, style_price_columns, render_last_fetch_caption, _to_display_tz
 from app.dashboard.portfolio import EXCLUDED_ACCOUNT_TYPES
 
 
@@ -180,12 +180,15 @@ def show_dividends(db: Session):
 
         st.subheader("All Dividends")
         dividends_table = pd.DataFrame(data)
+        # Sub-R1 amounts keep up to 4 decimals (R 0.0525), others 2 (R 6.10).
         st.dataframe(
-            dividends_table,
+            style_price_columns(
+                dividends_table.style, dividends_table, price_cols=("Amount (per share)",),
+            ),
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Amount (per share)": st.column_config.NumberColumn("Amount (per share)", format="R %.4f"),
+                "Amount (per share)": st.column_config.NumberColumn("Amount (per share)"),
             },
         )
         render_csv_download(dividends_table, "dividends", key="dividends_csv")
@@ -209,11 +212,13 @@ def show_dividends(db: Session):
 
         income_table = pd.DataFrame(holdings_data)
         st.dataframe(
-            income_table,
+            style_price_columns(
+                income_table.style, income_table, price_cols=("Dividends per Share",),
+            ),
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Dividends per Share": st.column_config.NumberColumn("Dividends per Share", format="R %.4f"),
+                "Dividends per Share": st.column_config.NumberColumn("Dividends per Share"),
                 "Estimated Income": st.column_config.NumberColumn("Estimated Income", format="R %.2f"),
             },
         )

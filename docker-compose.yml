@@ -5,7 +5,9 @@ services:
     build: .
     container_name: stock-analyzer
     ports:
-      - "8501:8501"
+      # Bind to localhost only - the dashboard has no authentication, so
+      # publishing on all interfaces would expose it to the LAN.
+      - "127.0.0.1:8501:8501"
     volumes:
       - ./data:/app/data
     env_file:

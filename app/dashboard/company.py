@@ -8,7 +8,7 @@ from typing import List, Dict, Optional
 from app.models.base import SessionLocal
 from app.models.news import NewsArticle
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_price, format_stock_label, price_column_format, render_csv_download, render_last_fetch_caption, _to_display_tz
+from app.dashboard.utils import format_price, format_stock_label, style_price_columns, render_csv_download, render_last_fetch_caption, _to_display_tz
 from app.services.company_news import CompanyNewsService
 from datetime import datetime, timedelta, timezone
 from loguru import logger
@@ -89,16 +89,19 @@ def show_company(db: Session):
     st.markdown("---")
     
     # Tabs for different views
-    tab1, tab2, tab3 = st.tabs(["Price Chart", "Historical Data", "News"])
-    
+    tab1, tab2, tab3, tab4 = st.tabs(["Price Chart", "Historical Data", "News", "Financials"])
+
     with tab1:
         _render_price_chart(db, selected_symbol)
-    
+
     with tab2:
         _render_historical_data(db, selected_symbol)
-    
+
     with tab3:
         _render_company_news(db, selected_symbol)
+
+    with tab4:
+        _render_financials(selected_symbol)
 
     st.markdown("---")
     _render_manage_stocks(db)
@@ -335,20 +338,21 @@ def _render_historical_data(db: Session, symbol: str):
     # Numeric cells so column sorting works; the "R"/grouped display comes
     # from NumberColumn formats rather than pre-formatted strings.
     history_table = pd.DataFrame(data)
-    price_fmt = price_column_format(
-        history_table["Open"], history_table["High"],
-        history_table["Low"], history_table["Close"],
+    # Per-row decimals keyed on the close: R 0.62, not R 0.6200.
+    styled_history = style_price_columns(
+        history_table.style, history_table, "Close",
+        price_cols=("Open", "High", "Low", "Close"),
     )
     st.caption(f"Page {page} of {total_pages} ({total} rows, {page_size} per page)")
     st.dataframe(
-        history_table,
+        styled_history,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Open": st.column_config.NumberColumn(format=price_fmt),
-            "High": st.column_config.NumberColumn(format=price_fmt),
-            "Low": st.column_config.NumberColumn(format=price_fmt),
-            "Close": st.column_config.NumberColumn(format=price_fmt),
+            "Open": st.column_config.NumberColumn(),
+            "High": st.column_config.NumberColumn(),
+            "Low": st.column_config.NumberColumn(),
+            "Close": st.column_config.NumberColumn(),
             "Volume": st.column_config.NumberColumn(format="%d"),
         },
     )
@@ -363,6 +367,41 @@ def _get_company_news(db: Session, symbol: str, company_name: Optional[str]) -> 
     re-fetched on every rerun when it missed; a timed cache fixes both.
     """
     return CompanyNewsService(db).get_company_news(symbol, company_name) or []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_financials(symbol: str) -> Optional[Dict]:
+    """Yahoo income statement / balance sheet / cash flow, cached 1h."""
+    from app.collectors.yfinance import YFinanceCollector
+    ticker = YFinanceCollector().get_ticker(symbol)
+    if not ticker:
+        return None
+    try:
+        return {
+            "Income statement": ticker.income_stmt,
+            "Balance sheet": ticker.balance_sheet,
+            "Cash flow": ticker.cashflow,
+        }
+    except Exception as e:
+        logger.error(f"Financials fetch failed for {symbol}: {e.__class__.__name__}")
+        return None
+
+
+def _render_financials(symbol: str):
+    """Annual financial statements from Yahoo (columns are fiscal periods)."""
+    st.subheader("Financial Statements")
+    st.caption("Source: Yahoo Finance - annual figures in the company's reporting currency.")
+    data = _fetch_financials(symbol)
+    if not data:
+        st.info("No financial statements available for this symbol.")
+        return
+    tabs = st.tabs(list(data))
+    for tab, (label, df) in zip(tabs, data.items()):
+        with tab:
+            if df is None or df.empty:
+                st.info(f"No {label.lower()} available.")
+                continue
+            st.dataframe(df, use_container_width=True)
 
 
 def _render_company_news(db: Session, symbol: str):

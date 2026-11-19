@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 from app.models.notification import Notification
+from app.models.news import NewsArticle
 from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
 # app.services.price_queries is Streamlit-free so this service also runs inside
@@ -12,6 +13,8 @@ from app.services.price_queries import get_latest_and_previous_prices
 from app.config.settings import settings
 from loguru import logger
 import json
+from urllib.parse import quote
+
 import apprise
 
 
@@ -45,9 +48,11 @@ class NotificationService:
         """Setup notification channels based on configuration."""
         # Email
         if settings.notification_email_from and settings.notification_email_password:
+            # The password must be URL-encoded - an SMTP password containing
+            # '@', ':' or '%' would corrupt the authority parse and fail sends.
             email_url = (
                 f"mailto://{settings.notification_email_from}:"
-                f"{settings.notification_email_password}@"
+                f"{quote(settings.notification_email_password, safe='')}@"
                 f"{settings.notification_email_smtp_host}:"
                 f"{settings.notification_email_smtp_port}"
             )
@@ -181,7 +186,9 @@ class NotificationService:
             logger.error(f"Failed to send notification: {notification.title}")
 
         except Exception as e:
-            logger.error(f"Error sending notification: {e}")
+            # Don't log `str(e)` - Apprise exceptions can echo the asset URL,
+            # which may contain webhook/bot tokens or the mailto password.
+            logger.error(f"Error sending notification: {e.__class__.__name__}")
 
         notification.attempts = (notification.attempts or 0) + 1
         try:
@@ -326,6 +333,38 @@ class NotificationService:
                         metadata={"indicator": "MACD", "signal": "bearish_crossover"}
                     )
     
+    def check_news_alerts(self):
+        """Raise type="news" alerts for fresh articles about watchlisted symbols.
+
+        Consumes WatchlistItem.notify_news - the flag existed with no reader.
+        The scan window equals ALERT_DEDUP_WINDOW so each stored article
+        alerts exactly once: within the window create_notification dedups
+        repeats, and outside it the article isn't re-scanned.
+        """
+        items = [i for i in self._alertable_watchlist_items() if i.notify_news]
+        if not items:
+            return
+        symbols = {i.symbol for i in items}
+        cutoff = _utcnow_naive() - ALERT_DEDUP_WINDOW
+        articles = self.db.query(NewsArticle).filter(
+            NewsArticle.stock_symbol.in_(symbols),
+            NewsArticle.created_at >= cutoff,
+        ).order_by(NewsArticle.created_at.desc()).limit(100).all()
+
+        for article in articles:
+            headline = (article.title or "").strip()
+            if not headline:
+                continue
+            self.create_notification(
+                notification_type="news",
+                title=headline[:490],
+                message=(
+                    f"{article.source}: {(article.summary or '').strip() or article.url}"
+                )[:2000],
+                stock_symbol=article.stock_symbol,
+                metadata={"url": article.url, "source": article.source},
+            )
+
     def send_pending_notifications(self):
         """Send all pending notifications."""
         if not self.enabled:

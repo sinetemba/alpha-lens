@@ -14,7 +14,7 @@ if ROOT not in sys.path:
 from app.models.base import SessionLocal
 from app.models.portfolio import Portfolio
 from app.collectors.easyequities import EasyEquitiesCollector
-from app.dashboard.portfolio import _sync_portfolio_from_easyequities
+from app.services.easyequities_sync import sync_portfolio_from_easyequities
 
 collector = EasyEquitiesCollector()
 if not collector.enabled:
@@ -28,12 +28,14 @@ try:
         print("No portfolio row found.")
         raise SystemExit(1)
 
-    synced = _sync_portfolio_from_easyequities(db, portfolio.id, collector)
+    synced, _raw = sync_portfolio_from_easyequities(db, portfolio.id, collector)
     if synced is None:
         print(f"Sync failed: {collector.last_error}")
         raise SystemExit(1)
 
-    portfolio.last_easyequities_sync = datetime.now(timezone.utc)
+    # Naive UTC - all DateTime columns are naive; an aware value would store
+    # a "+00:00" suffix on SQLite and break staleness comparisons.
+    portfolio.last_easyequities_sync = datetime.now(timezone.utc).replace(tzinfo=None)
     db.commit()
     print(f"Synced {synced} holding(s); last_easyequities_sync = {portfolio.last_easyequities_sync}")
 finally:

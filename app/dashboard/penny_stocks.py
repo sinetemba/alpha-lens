@@ -11,7 +11,7 @@ from loguru import logger
 from app.analytics.technical_indicators import TechnicalIndicators
 from app.collectors.yfinance import JSE_PRICE_SCALE
 from app.dashboard.company import _get_company_news
-from app.dashboard.utils import format_price, format_stock_label, price_column_format, _to_display_tz, render_last_fetch_caption
+from app.dashboard.utils import format_price, format_stock_label, style_price_columns, _to_display_tz, render_last_fetch_caption
 from app.models.news import NewsArticle
 from app.models.portfolio import PortfolioHolding, is_jse_tracked_account
 from app.models.stock import Stock
@@ -144,9 +144,11 @@ def show_penny_stocks(db: Session):
         "Potential": r["score"],
     } for r in top])
 
-    price_fmt = price_column_format(grid_df["Price"], grid_df["52w Low"], grid_df["52w High"])
+    styled_grid = style_price_columns(
+        grid_df.style, grid_df, "Price", price_cols=("Price", "52w Low", "52w High"),
+    )
     event = st.dataframe(
-        grid_df,
+        styled_grid,
         use_container_width=True,
         hide_index=True,
         on_select="rerun",
@@ -157,7 +159,7 @@ def show_penny_stocks(db: Session):
                 "Stock", help="Ticker and company name of the scanned share"
             ),
             "Price": st.column_config.NumberColumn(
-                "Price", format=price_fmt,
+                "Price",
                 help="Latest share price in Rand (last close from Yahoo Finance)",
             ),
             "Day %": st.column_config.NumberColumn(
@@ -165,11 +167,11 @@ def show_penny_stocks(db: Session):
                 help="Price change vs the previous trading day's close",
             ),
             "52w Low": st.column_config.NumberColumn(
-                "52w Low", format=price_fmt,
+                "52w Low",
                 help="Lowest price over the past 52 weeks",
             ),
             "52w High": st.column_config.NumberColumn(
-                "52w High", format=price_fmt,
+                "52w High",
                 help="Highest price over the past 52 weeks",
             ),
             "Above Low %": st.column_config.NumberColumn(

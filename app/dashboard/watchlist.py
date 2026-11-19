@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from app.models.portfolio import PortfolioHolding
 from app.dashboard.utils import (
     format_stock_label,
-    price_column_format,
+    style_price_columns,
     render_csv_download,
     render_market_data_refresh_control,
     render_symbol_search,
@@ -211,11 +211,12 @@ def show_watchlist(db: Session):
         styled_table = watchlist_table.style.apply(_style_watchlist_row, axis=1).hide(
             axis="columns", subset=[c for c in watchlist_table.columns if c.startswith("_")]
         )
-        price_fmt = price_column_format(
-            *(watchlist_table[c] for c in ("Current Price", "Purchase Price", "Target Price", "Stop Loss"))
-        )
-        change_fmt = price_column_format(
-            watchlist_table["Change"], watchlist_table["Gain/Loss"], signed=True
+        # Per-row decimals: a penny stock (SKA at R0.0085) must not put every
+        # row on 4 decimals (R 210.3800) - column formats are table-wide.
+        styled_table = style_price_columns(
+            styled_table, watchlist_table, "Current Price",
+            price_cols=("Current Price", "Purchase Price", "Target Price", "Stop Loss"),
+            signed_cols=("Change", "Gain/Loss"),
         )
         st.dataframe(
             styled_table,
@@ -223,13 +224,13 @@ def show_watchlist(db: Session):
             hide_index=True,
             column_config={
                 "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
-                "Current Price": st.column_config.NumberColumn("Current Price", format=price_fmt, help="Latest market price per share."),
-                "Change": st.column_config.NumberColumn("Change", format=change_fmt, help="Rand change since the previous close."),
+                "Current Price": st.column_config.NumberColumn("Current Price", help="Latest market price per share."),
+                "Change": st.column_config.NumberColumn("Change", help="Rand change since the previous close."),
                 "Change %": st.column_config.NumberColumn("Change %", format="%+.2f%%", help="Percentage change since the previous close."),
-                "Purchase Price": st.column_config.NumberColumn("Purchase Price", format=price_fmt, help="Average price paid per share, if held."),
-                "Target Price": st.column_config.NumberColumn("Target Price", format=price_fmt, help="Price target for this stock."),
-                "Stop Loss": st.column_config.NumberColumn("Stop Loss", format=price_fmt, help="Stop loss price for this stock."),
-                "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format=change_fmt, help="Current price less purchase price."),
+                "Purchase Price": st.column_config.NumberColumn("Purchase Price", help="Average price paid per share, if held."),
+                "Target Price": st.column_config.NumberColumn("Target Price", help="Price target for this stock."),
+                "Stop Loss": st.column_config.NumberColumn("Stop Loss", help="Stop loss price for this stock."),
+                "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", help="Current price less purchase price."),
                 "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", format="%+.2f%%", help="Gain or loss as a percentage of purchase price."),
             },
         )

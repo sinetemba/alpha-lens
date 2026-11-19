@@ -400,28 +400,6 @@ class YFinanceCollector:
             logger.error(f"Error getting actions for {symbol}: {e}")
             return None
     
-    def get_financials(self, symbol: str) -> Optional[Dict]:
-        """Get financial statements for a symbol."""
-        ticker = self.get_ticker(symbol)
-        if not ticker:
-            return None
-        
-        try:
-            return {
-                "income_statement": self._call_with_retry(
-                    f"Yahoo income statement for {symbol}", lambda: ticker.income_stmt
-                ),
-                "balance_sheet": self._call_with_retry(
-                    f"Yahoo balance sheet for {symbol}", lambda: ticker.balance_sheet
-                ),
-                "cash_flow": self._call_with_retry(
-                    f"Yahoo cash flow for {symbol}", lambda: ticker.cashflow
-                ),
-            }
-        except Exception as e:
-            logger.error(f"Error getting financials for {symbol}: {e}")
-            return None
-    
     def get_major_holders(self, symbol: str) -> Optional[Dict]:
         """Get major holders information for a symbol."""
         ticker = self.get_ticker(symbol)

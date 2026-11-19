@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import func
+from sqlalchemy import func, case
 from sqlalchemy.orm import Session, joinedload
 from app.models.portfolio import (
     Portfolio,
@@ -13,12 +13,13 @@ from app.models.portfolio import (
     is_jse_tracked_account,
 )
 from app.models.portfolio_snapshot import PortfolioSnapshot
+from app.models.transaction import PortfolioTransaction
 from app.models.stock import Stock, StockPrice
 from app.dashboard.utils import (
     format_stock_label,
     is_market_data_stale,
     PriceSnapshot,
-    price_column_format,
+    style_price_columns,
     render_csv_download,
     render_last_fetch_caption,
     render_symbol_search,
@@ -28,16 +29,16 @@ from app.dashboard.utils import (
 from app.collectors.easyequities import EasyEquitiesCollector
 from app.services.portfolio_valuation import update_holding_values, update_portfolio_totals
 from app.services.price_queries import get_latest_and_previous_prices
+# The sync itself is Streamlit-free in services.easyequities_sync so the
+# headless updater can run it too; these names are re-exported for tests.
+from app.services.easyequities_sync import (
+    _normalize_account_type,
+    _ee_reconcile_units,
+    _sync_holding_from_easyequities,
+    sync_portfolio_from_easyequities,
+)
 from datetime import datetime, timedelta, timezone
 from loguru import logger
-
-
-def _normalize_account_type(account_type: str | None) -> str:
-    """Strip the 'EasyEquities ' prefix and whitespace so account names
-    align with the portfolio's account_type values (e.g. 'ZAR', 'TFSA')."""
-    if not account_type:
-        return "ZAR"
-    return account_type.strip().replace("EasyEquities ", "")
 
 
 def show_portfolio(db: Session):
@@ -154,6 +155,8 @@ def show_portfolio(db: Session):
 
     _render_unpriced_notice(db, holdings, portfolio)
     _render_value_history(db, portfolio.id)
+    _render_sector_allocation(db, holdings)
+    _render_transaction_history(db, portfolio.id)
 
     st.markdown("---")
     _render_instrument_type_counts(st.session_state.get("ee_last_raw_holdings"))
@@ -307,28 +310,69 @@ def show_portfolio(db: Session):
     # Remove holding — scoped to (symbol, account_type), since the same symbol
     # can legitimately be held in e.g. both the ZAR and TFSA accounts.
     st.subheader("Remove Holding")
+    remove_flash = st.session_state.pop("portfolio_remove_flash", None)
+    if remove_flash:
+        getattr(st, remove_flash[0])(remove_flash[1])
     holding_options = {
         f"{format_stock_label(h.symbol, h.stock.name if h.stock else None)} — {h.account_type or 'ZAR'}": h
         for h in holdings
     }
     label_to_remove = st.selectbox("Select holding to remove", list(holding_options.keys()))
     holding_to_remove = holding_options.get(label_to_remove)
+    if holding_to_remove is None:
+        return
+
+    reason = st.radio(
+        "Reason",
+        ["Sold it", "Entered by mistake"],
+        horizontal=True,
+        key="remove_holding_reason",
+        help=(
+            "'Sold it' records a sale (realized P&L) at the price/date below. "
+            "'Entered by mistake' deletes the holding and its logged manual buys "
+            "without recording a sale."
+        ),
+    )
+    sold = reason == "Sold it"
+    sell_price = sold_on = None
+    if sold:
+        price_col, date_col = st.columns(2)
+        default_price = float(holding_to_remove.current_price or holding_to_remove.purchase_price or 0.0)
+        sell_price = price_col.number_input(
+            "Sale price per share (R)", min_value=0.0, value=default_price,
+            step=0.01, format="%.4f", key="remove_holding_price",
+        )
+        sold_on = date_col.date_input("Sale date", value=datetime.now().date(), key="remove_holding_date")
+    if holding_to_remove.account_type != "Manual":
+        st.caption(
+            "This holding comes from EasyEquities - if EasyEquities still reports it, "
+            "the next sync will add it back."
+        )
 
     remove_key = "remove_pending_holding"
     if st.button("Remove Holding"):
         st.session_state[remove_key] = label_to_remove
 
     if label_to_remove and st.session_state.get(remove_key) == label_to_remove:
-        st.warning(f"Are you sure you want to remove {label_to_remove}?")
+        what = (
+            f"record a sale of {label_to_remove} at R {sell_price:,.4f} and remove it"
+            if sold else f"delete {label_to_remove} without recording a sale"
+        )
+        st.warning(f"Are you sure you want to {what}?")
         confirm_col, cancel_col = st.columns(2)
         with confirm_col:
             if st.button("Yes, remove"):
                 _remove_holding(
                     db, portfolio.id,
                     holding_to_remove.symbol, holding_to_remove.account_type,
+                    record_sale=sold,
+                    sell_price=sell_price,
+                    sold_at=datetime.combine(sold_on, datetime.min.time()) if sold_on else None,
                 )
                 st.session_state[remove_key] = None
-                st.success(f"Removed {label_to_remove} from portfolio.")
+                st.session_state["portfolio_remove_flash"] = (
+                    "success", f"Removed {label_to_remove} from portfolio."
+                )
                 st.rerun()
         with cancel_col:
             if st.button("Cancel"):
@@ -410,6 +454,129 @@ def _render_value_history(db: Session, portfolio_id: int) -> None:
             f"R {change:+,.2f} since {first.snapshot_date:%Y-%m-%d} "
             "(includes money added or withdrawn - this is value, not return)."
         )
+
+
+def _render_sector_allocation(db: Session, holdings: list) -> None:
+    """Invested value by sector (Stock.sector; 'Unclassified' when unfetched)."""
+    sectors: dict[str, float] = {}
+    for h in holdings:
+        value = h.current_value or 0.0
+        if value <= 0:
+            continue
+        sector = (h.stock.sector if h.stock else None) or "Unclassified"
+        sectors[sector] = sectors.get(sector, 0.0) + value
+    if not sectors:
+        return
+    with st.expander("🏷️ Sector allocation"):
+        fig = go.Figure(go.Pie(
+            labels=list(sectors), values=list(sectors.values()),
+            hole=0.45, textinfo="label+percent",
+        ))
+        fig.update_layout(
+            height=320, margin={"l": 10, "r": 10, "t": 10, "b": 10},
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        if "Unclassified" in sectors:
+            st.caption(
+                "'Unclassified' = holdings whose sector hasn't been fetched yet "
+                "(populated from Yahoo on the next price update)."
+            )
+
+
+def _render_transaction_history(db: Session, portfolio_id: int) -> None:
+    """Buy/sell log + realized P&L (manual add/remove + EasyEquities sync events)."""
+    realized, total_buys, sales = db.query(
+        func.coalesce(func.sum(PortfolioTransaction.realized_gain), 0.0),
+        func.coalesce(func.sum(
+            case((PortfolioTransaction.transaction_type == "buy",
+                  PortfolioTransaction.value), else_=0.0)
+        ), 0.0),
+        func.count(),
+    ).filter(
+        PortfolioTransaction.portfolio_id == portfolio_id,
+    ).first()
+
+    with st.expander("📜 Transaction history & realized P&L"):
+        if not sales:
+            st.info(
+                "No transactions recorded yet. Buys and sells are logged when "
+                "holdings are added/removed here or reconciled by EasyEquities sync."
+            )
+            return
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Realized P&L (approx.)", f"R {realized:,.2f}")
+        c2.metric("Total buys", f"R {total_buys:,.2f}")
+        c3.metric("Transactions", sales)
+        st.caption(
+            "Approximate: gains use average cost, not per-lot. EasyEquities doesn't "
+            "expose trade dates or fill prices, so its events are dated at sync time "
+            "and priced from EasyEquities' last reported values. Moves between "
+            "accounts are logged as xfer_in/xfer_out with no P&L. Holdings that "
+            "predate the log have a 'backfill' opening buy."
+        )
+
+        rows = db.query(PortfolioTransaction).filter(
+            PortfolioTransaction.portfolio_id == portfolio_id
+        ).order_by(PortfolioTransaction.transacted_at.desc()).limit(200).all()
+        table = pd.DataFrame([{
+            "Date": _to_display_tz(r.transacted_at).strftime("%Y-%m-%d") if r.transacted_at else "",
+            "Type": r.transaction_type,
+            "Symbol": r.symbol,
+            "Account": r.account_type or "ZAR",
+            "Qty": r.quantity,
+            "Price": r.price,
+            "Value": r.value,
+            "Realized": r.realized_gain,
+            "Source": r.source,
+        } for r in rows])
+        # Price per row: a penny-stock trade (R0.0085) must not show as R0.01.
+        st.dataframe(
+            style_price_columns(table.style, table, "Price", price_cols=("Price",)),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Qty": st.column_config.NumberColumn(format="%g"),
+                "Price": st.column_config.NumberColumn(),
+                "Value": st.column_config.NumberColumn(format="R %.2f"),
+                "Realized": st.column_config.NumberColumn(format="R %.2f"),
+            },
+        )
+        _render_transaction_delete(db, portfolio_id, rows)
+
+
+def _render_transaction_delete(db: Session, portfolio_id: int, rows: list) -> None:
+    """Two-step delete of one logged event (correcting a wrong entry)."""
+    flash = st.session_state.pop("transaction_delete_flash", None)
+    if flash:
+        getattr(st, flash[0])(flash[1])
+    options = {
+        f"#{r.id} {r.transaction_type} {r.quantity:g} {r.symbol} ({r.account_type or 'ZAR'}) "
+        f"@ R {r.price:,.4f}"
+        f"{' on ' + _to_display_tz(r.transacted_at).strftime('%Y-%m-%d') if r.transacted_at else ''}": r.id
+        for r in rows
+    }
+    col_select, col_button = st.columns([4, 1])
+    label = col_select.selectbox(
+        "Correct a wrong entry", list(options), key="transaction_delete_select",
+    )
+    pending_key = "transaction_delete_pending"
+    if col_button.button("Delete", key="transaction_delete_button"):
+        st.session_state[pending_key] = label
+    if label and st.session_state.get(pending_key) == label:
+        st.warning(f"Delete {label} from the history? This changes realized P&L.")
+        yes_col, no_col = st.columns(2)
+        if yes_col.button("Yes, delete", key="transaction_delete_yes"):
+            from app.services.transactions import delete_transaction
+            deleted = delete_transaction(db, portfolio_id, options[label])
+            st.session_state[pending_key] = None
+            st.session_state["transaction_delete_flash"] = (
+                ("success", f"Deleted {label}.") if deleted
+                else ("warning", "That transaction no longer exists.")
+            )
+            st.rerun()
+        if no_col.button("Cancel", key="transaction_delete_cancel"):
+            st.session_state[pending_key] = None
+            st.rerun()
 
 
 @st.cache_data(
@@ -497,7 +664,12 @@ def _render_holdings_table(
         styled_table = visible_table.style.apply(style_gain_loss_row, axis=1).hide(
             axis="columns", subset=["_gain_loss"]
         )
-        price_fmt = price_column_format(holdings_table["Purchase Price"], holdings_table["Current Price"])
+        # Per-row decimals keyed on the current price - taken from the full
+        # table, since the user may have hidden the Current Price column.
+        styled_table = style_price_columns(
+            styled_table, visible_table, holdings_table["Current Price"],
+            price_cols=("Purchase Price", "Current Price"),
+        )
         st.dataframe(
             styled_table,
             use_container_width=True,
@@ -505,8 +677,8 @@ def _render_holdings_table(
             column_config={
                 "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
                 "Quantity": st.column_config.NumberColumn("Quantity", help="Number of shares currently held."),
-                "Purchase Price": st.column_config.NumberColumn("Purchase Price", format=price_fmt, help="Average price paid per share."),
-                "Current Price": st.column_config.NumberColumn("Current Price", format=price_fmt, help="Latest market price per share from EasyEquities."),
+                "Purchase Price": st.column_config.NumberColumn("Purchase Price", help="Average price paid per share."),
+                "Current Price": st.column_config.NumberColumn("Current Price", help="Latest market price per share from EasyEquities."),
                 "Total Purchase Value": st.column_config.NumberColumn("Total Purchase Value", format="R %.2f", help="Quantity multiplied by the average purchase price."),
                 "Current Value": st.column_config.NumberColumn("Current Value", format="R %.2f", help="Current market value of the holding."),
                 "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format="R %.2f", help="Current value less total purchase value."),
@@ -683,119 +855,11 @@ def _render_instrument_type_counts(raw_holdings: list | None) -> None:
 def _sync_portfolio_from_easyequities(
     db: Session, portfolio_id: int, collector: EasyEquitiesCollector
 ) -> int | None:
-    ee_holdings = collector.get_all_holdings()
-    st.session_state["ee_last_raw_holdings"] = ee_holdings if ee_holdings is not None else []
-    if ee_holdings is None:
-        return None
-
-    aggregated_holdings = {}
-    seen_account_types = set()
-    for ee_holding in ee_holdings:
-        symbol = ee_holding["symbol"]
-        account_name = _normalize_account_type(ee_holding.get("account_name"))
-        if account_name not in EXCLUDED_ACCOUNT_TYPES:
-            seen_account_types.add(account_name)
-        if (
-            not symbol
-            or symbol in EXCLUDED_PORTFOLIO_SYMBOLS
-            or account_name in EXCLUDED_ACCOUNT_TYPES
-            or ee_holding["shares"] <= 0
-        ):
-            continue
-        key = (symbol, account_name)
-        current = aggregated_holdings.setdefault(key, {
-            "symbol": symbol,
-            "name": ee_holding.get("name") or symbol,
-            "account_name": account_name,
-            "currency": ee_holding.get("currency"),
-            "shares": 0.0,
-            "purchase_value": 0.0,
-            "current_value": 0.0,
-        })
-        current["shares"] += ee_holding["shares"]
-        current["purchase_value"] += ee_holding["purchase_value"]
-        current["current_value"] += ee_holding["current_value"]
-
-    # Prefetch lookup maps so each holding sync does not fire two queries.
-    if aggregated_holdings:
-        stocks_by_symbol = {
-            s.symbol: s for s in db.query(Stock).filter(
-                Stock.symbol.in_([h["symbol"] for h in aggregated_holdings.values()])
-            ).all()
-        }
-        holdings_by_key = {
-            (h.symbol, h.account_type): h for h in db.query(PortfolioHolding).filter(
-                PortfolioHolding.portfolio_id == portfolio_id,
-            ).all()
-        }
-        # One grouped latest-close lookup for the EE units check, instead of
-        # one ORDER BY DESC query per synced holding.
-        latest_ts = db.query(
-            StockPrice.symbol.label("symbol"),
-            func.max(StockPrice.timestamp).label("max_ts"),
-        ).filter(
-            StockPrice.symbol.in_([h["symbol"] for h in aggregated_holdings.values()])
-        ).group_by(StockPrice.symbol).subquery()
-        latest_closes = dict(db.query(StockPrice.symbol, StockPrice.close_price).join(
-            latest_ts,
-            (StockPrice.symbol == latest_ts.c.symbol)
-            & (StockPrice.timestamp == latest_ts.c.max_ts),
-        ).all())
-    else:
-        stocks_by_symbol = {}
-        holdings_by_key = {}
-        latest_closes = {}
-
-    for ee_holding in aggregated_holdings.values():
-        ee_holding["purchase_price"] = ee_holding["purchase_value"] / ee_holding["shares"]
-        ee_holding["current_price"] = ee_holding["current_value"] / ee_holding["shares"]
-        _sync_holding_from_easyequities(
-            db, portfolio_id, ee_holding, stocks_by_symbol, holdings_by_key, latest_closes,
-        )
-    try:
-        db.commit()
-    except IntegrityError:
-        # A concurrent sync (this page vs sync_easyequities.py / another
-        # session) upserted the same (symbol, account_type) rows first -
-        # they carry equivalent data, keep them instead of crashing.
-        db.rollback()
-        logger.warning("EasyEquities sync hit a concurrent write; keeping the other writer's rows")
-
-    # EasyEquities is the source of truth: remove holdings under the account
-    # types we just synced that it no longer reports (fully sold/delisted
-    # positions). Otherwise they linger in the DB forever and get retried on
-    # every price refresh, which is slow for delisted/wrong-exchange tickers.
-    # Guard: skip reconciliation entirely when nothing aggregated - an upstream
-    # glitch returning empty/partial data must never wipe all holdings.
-    if seen_account_types and aggregated_holdings:
-        stale_holdings = db.query(PortfolioHolding).filter(
-            PortfolioHolding.portfolio_id == portfolio_id,
-            PortfolioHolding.account_type.in_(seen_account_types),
-        ).all()
-        removed = []
-        for holding in stale_holdings:
-            if (holding.symbol, holding.account_type) not in aggregated_holdings:
-                db.delete(holding)
-                removed.append(f"{holding.symbol} ({holding.account_type})")
-        if removed:
-            db.commit()
-            logger.info(f"Removed {len(removed)} stale holding(s) no longer reported by EasyEquities")
-            # Removed positions used to vanish with no trace - an in-app
-            # notification records what was dropped (deduped per symbol set).
-            try:
-                from app.notifications.notification_service import NotificationService
-                NotificationService(db).create_notification(
-                    notification_type="system",
-                    title=f"EasyEquities sync removed {len(removed)} holding(s)",
-                    message=(
-                        "No longer reported by EasyEquities (sold, transferred or "
-                        f"delisted) and removed from the portfolio: {', '.join(sorted(removed))}"
-                    ),
-                )
-            except Exception as e:
-                logger.warning(f"Could not record holding-removal notification: {e}")
-
-    return len(aggregated_holdings)
+    """Page wrapper around services.easyequities_sync - stashes the raw
+    holdings for the debug expander, then returns the synced count."""
+    synced, raw = sync_portfolio_from_easyequities(db, portfolio_id, collector)
+    st.session_state["ee_last_raw_holdings"] = raw
+    return synced
 
 
 def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, purchase_price: float, purchase_date) -> int | None:
@@ -841,6 +905,13 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
     )
     
     db.add(holding)
+    from app.services.transactions import record_transaction
+    record_transaction(
+        db,
+        portfolio_id=portfolio_id, stock_id=stock.id, symbol=symbol,
+        account_type="Manual", transaction_type="buy",
+        quantity=quantity, price=purchase_price,
+    )
     try:
         db.commit()
     except IntegrityError:
@@ -878,135 +949,57 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
     return saved
 
 
-def _ee_reconcile_units(
-    db: Session, ee_holding: dict, account_type: str, latest_closes: dict | None = None
-) -> None:
-    """Rescale EasyEquities amounts that look like cents, in place.
-
-    The aggregated holding derives price from value/shares, so internal
-    consistency can't detect a units glitch - compare the implied price
-    against the stored JSE close instead (same ~100x rule as the bar unit
-    check on the price-feed path). USD-denominated amounts on JSE-tracked
-    accounts are flagged rather than rescaled.
-
-    `latest_closes` is an optional {symbol: latest close} map - syncs prefetch
-    it in one grouped query instead of querying per holding.
-    """
-    symbol = ee_holding.get("symbol", "?")
-    price = ee_holding.get("current_price") or 0.0
-    if price <= 0 or not is_jse_tracked_account(account_type):
-        return
-    currency = (ee_holding.get("currency") or "").upper()
-    if currency and currency != "ZAR":
-        logger.warning(
-            f"EasyEquities {symbol}: {currency}-denominated amount on "
-            f"JSE-tracked account {account_type} - skipping stored-close check"
-        )
-        return
-    if latest_closes is not None:
-        stored_close = latest_closes.get(symbol)
-    else:
-        stored = db.query(StockPrice.close_price).filter(
-            StockPrice.symbol == symbol
-        ).order_by(StockPrice.timestamp.desc()).first()
-        stored_close = stored.close_price if stored else None
-    if not stored_close:
-        return
-    ratio = max(price, stored_close) / min(price, stored_close)
-    if ratio <= 3.0:
-        return
-    if abs(price / 100 - stored_close) / stored_close <= 0.2:
-        logger.warning(
-            f"EasyEquities {symbol}: implied price {price:.2f} looks like cents "
-            f"vs stored close {stored_close:.2f} - rescaling /100"
-        )
-        for key in ("current_price", "purchase_price", "current_value", "purchase_value"):
-            if ee_holding.get(key):
-                ee_holding[key] /= 100
-    else:
-        logger.warning(
-            f"EasyEquities {symbol}: implied price {price:.2f} diverges {ratio:.0f}x "
-            f"from stored close {stored_close:.2f} - keeping EE values"
-        )
-
-
-def _sync_holding_from_easyequities(
+def _remove_holding(
     db: Session,
     portfolio_id: int,
-    ee_holding: dict,
-    stocks_by_symbol: dict | None = None,
-    holdings_by_key: dict | None = None,
-    latest_closes: dict | None = None,
+    symbol: str,
+    account_type: str,
+    record_sale: bool = True,
+    sell_price: float | None = None,
+    sold_at: datetime | None = None,
 ):
-    """Create or update a holding from parsed EasyEquities data.
+    """Remove a holding for a specific account type.
 
-    Does NOT commit - callers commit once per sync so a mid-loop failure does
-    not persist a half-synced portfolio.
+    `record_sale=True` logs the realized sale (at `sell_price`/`sold_at` when
+    given, else the last known price, now). `record_sale=False` is a
+    correction: the holding and the manual buys logged for it are deleted
+    with no sale, so a typo doesn't leave phantom P&L behind.
     """
-    symbol = ee_holding["symbol"]
-    account_type = _normalize_account_type(ee_holding.get("account_name"))
-    if (
-        not symbol
-        or symbol in EXCLUDED_PORTFOLIO_SYMBOLS
-        or account_type in EXCLUDED_ACCOUNT_TYPES
-        or ee_holding["shares"] <= 0
-    ):
-        return
+    from app.services.transactions import BUY, record_sale as log_sale
 
-    _ee_reconcile_units(db, ee_holding, account_type, latest_closes)
-
-    stock = (stocks_by_symbol or {}).get(symbol)
-    if stock is None:
-        stock = db.query(Stock).filter(Stock.symbol == symbol).first()
-    if not stock:
-        stock = Stock(symbol=symbol, name=ee_holding.get("name") or symbol)
-        db.add(stock)
-        db.flush()
-        if stocks_by_symbol is not None:
-            stocks_by_symbol[symbol] = stock
-
-    holding = (holdings_by_key or {}).get((symbol, account_type))
-    if holding is None:
-        holding = db.query(PortfolioHolding).filter(
-            PortfolioHolding.portfolio_id == portfolio_id,
-            PortfolioHolding.symbol == symbol,
-            PortfolioHolding.account_type == account_type,
-        ).first()
-
-    is_new = holding is None
-    if is_new:
-        holding = PortfolioHolding(
-            portfolio_id=portfolio_id,
-            stock_id=stock.id,
-            symbol=symbol,
-            account_type=account_type,
-            purchase_date=datetime.now(timezone.utc).replace(tzinfo=None),
-        )
-        db.add(holding)
-
-    # EasyEquities is treated as the source of truth for quantity, cost basis, and market value on sync
-    holding.quantity = ee_holding["shares"]
-    holding.purchase_price = ee_holding["purchase_price"]
-    holding.current_price = ee_holding["current_price"]
-    holding.current_value = ee_holding["current_value"]
-    holding.gain_loss = holding.current_value - (holding.quantity * holding.purchase_price)
-    cost_basis = holding.quantity * holding.purchase_price
-    holding.gain_loss_percentage = (
-        (holding.gain_loss / cost_basis) * 100
-        if cost_basis else 0.0
-    )
-    # Always update the timestamp so the UI reflects the latest sync time,
-    # even when EasyEquities returns identical values.
-    holding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def _remove_holding(db: Session, portfolio_id: int, symbol: str, account_type: str):
-    """Remove a holding for a specific account type from the portfolio."""
-    db.query(PortfolioHolding).filter(
+    holding = db.query(PortfolioHolding).filter(
         PortfolioHolding.portfolio_id == portfolio_id,
         PortfolioHolding.symbol == symbol,
         PortfolioHolding.account_type == (account_type or "ZAR"),
-    ).delete()
+    ).first()
+    if not holding:
+        return
+    if record_sale:
+        if not sell_price:
+            # Exit price: the holding's last known price, else the latest stored close.
+            sell_price = holding.current_price
+        if not sell_price:
+            latest = db.query(StockPrice.close_price).filter(
+                StockPrice.symbol == symbol
+            ).order_by(StockPrice.timestamp.desc()).first()
+            sell_price = latest.close_price if latest else holding.purchase_price
+        log_sale(db, holding, sell_price, source="manual", sold_at=sold_at)
+    else:
+        # Only the buys logged for THIS holding (since it was created) - an
+        # earlier, really-sold position in the same symbol keeps its history.
+        buys = db.query(PortfolioTransaction).filter(
+            PortfolioTransaction.portfolio_id == portfolio_id,
+            PortfolioTransaction.symbol == symbol,
+            PortfolioTransaction.account_type == (account_type or "ZAR"),
+            PortfolioTransaction.transaction_type == BUY,
+            PortfolioTransaction.source.in_(("manual", "backfill")),
+        )
+        if holding.created_at is not None:
+            buys = buys.filter(
+                PortfolioTransaction.created_at >= holding.created_at - timedelta(minutes=1)
+            )
+        buys.delete(synchronize_session=False)
+    db.delete(holding)
     db.commit()
 
 

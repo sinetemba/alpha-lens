@@ -1,5 +1,6 @@
 """Tests for the headless updater (app/services/updater.py)."""
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -212,6 +213,129 @@ def test_backup_not_taken_when_not_due(session_factory, monkeypatch):
     svc._run_backup.assert_not_called()
 
 
+# --- EasyEquities sync gate -----------------------------------------------
+
+def _stub_ee(monkeypatch, enabled=True, synced=2):
+    collector = SimpleNamespace(enabled=enabled, last_error=None)
+    monkeypatch.setattr(updater, "EasyEquitiesCollector", lambda: collector)
+    sync = MagicMock(return_value=(synced, []))
+    monkeypatch.setattr(updater, "sync_portfolio_from_easyequities", sync)
+    return sync
+
+
+def test_ee_sync_skipped_when_disabled(db, monkeypatch):
+    sync = _stub_ee(monkeypatch, enabled=False)
+    db.add(Portfolio(name="P"))
+    db.commit()
+
+    updater._sync_easyequities_if_due(db)
+
+    sync.assert_not_called()
+
+
+def test_ee_sync_skipped_when_fresh(db, monkeypatch):
+    sync = _stub_ee(monkeypatch)
+    db.add(Portfolio(name="P", last_easyequities_sync=_utcnow()))
+    db.commit()
+
+    updater._sync_easyequities_if_due(db)
+
+    sync.assert_not_called()
+
+
+def test_ee_sync_runs_when_stale_and_stamps(db, monkeypatch):
+    sync = _stub_ee(monkeypatch, synced=3)
+    portfolio = Portfolio(name="P", last_easyequities_sync=_utcnow() - timedelta(days=3))
+    db.add(portfolio)
+    db.commit()
+
+    updater._sync_easyequities_if_due(db)
+
+    sync.assert_called_once()
+    db.refresh(portfolio)
+    assert _utcnow() - portfolio.last_easyequities_sync < timedelta(minutes=5)
+
+
+def test_ee_sync_failure_leaves_timestamp(db, monkeypatch):
+    sync = _stub_ee(monkeypatch, synced=None)
+    portfolio = Portfolio(name="P")
+    db.add(portfolio)
+    db.commit()
+
+    updater._sync_easyequities_if_due(db)
+
+    sync.assert_called_once()
+    db.refresh(portfolio)
+    assert portfolio.last_easyequities_sync is None
+
+
+# --- cross-process job lock ------------------------------------------------
+
+from app.services import process_lock  # noqa: E402
+
+
+def test_os_lock_excludes_second_holder(tmp_path):
+    path = tmp_path / "updater.lock"
+    fh = process_lock.acquire_instance_lock(path)
+    try:
+        assert fh is not None
+        assert process_lock.acquire_instance_lock(path) is None
+    finally:
+        process_lock.release_instance_lock(fh)
+    # Released: a new holder can take it.
+    fh2 = process_lock.acquire_instance_lock(path)
+    assert fh2 is not None
+    process_lock.release_instance_lock(fh2)
+
+
+def test_job_lock_is_reentrant_and_released_per_job(tmp_path):
+    path = tmp_path / "job.lock"
+    mine = process_lock.InterProcessJobLock(path, poll_seconds=0.01)
+    other = process_lock.InterProcessJobLock(path, poll_seconds=0.01)  # "another process"
+
+    assert mine.acquire()
+    assert mine.acquire()            # nested job in the same process
+    assert not other.acquire(timeout=0.05)
+    mine.release()
+    assert not other.acquire(timeout=0)  # still held by the outer job
+    mine.release()
+    # Released after the job, not held for the life of the process.
+    assert other.acquire(timeout=0)
+    other.release()
+
+
+def test_job_skips_when_another_process_holds_lock(isolated_job_lock, session_factory, db, monkeypatch):
+    other = process_lock.InterProcessJobLock(isolated_job_lock.path)
+    assert other.acquire()
+    try:
+        data_service = MagicMock()
+        monkeypatch.setattr(updater, "DataService", lambda _db: data_service)
+        svc = UpdaterService()
+        svc.process_lock_timeout = 0.1
+
+        assert svc._update_prices_and_news() is False
+        data_service.update_stock_prices.assert_not_called()
+        assert db.query(UpdaterRun).count() == 0
+    finally:
+        other.release()
+
+
+def test_job_releases_lock_afterwards(isolated_job_lock, session_factory, monkeypatch):
+    data_service = MagicMock()
+    data_service.update_stock_prices.return_value = 0
+    monkeypatch.setattr(updater, "DataService", lambda _db: data_service)
+    monkeypatch.setattr(updater, "NewsScraper", MagicMock())
+    monkeypatch.setattr(updater, "EasyEquitiesCollector",
+                        lambda: SimpleNamespace(enabled=False))
+
+    UpdaterService()._update_prices_and_news()
+
+    assert not isolated_job_lock.held
+    other = process_lock.InterProcessJobLock(isolated_job_lock.path)
+    assert other.acquire(timeout=0)
+    other.release()
+
+
 # --- price + news job ----------------------------------------------------
 
 def test_price_job_with_zero_updates_fails_and_records_heartbeat(session_factory, db, monkeypatch):
@@ -219,6 +343,9 @@ def test_price_job_with_zero_updates_fails_and_records_heartbeat(session_factory
     data_service.update_stock_prices.return_value = 0
     monkeypatch.setattr(updater, "DataService", lambda _db: data_service)
     monkeypatch.setattr(updater, "NewsScraper", MagicMock())
+    # _snapshot_portfolio's broker syncs must not hit the network in tests.
+    monkeypatch.setattr(updater, "EasyEquitiesCollector",
+                        lambda: SimpleNamespace(enabled=False))
 
     assert UpdaterService()._update_prices_and_news() is False
 

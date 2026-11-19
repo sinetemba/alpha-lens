@@ -326,15 +326,6 @@ class TwelveDataCollector:
                 logger.error(f"Twelve Data request failed before a response was received: {exc.__class__.__name__}")
             return None
     
-    def get_price(self, symbol: str) -> Optional[Dict]:
-        """Get current price for a symbol."""
-        params = {
-            "symbol": symbol,
-            "outputsize": "1"
-        }
-        data = self._make_request("price", params)
-        return data
-    
     def get_quote(self, symbol: str) -> Optional[Dict]:
         """Get detailed quote for a symbol."""
         params = {
@@ -353,15 +344,7 @@ class TwelveDataCollector:
             return None
 
         return data
-    
-    def get_exchange_rate(self, from_currency: str, to_currency: str) -> Optional[Dict]:
-        """Get exchange rate between two currencies."""
-        params = {
-            "symbol": f"{from_currency}/{to_currency}"
-        }
-        data = self._make_request("exchange_rate", params)
-        return data
-    
+
     def get_historical_data(
         self, 
         symbol: str, 
@@ -403,29 +386,7 @@ class TwelveDataCollector:
             return data["values"]
 
         return None
-    
-    def get_technical_indicators(
-        self, 
-        symbol: str, 
-        indicator: str, 
-        interval: str = "1day"
-    ) -> Optional[Dict]:
-        """Get technical indicators for a symbol.
-        
-        Supported indicators: sma, ema, rsi, macd, bbands, adx, cci, stoch, etc.
-        """
-        params = {
-            "symbol": symbol,
-            "indicator": indicator,
-            "interval": interval
-        }
-        data = self._make_request("technical_indicators", params)
-        
-        if data and "values" in data:
-            return data["values"]
-        
-        return None
-    
+
     def get_company_info(self, symbol: str) -> Optional[Dict]:
         """Get company information for a symbol."""
         params = {
@@ -433,19 +394,7 @@ class TwelveDataCollector:
         }
         data = self._make_request("profile", params)
         return data
-    
-    def get_symbols(self, country: str = "South Africa") -> Optional[List[Dict]]:
-        """Get list of available symbols for a country."""
-        params = {
-            "country": country
-        }
-        data = self._make_request("symbol_search", params)
-        
-        if data and "data" in data:
-            return data["data"]
-        
-        return None
-    
+
     def get_dividends(self, symbol: str) -> Optional[List[Dict]]:
         """Get dividend history (including payment dates) for a symbol.
 

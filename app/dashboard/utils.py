@@ -12,6 +12,7 @@ from app.config.settings import settings
 from app.models.news import NewsArticle
 from app.models.stock import Stock, StockPrice
 from app.collectors.yfinance import YFinanceCollector
+from app.collectors.twelve_data import DEFAULT_REQUESTS_PER_DAY
 from app.models.updater_run import UpdaterRun
 from app.services.data_service import COMPANY_NAME_OVERRIDES, DataService
 # Re-exported from the Streamlit-free module so non-UI consumers (the headless
@@ -191,6 +192,69 @@ def format_price(value: Optional[float], na: str = "N/A") -> str:
     return f"R {value:,.2f}"
 
 
+def format_price_cell(
+    value: Optional[float], reference: Optional[float] = None, signed: bool = False,
+) -> str:
+    """Per-row Rand price text for Styler display (numbers stay sortable).
+
+    2 decimals, unless the row's reference price (its current price; the
+    value itself when there is none) is under R1 - then up to 4 decimals
+    with trailing zeros trimmed (R 0.0085, R 0.62, not R 0.6200).
+    """
+    if value is None or pd.isna(value):
+        return ""
+    ref = value if reference is None or pd.isna(reference) else reference
+    sign = "+" if signed else ""
+    if 0 < abs(ref) < SUB_RAND:
+        whole, frac = f"{value:{sign},.4f}".split(".")
+        return f"R {whole}.{frac.rstrip('0').ljust(2, '0')}"
+    return f"R {value:{sign},.2f}"
+
+
+def style_price_columns(
+    styler,
+    df: pd.DataFrame,
+    reference=None,
+    price_cols: Iterable[str] = (),
+    signed_cols: Iterable[str] = (),
+):
+    """Format price columns row-by-row on a pandas Styler.
+
+    Unlike `price_column_format` (one printf format per column), one penny
+    stock in the table doesn't put every row on 4 decimals. `reference` is
+    the per-row price that decides the decimals - a column name in `df`, a
+    Series aligned to `df`'s index (e.g. from a fuller table when the user
+    has hidden the column), or None to judge each value by itself. Leave
+    `format` off these columns' NumberColumn config so the Styler text is
+    shown; the underlying values stay numeric, so sorting still works.
+    """
+    if isinstance(reference, str):
+        refs = df[reference] if reference in df.columns else None
+    else:
+        refs = reference
+    if refs is not None:
+        refs = pd.to_numeric(refs.reindex(df.index), errors="coerce")
+        penny = (refs.abs() > 0) & (refs.abs() < SUB_RAND)
+        groups = (
+            (df.index[penny], SUB_RAND / 2),     # under R1 -> up to 4 decimals
+            (df.index[refs.notna() & ~penny], SUB_RAND * 2),  # R1+ -> 2 decimals
+            (df.index[refs.isna()], None),       # no reference -> by own value
+        )
+    else:
+        groups = ((df.index, None),)
+    for cols, signed in ((price_cols, False), (signed_cols, True)):
+        for col in cols:
+            if col not in df.columns:
+                continue
+            for rows, ref in groups:
+                if len(rows):
+                    styler = styler.format(
+                        lambda v, ref=ref, signed=signed: format_price_cell(v, ref, signed),
+                        subset=pd.IndexSlice[rows, [col]],
+                    )
+    return styler
+
+
 def price_column_format(*columns: Iterable[Optional[float]], signed: bool = False) -> str:
     """NumberColumn printf format for per-share price columns.
 
@@ -316,7 +380,6 @@ UPDATER_STALE_AGE = timedelta(hours=20)
 # Same on-disk counter the TwelveDataCollector shares across processes -
 # read it directly rather than instantiating a collector just to display it.
 _TWELVE_DATA_USAGE_FILE = Path(__file__).resolve().parents[2] / "data" / ".twelve_data_usage"
-_TWELVE_DATA_DAILY_LIMIT = 800
 
 
 def format_twelve_data_quota() -> Optional[str]:
@@ -327,7 +390,7 @@ def format_twelve_data_quota() -> Optional[str]:
         data = json.loads(_TWELVE_DATA_USAGE_FILE.read_text(encoding="utf-8"))
         if data.get("date") != str(datetime.now(timezone.utc).date()):
             return None
-        return f"Twelve Data today: {int(data.get('count', 0))}/{_TWELVE_DATA_DAILY_LIMIT}"
+        return f"Twelve Data today: {int(data.get('count', 0))}/{DEFAULT_REQUESTS_PER_DAY}"
     except (OSError, ValueError, TypeError):
         return None
 
@@ -428,30 +491,47 @@ def render_market_data_refresh_control(
 
     _, refresh_column = st.columns([3, 1])
     with refresh_column:
+        # st.rerun() discards messages rendered in the same run - the manual
+        # refresh result is carried across the rerun as a flash.
+        flash = st.session_state.pop(f"{key}_flash", None)
+        if flash:
+            getattr(st, flash[0])(flash[1])
         manual_refresh = st.button("🔄 Refresh Prices", key=key)
         if manual_refresh or needs_auto_refresh:
-            spinner_text = (
-                "Fetching latest market data..." if manual_refresh
-                else "Auto-refreshing market data..."
-            )
-            with st.spinner(spinner_text):
-                data_service = DataService(db)
-                updated_prices = data_service.update_stock_prices(symbol_list or [])
-                new_articles = data_service.collect_news() if include_news else 0
             if needs_auto_refresh:
                 st.session_state[auto_key] = True
-            if data_service.quota_message:
-                st.warning(
-                    f"{data_service.quota_message} "
-                    f"{format_market_data_age(latest_timestamp)}"
+            # Share the updater's cross-process lock: if the background
+            # updater is mid-fetch, don't double-spend quota racing it.
+            from app.services import process_lock
+            if not process_lock.JOB_LOCK.acquire(timeout=5):
+                st.info(
+                    "The background updater is fetching market data right now - "
+                    "prices will update when it finishes."
                 )
-            if manual_refresh:
-                status = f"Updated prices for {updated_prices} symbol{'s' if updated_prices != 1 else ''}."
-                if include_news:
-                    status += f" Collected {new_articles} new article{'s' if new_articles != 1 else ''}."
-                st.success(status)
-                st.rerun()
-            latest_timestamp = get_latest_market_data_timestamp(db, symbol_list)
+            else:
+                try:
+                    spinner_text = (
+                        "Fetching latest market data..." if manual_refresh
+                        else "Auto-refreshing market data..."
+                    )
+                    with st.spinner(spinner_text):
+                        data_service = DataService(db)
+                        updated_prices = data_service.update_stock_prices(symbol_list or [])
+                        new_articles = data_service.collect_news() if include_news else 0
+                finally:
+                    process_lock.JOB_LOCK.release()
+                if data_service.quota_message:
+                    st.warning(
+                        f"{data_service.quota_message} "
+                        f"{format_market_data_age(latest_timestamp)}"
+                    )
+                if manual_refresh:
+                    status = f"Updated prices for {updated_prices} symbol{'s' if updated_prices != 1 else ''}."
+                    if include_news:
+                        status += f" Collected {new_articles} new article{'s' if new_articles != 1 else ''}."
+                    st.session_state[f"{key}_flash"] = ("success", status)
+                    st.rerun()
+                latest_timestamp = get_latest_market_data_timestamp(db, symbol_list)
         quota = format_twelve_data_quota()
         age_caption = format_market_data_age(latest_timestamp)
         st.caption(f"{age_caption} | {quota}" if quota else age_caption)

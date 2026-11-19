@@ -109,7 +109,8 @@ class MoneywebCollector:
             # a failed login also returns a 302 (back to wp-login.php), so the
             # status code alone is not proof of authentication.
             if r.status_code in (302, 303):
-                if any(name.startswith("wordpress_logged_in") for name in s.cookies):
+                # RequestsCookieJar iterates Cookie objects - read .name.
+                if any(c.name.startswith("wordpress_logged_in") for c in s.cookies):
                     self._authenticated = True
                     return True
                 raise AuthError("Login failed: no auth cookie returned (check credentials)")
@@ -118,6 +119,8 @@ class MoneywebCollector:
             if "login_error" in text or "invalid" in text or "incorrect" in text:
                 raise AuthError("Login failed: invalid credentials")
             if 400 <= r.status_code < 500:
+                # 429 isn't a credential problem but retrying in ~3s only
+                # makes the rate limiter angrier - fail fast either way.
                 raise AuthError(f"Login rejected with HTTP {r.status_code}")
             if r.status_code >= 400:
                 raise Exception(f"Login failed with HTTP {r.status_code}")
@@ -196,6 +199,53 @@ class MoneywebCollector:
             return 0
         return len(watch_rows)
 
+    SENS_URL = "https://www.moneyweb.co.za/tools-and-data/moneyweb-sens/"
+
+    def get_sens_announcements(self) -> Optional[List[Dict[str, Any]]]:
+        """Latest SENS announcements from the public Moneyweb page (no login).
+
+        Returns [{published_at, symbol, name, headline, source_url}].
+        """
+        def _do_fetch():
+            s = self._get_session()
+            resp = s.get(self.SENS_URL, timeout=15)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            rows = []
+            for row in soup.select("div.sens-row"):
+                link_el = row.select_one('a[href*="mny_sens"]')
+                if not link_el:
+                    continue
+                time_el = row.select_one("time")
+                published = None
+                if time_el and time_el.get("datetime"):
+                    try:
+                        published = datetime.fromisoformat(time_el["datetime"])
+                    except ValueError:
+                        pass
+                ticker_el = row.select_one('a[href*="click-a-company"]')
+                strong = link_el.find("strong")
+                name = strong.get_text(strip=True) if strong else None
+                full_text = link_el.get_text(" ", strip=True)
+                # Headline follows "NAME – headline"; when there is no
+                # company prefix (ticker-less announcements) it is the title.
+                headline = full_text
+                if name and full_text.startswith(name):
+                    headline = full_text[len(name):].lstrip(" -–").strip()
+                if not headline:
+                    headline = full_text
+                    name = None
+                rows.append({
+                    "published_at": published,
+                    "symbol": ticker_el.get_text(strip=True) if ticker_el else None,
+                    "name": name,
+                    "headline": headline,
+                    "source_url": link_el.get("href"),
+                })
+            return rows
+
+        return self._call_with_retry("Moneyweb SENS", _do_fetch)
+
     @staticmethod
     def _parse_date(value: Optional[Any]) -> Optional[date]:
         """Parse a Moneyweb date string (yyyy/mm/dd) into a Python date."""
@@ -207,10 +257,14 @@ class MoneywebCollector:
             return None
 
     def get_winners_and_losers(self) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
-        """Return the daily top winners and losers from Moneyweb as (winners, losers)."""
-        if not self._login():
-            return None
+        """Return the daily top winners and losers from Moneyweb as (winners, losers).
 
+        The mover tables are the public AJAX feed behind Moneyweb's "Latest
+        winners and losers" page - no login. (It used to log in first, so a
+        wp-login.php rate limit - HTTP 429 - or a login bug blanked the Home
+        page's movers even though the feed itself was reachable. Checked
+        2026-11-19: the feed serves anonymous requests.)
+        """
         def _do_fetch():
             s = self._get_session()
             url = "https://cache.moneyweb.co.za/mny-mover-tables.php"

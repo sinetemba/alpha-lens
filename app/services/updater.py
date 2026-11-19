@@ -14,6 +14,7 @@ Schedule defaults (all Africa/Johannesburg):
                          machine catches up on wake - see services/backup.py)
 """
 
+import functools
 import os
 import sys
 import time
@@ -53,11 +54,14 @@ from app.models.updater_run import UpdaterRun
 from app.services.data_service import DataService
 from app.scrapers.news import NewsScraper
 from app.collectors.twelve_data import TwelveDataCollector
-from app.services import backup
+from app.services import backup, process_lock
 from app.services.portfolio_valuation import record_snapshot, revalue_portfolio, valued_holdings
 from app.services.luno_sync import sync_luno_holdings
 from app.services.net_worth import compute_net_worth
 from app.collectors.luno import LunoCollector
+from app.collectors.easyequities import EasyEquitiesCollector
+from app.collectors.moneyweb import MoneywebCollector
+from app.services.easyequities_sync import sync_portfolio_from_easyequities
 
 
 def _run_notification_checks(db: Session) -> None:
@@ -72,18 +76,45 @@ def _run_notification_checks(db: Session) -> None:
         notifier = NotificationService(db)
         notifier.check_price_alerts()
         notifier.check_technical_alerts()
+        notifier.check_news_alerts()
         notifier.send_pending_notifications()
     except Exception as e:
         logger.error(f"Notification checks failed: {e}")
 
 
+def _sync_easyequities_if_due(db: Session) -> None:
+    """Refresh holdings from EasyEquities when the last sync is stale.
+
+    The Portfolio page also syncs on load, so this only matters on days the
+    dashboard is never opened - without it, units/cost-basis/reconciliation
+    (sold positions) silently lag for days. Gated to about once a day to
+    stay well clear of EasyEquities rate limiting.
+    """
+    ee = EasyEquitiesCollector()
+    if not ee.enabled:
+        return
+    portfolio = db.query(Portfolio).first()
+    if not portfolio:
+        return
+    last = portfolio.last_easyequities_sync
+    if last is not None and utcnow_naive() - last < EE_SYNC_MIN_AGE:
+        return
+    synced, _raw = sync_portfolio_from_easyequities(db, portfolio.id, ee)
+    if synced is None:
+        logger.warning(f"EasyEquities sync failed: {ee.last_error}")
+        return
+    portfolio.last_easyequities_sync = utcnow_naive()
+    db.commit()
+    logger.info(f"EasyEquities sync: {synced} holding(s)")
+
+
 def _snapshot_portfolio(db: Session) -> None:
-    """Sync Luno, revalue everything and record today's net-worth snapshot.
+    """Sync brokers, revalue everything and record today's net-worth snapshot.
 
     Keeps the Portfolio page's value-history chart (JSE + crypto + bullion)
-    filling in on days the dashboard is never opened, and keeps crypto
-    balances current without a Crypto page visit. Each step is
-    best-effort: failures must never fail the update run.
+    filling in on days the dashboard is never opened, and keeps crypto/EE
+    balances current without a page visit. Each step is best-effort:
+    failures must never fail the update run.
     """
     luno = LunoCollector()
     if luno.enabled:
@@ -93,6 +124,12 @@ def _snapshot_portfolio(db: Session) -> None:
         except Exception as e:
             db.rollback()
             logger.error(f"Luno sync failed: {e}")
+
+    try:
+        _sync_easyequities_if_due(db)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"EasyEquities sync failed: {e}")
 
     try:
         value = revalue_portfolio(db)
@@ -122,8 +159,45 @@ def _snapshot_portfolio(db: Session) -> None:
 # works for both SQLite and PostgreSQL.
 LAST_LOGON_FILE = ROOT / "data" / ".updater_last_logon"
 
+# Only one process may run a fetch/write job at a time (a manual
+# `run_updater.py` next to the daemon, or the dashboard's refresh button,
+# would otherwise double-fetch and double-write). The lock is taken per job
+# - see app/services/process_lock.py - so the always-on daemon never locks
+# out the logon/unlock refresh or a manual --full for the whole session.
+
+# How long a job waits for another process's job to finish, per mode.
+# Daemon jobs wait out a manual run; manual one-shots wait out a daemon job
+# (a full run takes several minutes). Logon refreshes never wait - if
+# another process is fetching right now, the data is being refreshed anyway.
+PROCESS_LOCK_TIMEOUT_DAEMON = 10 * 60
+PROCESS_LOCK_TIMEOUT_ONE_SHOT = 30 * 60
+
+
+def _with_process_lock(job_name: str):
+    """Decorator: run an UpdaterService job under the cross-process lock."""
+    def decorate(method):
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            lock = process_lock.JOB_LOCK
+            if not lock.acquire(timeout=self.process_lock_timeout):
+                logger.warning(
+                    f"{job_name} skipped: another AlphaLens process is running "
+                    f"a fetch job (waited {self.process_lock_timeout:.0f}s)"
+                )
+                return False
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                lock.release()
+        return wrapper
+    return decorate
+
 # Shared with the dashboard so the headless updater and UI never drift apart.
 EXCLUDED_ACCOUNT_TYPES = PORTFOLIO_EXCLUDED_ACCOUNT_TYPES
+
+# The daemon refreshes EasyEquities holdings at most this often (the
+# Portfolio page syncs more eagerly on visits).
+EE_SYNC_MIN_AGE = timedelta(hours=20)
 
 
 def _get_tracked_symbols(db: Session) -> list:
@@ -288,6 +362,7 @@ class UpdaterService:
         self._last_catch_up_attempt: Optional[datetime] = None
         self._last_historical_attempt: Optional[datetime] = None
         self._last_backup_attempt: Optional[datetime] = None
+        self.process_lock_timeout: float = PROCESS_LOCK_TIMEOUT_DAEMON
 
     def _on_job_error(self, event):
         logger.error(f"Scheduler job {event.job_id} failed: {event.exception}")
@@ -329,11 +404,17 @@ class UpdaterService:
             # `timestamp` is naive exchange-local midnight, not a UTC instant
             # like fetched_at - convert before comparing so a recent bar can't
             # look up to a UTC-offset's worth "newer" than it really is.
-            latest_bar = (
-                latest_bar.replace(tzinfo=ZoneInfo(settings.scheduler_timezone))
-                .astimezone(timezone.utc)
-                .replace(tzinfo=None)
-            )
+            try:
+                latest_bar = (
+                    latest_bar.replace(tzinfo=ZoneInfo(settings.scheduler_timezone))
+                    .astimezone(timezone.utc)
+                    .replace(tzinfo=None)
+                )
+            except Exception as e:
+                # SCHEDULER_TIMEZONE is user-configurable - a bad value raises
+                # ZoneInfoNotFoundError; skip this check rather than crash.
+                logger.warning(f"Catch-up bar-time conversion failed: {e}")
+                return
         latest = max(
             (t for t in (latest_fetched, latest_bar) if t is not None), default=None
         )
@@ -350,6 +431,7 @@ class UpdaterService:
         if not self._update_prices_and_news():
             logger.warning("Catch-up update did not complete successfully")
 
+    @_with_process_lock("Price + news update")
     def _update_prices_and_news(self) -> bool:
         """3x-daily job: update tracked stock prices and collect news.
 
@@ -413,6 +495,7 @@ class UpdaterService:
                 db.close()
                 self._job_lock.release()
 
+    @_with_process_lock("Historical update")
     def _update_historical(self) -> bool:
         """Daily job: update historical data and dividends for tracked symbols."""
         if not self._historical_lock.acquire(blocking=False):
@@ -437,6 +520,19 @@ class UpdaterService:
                     _maybe_deactivate_dead_symbol(db, symbol)
 
             data_service.update_dividends(symbols)
+
+            # The Moneyweb Dividend Watch calendar was previously only
+            # refreshed by a manual button on the Dividends page - refresh it
+            # daily so it never silently goes stale.
+            try:
+                moneyweb = MoneywebCollector()
+                if moneyweb.enabled:
+                    watch_rows = moneyweb.save_dividend_watch(db)
+                    logger.info(f"Moneyweb dividend watch refreshed: {watch_rows} rows")
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"Dividend watch refresh failed: {e}")
+
             logger.info(f"Daily historical update completed for {len(symbols)} symbols")
             if symbols and failed == len(symbols):
                 detail = f"historical failed for all {failed} symbols"
@@ -496,6 +592,7 @@ class UpdaterService:
         if not self._update_historical():
             logger.warning("Historical catch-up did not complete successfully")
 
+    @_with_process_lock("Weekly cleanup")
     def _weekly_cleanup(self) -> bool:
         """Weekly job: delete old news articles and old notifications."""
         logger.info("Running weekly cleanup")
@@ -521,10 +618,35 @@ class UpdaterService:
         except Exception as e:
             detail = str(e)[:200]
             logger.error(f"Weekly cleanup failed: {e}")
+            db.rollback()
             return False
         finally:
             try:
                 _record_run(db, "weekly_cleanup", ok, detail)
+            finally:
+                db.close()
+
+    @_with_process_lock("SENS IPO scan")
+    def _update_ipo_listings(self) -> bool:
+        """Daily job: scan Moneyweb SENS for IPO announcements (public page)."""
+        logger.info("Running SENS IPO scan")
+        db = SessionLocal()
+        ok = False
+        detail = None
+        try:
+            from app.services.ipo import update_ipo_listings
+            added = update_ipo_listings(db)
+            detail = f"{added} new" if added else None
+            ok = True
+            return True
+        except Exception as e:
+            detail = str(e)[:200]
+            logger.error(f"SENS IPO scan failed: {e}")
+            db.rollback()
+            return False
+        finally:
+            try:
+                _record_run(db, "ipo_listings", ok, detail)
             finally:
                 db.close()
 
@@ -587,6 +709,15 @@ class UpdaterService:
             coalesce=True,
         )
         self.scheduler.add_job(
+            self._update_ipo_listings,
+            trigger=CronTrigger(hour=8, minute=0),
+            id="ipo_listings",
+            name="Daily SENS IPO Scan",
+            replace_existing=True,
+            misfire_grace_time=86400,
+            coalesce=True,
+        )
+        self.scheduler.add_job(
             self._weekly_cleanup,
             trigger=CronTrigger(day_of_week="sun", hour=2, minute=0),
             id="weekly_cleanup",
@@ -639,9 +770,15 @@ class UpdaterService:
                     break
                 elif stop_event is None:
                     time.sleep(60)
-                self._catch_up_if_stale()
-                self._historical_catch_up_if_due()
-                self._backup_if_due()
+                # A single failed check must never kill the daemon - each
+                # helper is internally guarded, but not airtight (e.g. a bad
+                # SCHEDULER_TIMEZONE used to escape _catch_up_if_stale).
+                try:
+                    self._catch_up_if_stale()
+                    self._historical_catch_up_if_due()
+                    self._backup_if_due()
+                except Exception:
+                    logger.exception("Minute-loop check failed - continuing")
         except KeyboardInterrupt:
             logger.info("Shutting down updater service (keyboard interrupt)")
         finally:
@@ -656,17 +793,33 @@ class UpdaterService:
           - full: run the 3x-daily job plus historical data and dividends, then exit.
           - logon: run the 3x-daily job only if it has not run recently, then exit.
           - backup: back up the database now and exit.
+          - ipo: run the SENS IPO scan once and exit.
 
         One-shot modes exit non-zero on failure so Task Scheduler surfaces the
         run as failed instead of silently succeeding.
         """
         self.setup()
 
+        # Jobs take the cross-process lock themselves (per job, not per
+        # process). One-shots wait out a running daemon job; a one-shot that
+        # still can't get the lock reports failure (exit 1) rather than
+        # silently "succeeding" with nothing done.
+        if mode != "daemon":
+            self.process_lock_timeout = PROCESS_LOCK_TIMEOUT_ONE_SHOT
+
         if mode == "logon":
             if _should_run_logon_update(min_seconds=settings.updater_logon_min_interval or 600):
-                logger.info("Running logon-triggered update")
-                ok = self._update_prices_and_news()
-                _record_logon_update()
+                # Another process fetching right now (the daemon's catch-up,
+                # a dashboard refresh) is refreshing the same data - skip.
+                if not process_lock.JOB_LOCK.acquire(timeout=0):
+                    logger.info("Skipping logon update: another process is fetching right now")
+                    return
+                try:
+                    logger.info("Running logon-triggered update")
+                    ok = self._update_prices_and_news()
+                    _record_logon_update()
+                finally:
+                    process_lock.JOB_LOCK.release()
                 sys.exit(0 if ok else 1)
             else:
                 logger.info("Skipping logon update: ran too recently")
@@ -679,6 +832,9 @@ class UpdaterService:
 
         if mode == "backup":
             sys.exit(0 if self._run_backup() else 1)
+
+        if mode == "ipo":
+            sys.exit(0 if self._update_ipo_listings() else 1)
 
         if mode == "full":
             logger.info("Running full update")
@@ -703,6 +859,7 @@ def main():
     group.add_argument("--full", action="store_true", help="Run the full update (prices, news, history, dividends) and exit")
     group.add_argument("--logon", action="store_true", help="Run a lightweight logon update and exit")
     group.add_argument("--backup", action="store_true", help="Back up the database now and exit")
+    group.add_argument("--ipo", action="store_true", help="Scan Moneyweb SENS for IPO announcements and exit")
     args = parser.parse_args()
 
     mode = "daemon"
@@ -714,6 +871,8 @@ def main():
         mode = "logon"
     elif args.backup:
         mode = "backup"
+    elif args.ipo:
+        mode = "ipo"
 
     service = UpdaterService()
     service.start(mode=mode)

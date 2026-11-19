@@ -94,8 +94,10 @@ Edit `.env` and configure the following:
 - `DATABASE_URL`: SQLite database path (default: `sqlite:///./data/stock_analyzer.db`)
 
 **Optional:**
-- `FMP_API_KEY`: Financial Modeling Prep API key for financial statements
-- `EXCHANGE_RATE_API_KEY`: Exchange Rate API key for currency conversion
+- `EASYEQUITIES_USERNAME`/`EASYEQUITIES_PASSWORD`: live portfolio sync
+- `MONEYWEB_USERNAME`/`MONEYWEB_PASSWORD`: top movers + Dividend Watch
+- `LUNO_API_KEY_ID`/`LUNO_API_SECRET`: crypto holdings (read-only key)
+- `GOLD_API_KEY`, `METALS_DEV_API_KEY`, `ALPHA_VANTAGE_API_KEY`: bullion/commodity prices
 - `NOTIFICATION_ENABLED`: Set to `true` to enable notifications
 - Notification channel settings (email, ntfy, Discord, Telegram)
 

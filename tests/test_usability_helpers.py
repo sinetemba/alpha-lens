@@ -159,3 +159,57 @@ def test_send_test_when_disabled(monkeypatch, db_session):
     monkeypatch.setattr(settings, "notification_enabled", False)
     ok, message = NotificationService(db_session).send_test()
     assert ok is False and "disabled" in message
+
+
+# --- per-row price formatting (watchlist) ----------------------------------
+
+import pandas as pd  # noqa: E402
+from app.dashboard.utils import format_price_cell, style_price_columns  # noqa: E402
+
+
+@pytest.mark.parametrize("value,reference,signed,expected", [
+    (210.38, 210.38, False, "R 210.38"),
+    (-1.460000000000008, 210.38, True, "R -1.46"),
+    (0.11000000000000032, 5.61, True, "R +0.11"),
+    (0.008500000238, None, False, "R 0.0085"),
+    (0.62, 0.62, False, "R 0.62"),
+    (1.2, 0.62, False, "R 1.20"),
+    (0.0, 0.0085, True, "R +0.00"),
+    (1234.5, None, False, "R 1,234.50"),
+    (None, 5.0, False, ""),
+])
+def test_format_price_cell(value, reference, signed, expected):
+    assert format_price_cell(value, reference, signed) == expected
+
+
+def test_one_penny_stock_does_not_widen_other_rows():
+    df = pd.DataFrame({"Current Price": [210.38, 0.0085], "Change": [-1.46, 0.0]})
+    text = style_price_columns(
+        df.style, df, "Current Price",
+        price_cols=("Current Price",), signed_cols=("Change",),
+    ).to_string()
+    assert "R 210.38" in text and "R 210.3800" not in text
+    assert "R -1.46" in text and "R 0.0085" in text
+
+
+def test_style_price_columns_reference_series_from_hidden_column():
+    """Portfolio: the user hid Current Price, decimals still follow it."""
+    full = pd.DataFrame({"Purchase Price": [1.2, 150.0], "Current Price": [0.62, 210.38]})
+    visible = full[["Purchase Price"]]
+    text = style_price_columns(
+        visible.style, visible, full["Current Price"], price_cols=("Purchase Price",),
+    ).to_string()
+    assert "R 1.20" in text and "R 150.00" in text
+
+
+def test_style_price_columns_without_reference_judges_each_value():
+    """Dividends: R 0.0525 keeps 4 decimals, R 6.10 gets 2 - no R 6.1000."""
+    df = pd.DataFrame({"Amount": [0.0525, 6.1, None]})
+    text = style_price_columns(df.style, df, price_cols=("Amount",)).to_string()
+    assert "R 0.0525" in text and "R 6.10" in text and "6.1000" not in text
+
+
+def test_style_price_columns_missing_reference_column_is_safe():
+    df = pd.DataFrame({"Price": [0.5]})
+    text = style_price_columns(df.style, df, "Nope", price_cols=("Price", "Absent")).to_string()
+    assert "R 0.50" in text

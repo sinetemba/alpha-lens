@@ -1,3 +1,4 @@
+import pandas as pd
 import streamlit as st
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
@@ -5,7 +6,7 @@ from typing import Optional
 
 from app.collectors.coingecko import CoinGeckoCollector
 from app.collectors.luno import LunoCollector
-from app.dashboard.utils import _to_display_tz, holding_totals, price_column_format, render_holding_totals
+from app.dashboard.utils import _to_display_tz, holding_totals, render_holding_totals, style_price_columns
 from app.models.base import utcnow_naive
 from app.models.crypto import CryptoBundle, CryptoHolding
 from app.services.luno_sync import LUNO_SOURCE, last_luno_sync, sync_luno_holdings
@@ -238,17 +239,19 @@ def _render_holdings(db: Session, holdings: list, markets: dict, luno_prices: di
 
 def _render_direct_table(rows: list) -> None:
     """Coins held directly - Luno wallets and manual records, one row each."""
-    price_fmt = price_column_format(
-        [r["Price (ZAR)"] for r in rows], [r["Paid per coin"] for r in rows]
+    # Numeric cells (not "R x" strings) so column sorting works; per-row
+    # decimals so a sub-R1 coin doesn't put BTC on 4 decimals.
+    table = pd.DataFrame(rows)
+    styled = style_price_columns(
+        table.style, table, "Price (ZAR)", price_cols=("Price (ZAR)", "Paid per coin"),
     )
-    # Numeric cells (not "R x" strings) so column sorting works.
     st.dataframe(
-        rows, use_container_width=True, hide_index=True,
+        styled, use_container_width=True, hide_index=True,
         column_config={
             "Qty": st.column_config.NumberColumn(format="%g"),
-            "Price (ZAR)": st.column_config.NumberColumn(format=price_fmt),
+            "Price (ZAR)": st.column_config.NumberColumn(),
             "24h %": st.column_config.NumberColumn(format="%+.1f%%"),
-            "Paid per coin": st.column_config.NumberColumn(format=price_fmt),
+            "Paid per coin": st.column_config.NumberColumn(),
             "Current value": st.column_config.NumberColumn(format="R %.2f"),
             "Gain/Loss": st.column_config.NumberColumn(format="R %+.2f"),
             "Gain %": st.column_config.NumberColumn(format="%+.1f%%"),
@@ -297,15 +300,17 @@ def _render_bundle(
         key=lambda r: r["Value"] or 0,
         reverse=True,
     )
+    breakdown_table = pd.DataFrame(breakdown)
     st.dataframe(
-        breakdown, use_container_width=True, hide_index=True,
+        style_price_columns(
+            breakdown_table.style, breakdown_table, "Price (ZAR)", price_cols=("Price (ZAR)",),
+        ),
+        use_container_width=True, hide_index=True,
         column_config={
             "Weight %": st.column_config.NumberColumn(format="%.2f%%"),
             "Value": st.column_config.NumberColumn(format="R %.2f"),
             "Qty": st.column_config.NumberColumn(format="%g"),
-            "Price (ZAR)": st.column_config.NumberColumn(
-                format=price_column_format([r["Price (ZAR)"] for r in breakdown])
-            ),
+            "Price (ZAR)": st.column_config.NumberColumn(),
         },
     )
 

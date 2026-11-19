@@ -191,7 +191,11 @@ class CompanyNewsService:
                 })
             return articles
         except Exception as e:
-            logger.error(f"Error fetching NewsData.io news: {e}")
+            # Never log `str(e)` - requests exceptions embed the request URL,
+            # which carries the API key in the query string.
+            resp = getattr(e, "response", None)
+            detail = f"HTTP {resp.status_code}" if resp is not None else e.__class__.__name__
+            logger.error(f"Error fetching NewsData.io news: {detail}")
             return []
 
     def _to_utc(self, dt: Optional[datetime]) -> datetime:

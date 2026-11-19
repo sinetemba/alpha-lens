@@ -3,7 +3,7 @@
 # Python Version: 3.13+
 
 # UI Framework
-streamlit==1.38.0
+streamlit==1.66.1
 
 # Charts and Visualization
 plotly==5.24.1
@@ -36,9 +36,6 @@ easy-equities-client==1.2.0
 
 # Notifications
 apprise==1.9.0
-
-# Caching
-diskcache==5.6.3
 
 # Environment Variables
 python-dotenv==1.0.1

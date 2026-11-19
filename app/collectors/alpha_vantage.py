@@ -50,7 +50,11 @@ class AlphaVantageCollector:
             response.raise_for_status()
             data = response.json()
         except (requests.exceptions.RequestException, ValueError) as e:
-            logger.error(f"Error fetching Alpha Vantage history for {commodity}: {e}")
+            # Never log `str(e)` - requests exceptions embed the request URL,
+            # which carries the API key in the query string.
+            resp = getattr(e, "response", None)
+            detail = f"HTTP {resp.status_code}" if resp is not None else e.__class__.__name__
+            logger.error(f"Error fetching Alpha Vantage history for {commodity}: {detail}")
             return None
 
         if "Information" in data or "Note" in data or "Error Message" in data:

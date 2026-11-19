@@ -33,7 +33,11 @@ class MetalsDevCollector:
             response.raise_for_status()
             data = response.json()
         except (requests.exceptions.RequestException, ValueError) as e:
-            logger.error(f"Error fetching latest Metals.dev prices: {e}")
+            # Never log `str(e)` - requests exceptions embed the request URL,
+            # which carries the API key in the query string.
+            resp = getattr(e, "response", None)
+            detail = f"HTTP {resp.status_code}" if resp is not None else e.__class__.__name__
+            logger.error(f"Error fetching latest Metals.dev prices: {detail}")
             return None
 
         if data.get("status") != "success" or not isinstance(data.get("metals"), dict):

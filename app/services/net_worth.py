@@ -114,6 +114,49 @@ def _stored_metal_spots_zar(db: Session, max_age_hours: int = 48) -> dict:
     return spots
 
 
+def _persist_yahoo_metal_spots(db: Session, spots: dict) -> None:
+    """Flush-only upsert of Yahoo-sourced metal spots as day-midnight bars.
+
+    The daemon's net-worth snapshot is the only writer on days nobody opens
+    the Krugerrands page - persisting its Yahoo GC=F/SI=F x ZAR=X spots keeps
+    the XAU_*/XAG_* bar series (and its freshness) alive. No commit: the
+    caller's next commit (e.g. record_snapshot) persists the bars, and a
+    read-only caller just lets them roll back.
+    """
+    from app.models.stock import Stock
+    from sqlalchemy.exc import IntegrityError
+
+    now = utcnow_naive()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    for metal, symbol in (("XAU", "XAU_ZAR"), ("XAG", "XAG_ZAR")):
+        price = spots.get(metal)
+        if not price:
+            continue
+        stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+        if not stock:
+            name = "Gold" if metal == "XAU" else "Silver"
+            stock = Stock(symbol=symbol, name=f"{name} Spot ZAR (Live)")
+            db.add(stock)
+            db.flush()
+        bar = db.query(StockPrice).filter(
+            StockPrice.symbol == symbol,
+            StockPrice.timestamp == today,
+        ).first()
+        if bar:
+            bar.close_price = price
+            bar.fetched_at = now
+        else:
+            db.add(StockPrice(
+                stock_id=stock.id, symbol=symbol, timestamp=today,
+                close_price=price, fetched_at=now,
+            ))
+    try:
+        db.flush()
+    except IntegrityError:
+        # A concurrent writer (Krugerrands page) wrote today's bar first.
+        db.rollback()
+
+
 def compute_net_worth(db: Session, jse_value: Optional[float] = None) -> NetWorth:
     """Value every asset class now. `jse_value` defaults to the stored portfolio value.
 
@@ -136,8 +179,10 @@ def compute_net_worth(db: Session, jse_value: Optional[float] = None) -> NetWort
         spots = _stored_metal_spots_zar(db) if bullion else {}
         if bullion and set(spots) < {"XAU", "XAG"}:
             # Yahoo fills whichever metals lack a fresh stored GoldAPI spot.
-            for metal, price in (YFinanceCollector().get_metal_spots_zar() or {}).items():
+            fetched = YFinanceCollector().get_metal_spots_zar() or {}
+            for metal, price in fetched.items():
                 spots.setdefault(metal, price)
+            _persist_yahoo_metal_spots(db, fetched)
         bullion_total = bullion_value(bullion, spots or None)
     except Exception as e:
         logger.warning(f"Bullion valuation failed: {e}")

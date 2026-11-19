@@ -312,6 +312,30 @@ def _cleanup_excluded_holdings():
         db.close()
 
 
+_OPENING_BUYS_KEY = "backfill_opening_buys_v1"
+
+
+def _backfill_opening_buys():
+    """One-time: log an opening buy for holdings that predate the transaction
+    log, so later sells have a matching buy. Additive only (inserts rows)."""
+    from app.services.transactions import backfill_opening_buys
+
+    db = SessionLocal()
+    try:
+        if db.get(SchemaMeta, _OPENING_BUYS_KEY) is not None:
+            return
+        added = backfill_opening_buys(db)
+        db.add(SchemaMeta(key=_OPENING_BUYS_KEY))
+        db.commit()
+        if added:
+            print(f"Migration: logged opening buys for {added} pre-existing holding(s).")
+    except Exception as e:
+        db.rollback()
+        print(f"Error backfilling opening buys: {e}")
+    finally:
+        db.close()
+
+
 def init_database():
     """Initialize the database with tables and seed data."""
     print("Initializing database...")
@@ -320,6 +344,7 @@ def init_database():
     _normalize_bar_timestamps()
     _cleanup_excluded_holdings()
     _backfill_stock_names()
+    _backfill_opening_buys()
     
     # Add seed data if needed
     # For example, add default JSE stocks

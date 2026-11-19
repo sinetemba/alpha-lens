@@ -38,27 +38,17 @@ class Settings(BaseSettings):
     luno_api_key_id: str = Field(default="", alias="LUNO_API_KEY_ID")
     luno_api_secret: str = Field(default="", alias="LUNO_API_SECRET")
 
-    # Financial Modeling Prep API
-    fmp_api_key: str = Field(default="", alias="FMP_API_KEY")
-    fmp_base_url: str = Field(default="https://financialmodelingprep.com/api/v3", alias="FMP_BASE_URL")
-
     # GoldAPI.io
     gold_api_key: str = Field(default="", alias="GOLD_API_KEY")
     gold_api_base_url: str = Field(default="https://www.goldapi.io", alias="GOLD_API_BASE_URL")
 
-    # CommodityPriceAPI
-    commodity_price_api_key: str = Field(default="", alias="COMMODITY_PRICE_API_KEY")
-    commodity_price_api_base_url: str = Field(default="https://api.commoditypriceapi.com/v2", alias="COMMODITY_PRICE_API_BASE_URL")
+    # Metals.dev (live commodity spot) + Alpha Vantage (commodity history)
     metals_dev_api_key: str = Field(default="", alias="METALS_DEV_API_KEY")
     metals_dev_base_url: str = Field(default="https://api.metals.dev/v1/latest", alias="METALS_DEV_BASE_URL")
     metals_dev_currency: str = Field(default="ZAR", alias="METALS_DEV_CURRENCY")
     metals_dev_unit: str = Field(default="g", alias="METALS_DEV_UNIT")
     alpha_vantage_api_key: str = Field(default="", alias="ALPHA_VANTAGE_API_KEY")
     alpha_vantage_base_url: str = Field(default="https://www.alphavantage.co/query", alias="ALPHA_VANTAGE_BASE_URL")
-
-    # Exchange Rate API
-    exchange_rate_api_key: str = Field(default="", alias="EXCHANGE_RATE_API_KEY")
-    exchange_rate_base_url: str = Field(default="https://v6.exchangerate-api.com/v6", alias="EXCHANGE_RATE_BASE_URL")
 
     # Company News (optional)
     newsdata_api_key: str = Field(default="", alias="NEWSDATA_API_KEY")
@@ -84,8 +74,6 @@ class Settings(BaseSettings):
     rss_iol_business: str = Field(default="https://iol.co.za/rss/iol/business", alias="RSS_IOL_BUSINESS")
 
     # Caching Configuration
-    cache_type: str = Field(default="diskcache", alias="CACHE_TYPE")
-    cache_dir: str = Field(default="./data/cache", alias="CACHE_DIR")
     cache_ttl_seconds: int = Field(default=3600, alias="CACHE_TTL_SECONDS")
 
     # Notification Configuration
@@ -108,7 +96,6 @@ class Settings(BaseSettings):
     log_file: str = Field(default="./data/logs/app.log", alias="LOG_FILE")
 
     # JSE Configuration
-    jse_index_symbol: str = Field(default="J203", alias="JSE_INDEX_SYMBOL")
     jse_index_yf_symbol: str = Field(default="^J203.JO", alias="JSE_INDEX_YF_SYMBOL")
     default_watchlist: str = Field(default="NPN,CFR,AGL,SOL,SBK", alias="DEFAULT_WATCHLIST")
 

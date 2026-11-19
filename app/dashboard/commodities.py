@@ -10,8 +10,8 @@ from app.collectors.metals_dev import MetalsDevCollector
 from loguru import logger
 
 
-# Commodity symbols tracked by CommodityPriceAPI and their Yahoo Finance
-# fallback symbols used for historical chart data.
+# Commodity symbols tracked on this page and the pseudo-symbols their
+# Alpha Vantage history bars are stored under.
 COMMODITY_SYMBOLS = {
     "gold": ("Gold", "AV_GOLD"),
     "silver": ("Silver", "AV_SILVER"),

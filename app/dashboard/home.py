@@ -1,3 +1,4 @@
+import pandas as pd
 import streamlit as st
 from datetime import datetime, timezone
 from typing import Optional
@@ -13,7 +14,7 @@ from app.config.settings import settings
 from app.collectors.moneyweb import MoneywebCollector
 from app.dashboard.utils import (
     format_stock_label,
-    price_column_format,
+    style_price_columns,
     PriceSnapshot,
     get_latest_news_timestamp,
     render_market_data_refresh_control,
@@ -36,6 +37,7 @@ PAGE_DATA_SOURCES = {
     "Watchlist": _MARKET_DATA,
     "Portfolio": f"EasyEquities, {_MARKET_DATA}",
     "Dividends": "Yahoo Finance, Moneyweb",
+    "IPOs": "Moneyweb SENS",
     "Notifications": "Updater alerts",
     "Company View": _MARKET_DATA,
     "Penny Stocks": "Yahoo Finance, RSS feeds",
@@ -69,6 +71,7 @@ _PAGES = [
     ("Watchlist", "📋", "watchlist", _lazy("watchlist", "show_watchlist")),
     ("Portfolio", "💼", "portfolio", _lazy("portfolio", "show_portfolio")),
     ("Dividends", "💰", "dividends", _lazy("dividends", "show_dividends")),
+    ("IPOs", "🚀", "ipos", _lazy("upcoming_ipos", "show_upcoming_ipos")),
     ("Notifications", "🔔", "notifications", _lazy("notifications", "show_notifications")),
     ("Company View", "🏢", "company", _lazy("company", "show_company")),
     ("Penny Stocks", "🪙", "penny-stocks", _lazy("penny_stocks", "show_penny_stocks")),
@@ -398,8 +401,8 @@ def _render_top_movers(db: Session):
 
     if movers is None:
         st.warning(
-            "Couldn't fetch today's movers from Moneyweb. Check Moneyweb "
-            "credentials/connectivity or try again later."
+            "Couldn't fetch today's movers from Moneyweb (public feed - no "
+            "login needed). Check connectivity or try again later."
         )
         return
 
@@ -408,18 +411,26 @@ def _render_top_movers(db: Session):
     col_winners, col_losers = st.columns(2)
 
     column_config = {
-        "Price": st.column_config.NumberColumn(
-            "Price", format=price_column_format([m["Price"] for m in winners + losers])
-        ),
-        "Move": st.column_config.NumberColumn("Move", format="%.2f"),
+        "Price": st.column_config.NumberColumn("Price"),
+        "Move": st.column_config.NumberColumn("Move"),
         "Change": st.column_config.NumberColumn("Change", format="%.2f%%"),
     }
+
+    def _movers_table(movers: list):
+        # Per-row decimals: one R0.12 share must not put R210 shares on 4.
+        df = pd.DataFrame(
+            [{"Symbol": m["Symbol"], "Price": m["Price"], "Move": m["Move"], "Change": m["Change"]}
+             for m in movers]
+        )
+        return style_price_columns(
+            df.style, df, "Price", price_cols=("Price",), signed_cols=("Move",),
+        )
 
     with col_winners:
         st.markdown("**🟢 Top 10 Winners**")
         if winners:
             st.dataframe(
-                [{"Symbol": m["Symbol"], "Price": m["Price"], "Move": m["Move"], "Change": m["Change"]} for m in winners],
+                _movers_table(winners),
                 use_container_width=True,
                 hide_index=True,
                 column_config=column_config,
@@ -431,7 +442,7 @@ def _render_top_movers(db: Session):
         st.markdown("**🔴 Top 10 Losers**")
         if losers:
             st.dataframe(
-                [{"Symbol": m["Symbol"], "Price": m["Price"], "Move": m["Move"], "Change": m["Change"]} for m in losers],
+                _movers_table(losers),
                 use_container_width=True,
                 hide_index=True,
                 column_config=column_config,

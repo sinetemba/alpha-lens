@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.models.notification import Notification
+from app.models.news import NewsArticle
 from app.models.stock import Stock, StockPrice
 from app.models.watchlist import WatchlistItem
 from app.notifications.notification_service import NotificationService
@@ -124,6 +125,63 @@ def test_rsi_overbought_alert(db_session, monkeypatch):
     assert note is not None
     assert "RSI Overbought" in note.title
     assert note.type == "technical"
+
+
+def _seed_article(db_session, symbol="NPN", title="Naspers posts strong results"):
+    article = NewsArticle(
+        title=title,
+        summary="Naspers beat expectations.",
+        url=f"https://example.com/{title.replace(' ', '-')}",
+        source="Moneyweb",
+        published_at=datetime(2024, 1, 15, 9, 0, 0),
+        stock_symbol=symbol,
+    )
+    db_session.add(article)
+    db_session.commit()
+    return article
+
+
+def test_news_alert_fires_for_watchlisted_symbol(db_session, monkeypatch):
+    _seed_stock_and_watchlist(db_session, notify_news=True)
+    _seed_article(db_session)
+
+    service = _service(db_session, monkeypatch)
+    service.check_news_alerts()
+
+    note = db_session.query(Notification).filter_by(type="news").one()
+    assert note.stock_symbol == "NPN"
+    assert "strong results" in note.title
+
+
+def test_news_alert_respects_notify_news_flag(db_session, monkeypatch):
+    _seed_stock_and_watchlist(db_session, notify_news=False)
+    _seed_article(db_session)
+
+    service = _service(db_session, monkeypatch)
+    service.check_news_alerts()
+
+    assert db_session.query(Notification).filter_by(type="news").count() == 0
+
+
+def test_news_alert_ignores_non_watchlisted_symbol(db_session, monkeypatch):
+    _seed_stock_and_watchlist(db_session, notify_news=True)
+    _seed_article(db_session, symbol="SOL", title="Sasol rallies")
+
+    service = _service(db_session, monkeypatch)
+    service.check_news_alerts()
+
+    assert db_session.query(Notification).filter_by(type="news").count() == 0
+
+
+def test_news_alert_dedupes_repeat_checks(db_session, monkeypatch):
+    _seed_stock_and_watchlist(db_session, notify_news=True)
+    _seed_article(db_session)
+
+    service = _service(db_session, monkeypatch)
+    service.check_news_alerts()
+    service.check_news_alerts()
+
+    assert db_session.query(Notification).filter_by(type="news").count() == 1
 
 
 def test_macd_bullish_crossover_alert(db_session, monkeypatch):

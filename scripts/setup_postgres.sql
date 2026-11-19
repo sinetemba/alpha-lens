@@ -5,7 +5,8 @@
 --
 -- This creates an 'alphalens' user and database with the correct privileges.
 
-CREATE USER alphalens WITH PASSWORD 'changeme';
+-- REPLACE the password before running - then set the same one in DATABASE_URL.
+CREATE USER alphalens WITH PASSWORD 'REPLACE_WITH_STRONG_PASSWORD';
 CREATE DATABASE alphalens OWNER alphalens;
 GRANT ALL PRIVILEGES ON DATABASE alphalens TO alphalens;
 

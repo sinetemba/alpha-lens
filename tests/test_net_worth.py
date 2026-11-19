@@ -95,6 +95,10 @@ def test_updater_snapshot_records_net_worth(db_session, monkeypatch):
     db_session.commit()
     luno = MagicMock(enabled=True)
     monkeypatch.setattr(updater, "LunoCollector", lambda: luno)
+    # The snapshot also gates on EasyEquities - keep it off so the test can't
+    # hit the real account when the developer's .env has credentials.
+    monkeypatch.setattr(updater, "EasyEquitiesCollector",
+                        lambda: SimpleNamespace(enabled=False))
     sync = MagicMock(return_value=SimpleNamespace())
     monkeypatch.setattr(updater, "sync_luno_holdings", sync)
     monkeypatch.setattr(updater, "compute_net_worth",
