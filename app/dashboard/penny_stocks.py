@@ -28,6 +28,12 @@ SCAN_TTL_SECONDS = 1800
 PROJECTION_DAYS = 30
 MIN_HISTORY_ROWS = 30
 FUNDAMENTALS_TTL_SECONDS = 6 * 3600
+# Daily % move that alerts for stocks added to the watchlist from this page.
+# Penny stocks routinely move 5% a day; 10% keeps the alerts meaningful.
+WATCHLIST_MOVE_THRESHOLD = 10.0
+# Rows whose last trade is this many weekdays behind the market get the ⏸
+# marker - their Price is a stale close, not a live quote.
+STALE_SESSIONS = 5
 # Liquidity = median daily Rand value traded over the last N sessions (a
 # no-trade day counts as R0, so a mostly-dormant stock's median is ~0). Mean
 # is skewed by one-off block trades (ISA: R38k mean, R26 median).
@@ -157,6 +163,7 @@ def show_penny_stocks(db: Session):
     top = results[:TOP_N]
     grid_df = pd.DataFrame([{
         "Stock": ("★ " if r["symbol"] in held_symbols else "")
+        + ("⏸ " if _is_stale(r) else "")
         + format_stock_label(r["symbol"], r["name"]),
         "Price": r["price"],
         "Day %": r["day_change"],
@@ -182,15 +189,18 @@ def show_penny_stocks(db: Session):
         column_config={
             "Stock": st.column_config.TextColumn(
                 "Stock",
-                help="Ticker and company name of the scanned share (★ = held in your portfolio)",
+                help=(
+                    "Ticker and company name of the scanned share (★ = held in your portfolio, "
+                    f"⏸ = no trade in the last {STALE_SESSIONS}+ sessions - Price is an old close)"
+                ),
             ),
             "Price": st.column_config.NumberColumn(
                 "Price",
-                help="Latest share price in Rand (last close from Yahoo Finance)",
+                help="Last traded price in Rand (close from Yahoo Finance) - may be days old for ⏸ rows",
             ),
             "Day %": st.column_config.NumberColumn(
                 "Day %", format="%+.2f%%",
-                help="Price change vs the previous trading day's close",
+                help="Price change vs the previous trading day's close. Blank = no trade on the latest session",
             ),
             "52w Low": st.column_config.NumberColumn(
                 "52w Low",
@@ -228,6 +238,12 @@ def show_penny_stocks(db: Session):
             ),
         },
     )
+
+    if any(_is_stale(r) for r in top):
+        st.caption(
+            f"⏸ = no trade in the last {STALE_SESSIONS}+ sessions - the price shown is "
+            "the last close, not a live quote."
+        )
 
     selected_rows = event.selection.rows if event else []
     if selected_rows:
@@ -273,8 +289,43 @@ def _scan_penny_stocks(extra_symbols: tuple) -> tuple:
         if stats:
             results.append(stats)
 
+    _apply_staleness(results)
     results.sort(key=lambda r: r["score"], reverse=True)
     return results, scanned_at, None
+
+
+def _last_trade_date(volume: pd.Series) -> Optional[str]:
+    """Date (YYYY-MM-DD) of the last bar with volume, or None if none traded."""
+    traded = volume[volume > 0]
+    return traded.index[-1].strftime("%Y-%m-%d") if len(traded) else None
+
+
+def _apply_staleness(results: list) -> None:
+    """Stamp sessions_since_trade and blank Day % for rows that didn't trade.
+
+    The market's latest session is the newest bar across the whole scan, so
+    a symbol Yahoo stopped serving bars for is caught too, not just one with
+    zero-volume bars. A row that didn't trade on that session has no real
+    day change - its 0% (or a move from an older session) would read as a
+    live quote, so day_change becomes None. sessions_since_trade counts
+    weekdays (JSE holidays aren't modelled); None = no trade in the year.
+    """
+    if not results:
+        return
+    market_day = max(r["dates"][-1] for r in results)
+    for r in results:
+        last = r.get("last_trade")
+        r["sessions_since_trade"] = int(np.busday_count(last, market_day)) if last else None
+        if last != market_day:
+            r["day_change"] = None
+
+
+def _is_stale(row: dict) -> bool:
+    """No trade in the last STALE_SESSIONS weekdays (or none all year)."""
+    if "sessions_since_trade" not in row:
+        return False  # pre-staleness cached scan result
+    sessions = row["sessions_since_trade"]
+    return sessions is None or sessions >= STALE_SESSIONS
 
 
 def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Optional[dict]:
@@ -344,6 +395,9 @@ def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Option
         "mom_3m": ((current - close_3m) / close_3m * 100) if close_3m else 0.0,
         "vol_recent": vol_recent,
         "vol_base": vol_base,
+        # Yahoo forward-fills no-trade days as zero-volume bars, so the last
+        # bar's date isn't the last trade - the last bar WITH volume is.
+        "last_trade": _last_trade_date(volume),
         "traded_value": traded_value,
         "zero_volume_days": zero_volume_days,
         "liquidity_penalty": liquidity_penalty,
@@ -458,7 +512,12 @@ def _render_penny_detail(db: Session, row: dict):
     st.subheader(f"🔍 {label}")
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Current", format_price(row["price"]), f"{row['day_change']:+.2f}% today")
+    if row.get("day_change") is not None:
+        col1.metric("Current", format_price(row["price"]), f"{row['day_change']:+.2f}% today")
+    else:
+        last = row.get("last_trade")
+        last_text = datetime.strptime(last, "%Y-%m-%d").strftime("%d %b") if last else "over a year ago"
+        col1.metric("Last Traded", format_price(row["price"]), f"on {last_text}", delta_color="off")
     col2.metric("52w Low", format_price(row["low_52w"]))
     col3.metric("52w High", format_price(row["high_52w"]))
     col4.metric("3m Momentum", f"{row['mom_3m']:+.1f}%")
@@ -473,8 +532,17 @@ def _render_penny_detail(db: Session, row: dict):
         st.caption("Already on your watchlist.")
     elif st.button("➕ Add to Watchlist", key=f"penny_watch_{symbol}"):
         from app.dashboard.watchlist import _add_to_watchlist
-        _add_to_watchlist(db, symbol, 0.0, 0.0, 0.0, "Added from Penny Stocks screen")
-        st.session_state["penny_flash"] = ("success", f"Added {symbol} to watchlist.")
+        # target/stop 0 = off, and notify_move defaults to False - without
+        # these the stock was watched with no price alert of any kind.
+        _add_to_watchlist(
+            db, symbol, 0.0, 0.0, 0.0, "Added from Penny Stocks screen",
+            notify_move=True, move_threshold=WATCHLIST_MOVE_THRESHOLD,
+        )
+        st.session_state["penny_flash"] = (
+            "success",
+            f"Added {symbol} to watchlist - alerts on a ±{WATCHLIST_MOVE_THRESHOLD:.0f}% daily move "
+            "(change it in Watchlist → Edit).",
+        )
         st.rerun()
 
     tab_projection, tab_chart, tab_news = st.tabs(["Outlook & Influences", "Price Chart", "News"])
@@ -698,6 +766,16 @@ def _influences(row: dict) -> list:
         influences.append(f"Positive 3-month momentum ({row['mom_3m']:+.1f}%)")
     else:
         influences.append(f"Negative 3-month momentum ({row['mom_3m']:+.1f}%)")
+
+    sessions = row.get("sessions_since_trade", 0)
+    if sessions is None:
+        influences.append("No trade in the past year — the price is a stale close")
+    elif sessions > 0:
+        last = datetime.strptime(row["last_trade"], "%Y-%m-%d").strftime("%d %b %Y")
+        influences.append(
+            f"Last traded {last} ({sessions} session{'s' if sessions != 1 else ''} ago) — "
+            "price is not a live quote"
+        )
 
     traded_value = row.get("traded_value")
     if traded_value is not None:

@@ -7,7 +7,10 @@ import pytest
 
 from app.dashboard.penny_stocks import (
     _build_fundamentals,
+    _apply_staleness,
     _drop_unit_glitches,
+    _is_stale,
+    _last_trade_date,
     _influences,
     _liquidity_penalty,
     _sane_high_low,
@@ -104,7 +107,7 @@ def _bars(volumes, close_cents=200.0):
     closes = [close_cents] * n
     return pd.DataFrame({
         "Open": closes, "High": closes, "Low": closes, "Close": closes, "Volume": volumes,
-    }, index=pd.date_range("2026-01-01", periods=n))
+    }, index=pd.bdate_range("2026-01-01", periods=n))
 
 
 def test_dormant_stock_is_penalised_and_block_trade_does_not_rescue_it():
@@ -126,6 +129,48 @@ def test_influences_flag_thin_trading():
     row["zero_volume_days"] = 14
     text = " ".join(_influences(row))
     assert "Thinly traded" in text and "no trades on 14 of the last 20 days" in text
+
+
+# --- stale prices ----------------------------------------------------------
+
+def test_last_trade_date_skips_forward_filled_zero_volume_bars():
+    vol = pd.Series([500, 0, 0], index=pd.to_datetime(["2026-11-13", "2026-11-16", "2026-11-17"]))
+    assert _last_trade_date(vol) == "2026-11-13"
+    assert _last_trade_date(vol * 0) is None
+
+
+def _scan_row(last_bar, last_trade, day_change=1.5):
+    return {"dates": ["2026-11-01", last_bar], "last_trade": last_trade, "day_change": day_change}
+
+
+def test_apply_staleness_against_the_market_session():
+    fresh = _scan_row("2026-11-19", "2026-11-19")            # traded today
+    ffill = _scan_row("2026-11-19", "2026-11-10", 0.0)       # zero-volume bars since
+    no_bars = _scan_row("2026-11-17", "2026-11-17", 2.0)      # Yahoo stopped serving bars
+    dead = _scan_row("2026-11-19", None, 0.0)
+    _apply_staleness([fresh, ffill, no_bars, dead])
+
+    assert fresh["sessions_since_trade"] == 0 and fresh["day_change"] == 1.5
+    assert ffill["sessions_since_trade"] == 7 and ffill["day_change"] is None
+    assert no_bars["sessions_since_trade"] == 2 and no_bars["day_change"] is None
+    assert dead["sessions_since_trade"] is None
+
+    assert not _is_stale(fresh) and not _is_stale(no_bars)
+    assert _is_stale(ffill) and _is_stale(dead)
+    assert not _is_stale({"symbol": "OLD"})  # cached pre-staleness row
+
+
+def test_apply_staleness_counts_weekdays_over_a_weekend():
+    friday = _scan_row("2026-11-16", "2026-11-13")  # Fri trade, Mon session
+    _apply_staleness([friday])
+    assert friday["sessions_since_trade"] == 1
+
+
+def test_influences_name_the_last_trade():
+    row = _summarise_symbol(_bars([1_000] * 55 + [0] * 5), "Y.JO", "Y")
+    _apply_staleness([row])
+    text = " ".join(_influences(row))
+    assert "Last traded" in text and "5 sessions ago" in text
 
 
 # --- dividend yield --------------------------------------------------------
