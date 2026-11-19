@@ -9,11 +9,16 @@ from typing import Optional
 from loguru import logger
 
 from app.analytics.technical_indicators import TechnicalIndicators
-from app.collectors.yfinance import JSE_PRICE_SCALE
+from app.collectors.yfinance import JSE_PRICE_SCALE, YFinanceCollector
 from app.dashboard.company import _get_company_news
 from app.dashboard.utils import format_price, format_stock_label, style_price_columns, _to_display_tz, render_last_fetch_caption
 from app.models.news import NewsArticle
-from app.models.portfolio import PortfolioHolding, is_jse_tracked_account
+from app.models.portfolio import (
+    EXCLUDED_ACCOUNT_TYPES,
+    EXCLUDED_PORTFOLIO_SYMBOLS,
+    PortfolioHolding,
+    is_jse_tracked_account,
+)
 from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
 
@@ -22,6 +27,9 @@ TOP_N = 20
 SCAN_TTL_SECONDS = 1800
 PROJECTION_DAYS = 30
 MIN_HISTORY_ROWS = 30
+FUNDAMENTALS_TTL_SECONDS = 6 * 3600
+# A trailing yield above this is a cents/Rand unit glitch, not a real payout.
+DIVIDEND_YIELD_CEILING = 50.0
 
 # JSE-listed small caps and penny stocks that frequently trade below R5.
 # The live scan still filters by actual price, so listings that have moved
@@ -53,7 +61,6 @@ JSE_PENNY_CANDIDATES = {
     "NVS": "Niveus Investments",
     "OCT": "Octodec Investments",
     "PAN": "Pan African Resources",
-    "PEM": "Pembury Lifestyle Group",
     "PMV": "Primeserv Group",
     "PPE": "Purple Group",
     "RDF": "Redefine Properties",
@@ -96,10 +103,20 @@ def show_penny_stocks(db: Session):
     # Symbols held only under non-JSE accounts (e.g. a bare "AAPL" from a USD
     # holding) are not JSE tickers - scanning "<symbol>.JO" wastes a slot or
     # worse, resolves a different instrument that shares the ticker.
+    holding_rows = db.query(PortfolioHolding.symbol, PortfolioHolding.account_type).all()
     non_jse_symbols = {
         h.symbol
-        for h in db.query(PortfolioHolding.symbol, PortfolioHolding.account_type).all()
+        for h in holding_rows
         if not is_jse_tracked_account(h.account_type)
+    }
+    # Symbols actually held (JSE-tracked, real accounts only) get a ★ in the
+    # Stock column below.
+    held_symbols = {
+        h.symbol
+        for h in holding_rows
+        if is_jse_tracked_account(h.account_type)
+        and h.account_type not in EXCLUDED_ACCOUNT_TYPES
+        and h.symbol not in EXCLUDED_PORTFOLIO_SYMBOLS
     }
     db_stocks = {
         s.symbol: s.name
@@ -133,7 +150,8 @@ def show_penny_stocks(db: Session):
 
     top = results[:TOP_N]
     grid_df = pd.DataFrame([{
-        "Stock": format_stock_label(r["symbol"], r["name"]),
+        "Stock": ("★ " if r["symbol"] in held_symbols else "")
+        + format_stock_label(r["symbol"], r["name"]),
         "Price": r["price"],
         "Day %": r["day_change"],
         "52w Low": r["low_52w"],
@@ -156,7 +174,8 @@ def show_penny_stocks(db: Session):
         key="penny_stock_grid",
         column_config={
             "Stock": st.column_config.TextColumn(
-                "Stock", help="Ticker and company name of the scanned share"
+                "Stock",
+                help="Ticker and company name of the scanned share (★ = held in your portfolio)",
             ),
             "Price": st.column_config.NumberColumn(
                 "Price",
@@ -219,6 +238,10 @@ def _scan_penny_stocks(extra_symbols: tuple) -> tuple:
             threads=True,
             progress=False,
             auto_adjust=True,
+            # Dividends ride along in the same request - used for the
+            # trailing yield (Yahoo's own dividendYield field is unreliable
+            # for JSE listings).
+            actions=True,
         )
     except Exception as e:
         logger.error(f"Penny stock scan failed: {e}")
@@ -244,13 +267,16 @@ def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Option
     except (KeyError, TypeError):
         return None
 
-    if df is None or len(df) < MIN_HISTORY_ROWS:
+    if df is None:
+        return None
+    df = _drop_unit_glitches(df)
+    if len(df) < MIN_HISTORY_ROWS:
         return None
 
     # Yahoo reports JSE prices in cents (ZAc); convert to Rand.
     close = df["Close"] / JSE_PRICE_SCALE
-    high = df["High"] / JSE_PRICE_SCALE
-    low = df["Low"] / JSE_PRICE_SCALE
+    high, low = _sane_high_low(df)
+    high, low = high / JSE_PRICE_SCALE, low / JSE_PRICE_SCALE
     volume = df["Volume"].fillna(0)
 
     current = float(close.iloc[-1])
@@ -296,10 +322,63 @@ def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Option
         "mom_3m": ((current - close_3m) / close_3m * 100) if close_3m else 0.0,
         "vol_recent": vol_recent,
         "vol_base": vol_base,
+        "div_yield": _trailing_dividend_yield(df, current),
         "score": score,
         "dates": [d.strftime("%Y-%m-%d") for d in close.index],
         "closes": [float(c) for c in close],
     }
+
+
+GLITCH_RATIO = 20.0
+
+
+def _drop_unit_glitches(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop bars whose close is >20x off the local median.
+
+    Yahoo sometimes serves thin JSE shares' zero-volume days in Rand instead
+    of cents (PMV: 3.10 among ~300 closes) - one such bar wrecks the 52w low,
+    RSI and the projection band. The window is centred, so a genuine
+    permanent re-rating flips the median within a few bars and survives.
+    """
+    median = df["Close"].rolling(11, center=True, min_periods=3).median()
+    ratio = df["Close"] / median
+    keep = ratio.isna() | ((ratio > 1 / GLITCH_RATIO) & (ratio < GLITCH_RATIO))
+    return df[keep]
+
+
+def _sane_high_low(df: pd.DataFrame) -> tuple:
+    """Intraday High/Low with impossible values replaced by the bar's close.
+
+    _drop_unit_glitches only checks closes, so a bar with a good close can
+    still carry a Rand-vs-cents High/Low that becomes the 52w extreme. A Low
+    above the close (or High below it), a missing value, or one >20x off the
+    close is not a real trade - fall back to the close for that bar.
+    """
+    close = df["Close"]
+    high = df["High"].where(
+        (df["High"] >= close) & (df["High"] < close * GLITCH_RATIO), close
+    )
+    low = df["Low"].where(
+        (df["Low"] <= close) & (df["Low"] > close / GLITCH_RATIO), close
+    )
+    return high, low
+
+
+def _trailing_dividend_yield(df: pd.DataFrame, price: float) -> Optional[float]:
+    """Dividends paid over the last 365 days as a % of the current price.
+
+    Yahoo reports JSE dividends in the same unit as the close (ZAc), so they
+    share JSE_PRICE_SCALE. None = unknown (no Dividends column, or an
+    implausible yield that signals a unit mismatch); 0.0 = paid nothing.
+    """
+    if "Dividends" not in df.columns or not price:
+        return None
+    cutoff = df.index[-1] - pd.Timedelta(days=365)
+    paid = float(df.loc[df.index > cutoff, "Dividends"].fillna(0).sum()) / JSE_PRICE_SCALE
+    if paid <= 0:
+        return 0.0
+    yield_pct = paid / price * 100
+    return yield_pct if yield_pct <= DIVIDEND_YIELD_CEILING else None
 
 
 def _last(series: pd.Series) -> Optional[float]:
@@ -352,6 +431,8 @@ def _render_penny_detail(db: Session, row: dict):
     col4.metric("3m Momentum", f"{row['mom_3m']:+.1f}%")
     col5.metric("Potential Score", f"{row['score']}/100")
 
+    _render_fundamentals(db, row)
+
     watched = db.query(WatchlistItem).filter(
         WatchlistItem.symbol == symbol, WatchlistItem.is_active == True
     ).first()
@@ -387,16 +468,22 @@ def _render_outlook(row: dict):
 
     with col1:
         st.markdown("**📈 Projection**")
-        if len(closes) >= MIN_HISTORY_ROWS:
-            slope, intercept = np.polyfit(np.arange(len(closes)), closes, 1)
-            projected = intercept + slope * (len(closes) - 1 + PROJECTION_DAYS)
-            upside = (projected - row["price"]) / row["price"] * 100
+        projection = _trend_projection(closes)
+        if projection:
+            upside = (projection["projected"] - row["price"]) / row["price"] * 100
             st.metric(
                 f"{PROJECTION_DAYS}-day trend projection",
-                format_price(projected),
+                format_price(projection["projected"]),
                 f"{upside:+.1f}% vs current",
             )
-            st.caption(f"Linear trend ≈ R {slope:+.3f}/day over the last {len(closes)} trading days.")
+            st.caption(
+                f"±1σ range: {format_price(projection['low'])} – "
+                f"{format_price(projection['high'])}"
+            )
+            st.caption(
+                f"Trend ≈ {projection['daily_pct']:+.2f}%/day over the last "
+                f"{projection['n']} trading days."
+            )
         else:
             st.info("Not enough history for a projection.")
         st.caption("Simple trend extrapolation — highly speculative for penny stocks.")
@@ -409,6 +496,137 @@ def _render_outlook(row: dict):
         st.markdown("**⚖️ Key Influences**")
         for influence in _influences(row):
             st.markdown(f"- {influence}")
+
+
+def _trend_projection(closes, days: int = PROJECTION_DAYS) -> Optional[dict]:
+    """Log-linear trend extrapolation with a ±1σ band.
+
+    Fitting log(price) instead of price means a falling stock decays towards
+    zero rather than projecting a negative price, and the trend is a % rate,
+    which suits penny stocks better than Rand/day. sigma is the std dev of
+    the fit residuals, so the band is "typical deviation from the trend" -
+    not a confidence interval for the forecast.
+    """
+    closes = np.asarray(closes, dtype=float)
+    closes = closes[np.isfinite(closes) & (closes > 0)]
+    if len(closes) < MIN_HISTORY_ROWS:
+        return None
+
+    x = np.arange(len(closes))
+    log_closes = np.log(closes)
+    slope, intercept = np.polyfit(x, log_closes, 1)
+    sigma = float(np.std(log_closes - (intercept + slope * x), ddof=2))
+    centre = intercept + slope * (len(closes) - 1 + days)
+    return {
+        "projected": float(np.exp(centre)),
+        "low": float(np.exp(centre - sigma)),
+        "high": float(np.exp(centre + sigma)),
+        "daily_pct": float(np.expm1(slope) * 100),
+        "n": len(closes),
+    }
+
+
+@st.cache_data(ttl=FUNDAMENTALS_TTL_SECONDS, show_spinner=False)
+def _fetch_yahoo_fundamentals(symbol: str) -> dict:
+    """Yahoo profile fields for one symbol (one request, on demand).
+
+    Raises on failure - st.cache_data does not cache exceptions, so an outage
+    isn't pinned for the full TTL.
+    """
+    info = YFinanceCollector().get_info(symbol)
+    if not isinstance(info, dict) or not info:
+        raise LookupError(f"No Yahoo profile for {symbol}")
+    return {
+        key: info.get(key)
+        for key in ("marketCap", "trailingPE", "trailingEps", "priceToBook", "sector", "industry")
+    }
+
+
+def _positive(value) -> Optional[float]:
+    """value as a float if it is a real positive number, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if np.isfinite(value) and value > 0 else None
+
+
+def _build_fundamentals(yahoo: dict, stock: Optional[Stock], price: float, div_yield: Optional[float]) -> dict:
+    """Merge Yahoo's profile with the stored Stock row; missing values stay None.
+
+    Market cap prefers Yahoo's live figure, then stored shares x current price
+    (fresh without a request), then the stored cap (a one-time snapshot).
+    P/E is None for loss-makers - `loss_making` says so explicitly, since a
+    blank P/E would hide the most important fact about a value trap.
+    """
+    eps = yahoo.get("trailingEps")
+    eps = float(eps) if isinstance(eps, (int, float)) and not isinstance(eps, bool) else None
+
+    market_cap = _positive(yahoo.get("marketCap"))
+    if market_cap is None and stock is not None:
+        shares = _positive(stock.shares_outstanding)
+        market_cap = shares * price if shares and price else _positive(stock.market_cap)
+
+    sector = yahoo.get("sector") or (stock.sector if stock is not None else None)
+    industry = yahoo.get("industry") or (stock.industry if stock is not None else None)
+
+    return {
+        "market_cap": market_cap,
+        "pe": _positive(yahoo.get("trailingPE")),
+        "loss_making": eps is not None and eps < 0,
+        "pb": _positive(yahoo.get("priceToBook")),
+        "div_yield": div_yield,
+        "sector": sector if isinstance(sector, str) else None,
+        "industry": industry if isinstance(industry, str) else None,
+    }
+
+
+def _format_rand_compact(value: Optional[float]) -> str:
+    """R 438.7m / R 3.35bn style for market caps."""
+    if value is None:
+        return "n/a"
+    if value >= 1e9:
+        return f"R {value / 1e9:,.2f}bn"
+    if value >= 1e6:
+        return f"R {value / 1e6:,.1f}m"
+    return f"R {value:,.0f}"
+
+
+def _render_fundamentals(db: Session, row: dict):
+    """Market cap / P/E / P/B / dividend yield for the selected stock."""
+    symbol = row["symbol"]
+    failed = False
+    with st.spinner("Loading fundamentals..."):
+        try:
+            yahoo = _fetch_yahoo_fundamentals(symbol)
+        except Exception as e:
+            logger.warning(f"Penny stock fundamentals unavailable for {symbol}: {e}")
+            yahoo, failed = {}, True
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    f = _build_fundamentals(yahoo, stock, row["price"], row.get("div_yield"))
+
+    if f["pe"] is not None:
+        pe_text = f"{f['pe']:.1f}"
+    elif f["loss_making"]:
+        pe_text = "Loss-making"
+    else:
+        pe_text = "n/a"
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Market Cap", _format_rand_compact(f["market_cap"]),
+                help="Company size. Very small caps are thinly traded and more volatile.")
+    col2.metric("P/E", pe_text,
+                help="Price / trailing 12-month earnings per share. Loss-making = negative earnings.")
+    col3.metric("P/B", f"{f['pb']:.2f}" if f["pb"] is not None else "n/a",
+                help="Price / book value per share. Below 1 = priced under its net assets.")
+    col4.metric("Div Yield (12m)",
+                f"{f['div_yield']:.1f}%" if f["div_yield"] is not None else "n/a",
+                help="Dividends paid over the last 12 months as a % of the current price.")
+
+    details = " · ".join(x for x in (f["sector"], f["industry"]) if x)
+    if failed:
+        st.caption("Yahoo profile unavailable right now - showing stored values only.")
+    elif details:
+        st.caption(details)
 
 
 def _influences(row: dict) -> list:
