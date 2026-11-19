@@ -87,12 +87,25 @@ class AlphaLensUpdaterService(win32serviceutil.ServiceFramework):
         )
 
     def _run(self):
-        try:
-            self.updater.start(mode="daemon", stop_event=self.shutdown_event)
-        except Exception as exc:
-            logger.error(f"Updater service error: {exc}")
-            # Sleep a bit so the service doesn't restart-loop instantly.
-            time.sleep(5)
+        # Restart the daemon on a crash instead of dying inside a service that
+        # SCM still shows as Running - a dead thread used to be invisible.
+        while not self.shutdown_event.is_set():
+            try:
+                self.updater.start(mode="daemon", stop_event=self.shutdown_event)
+                break  # clean exit (stop event set) - don't restart
+            except SystemExit as exc:
+                logger.info(f"Updater service exiting (code {exc.code})")
+                if not exc.code:
+                    break
+            except Exception as exc:
+                logger.error(f"Updater service error: {exc}")
+                try:
+                    servicemanager.LogErrorMsg(f"AlphaLens updater thread crashed: {exc}")
+                except Exception:
+                    pass
+            # Sleep a bit so a crash loop doesn't restart instantly.
+            if self.shutdown_event.wait(60):
+                break
 
 
 if __name__ == "__main__":

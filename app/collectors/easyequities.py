@@ -73,7 +73,10 @@ class EasyEquitiesCollector:
                 return None
             except Exception as e:
                 last_exception = e
-                logger.warning(f"{label} failed on attempt {attempt}: {e}")
+                # Log the class name, not str(e) - client exceptions can echo
+                # server response text containing session details.
+                logger.warning(
+                    f"{label} failed on attempt {attempt}: {e.__class__.__name__}")
                 if (
                     not relogin_attempted
                     and label != "EasyEquities login"
@@ -143,7 +146,10 @@ class EasyEquitiesCollector:
                 client.login(username=self.username, password=self.password)
             except Exception as e:
                 if _is_auth_failure(e):
-                    raise AuthError(f"EasyEquities login rejected: {e}")
+                    # Class name only - the raw exception can echo response
+                    # bodies that may carry session details.
+                    raise AuthError(
+                        f"EasyEquities login rejected: {e.__class__.__name__}")
                 raise
             return True
 

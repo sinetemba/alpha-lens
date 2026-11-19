@@ -205,5 +205,15 @@ def _render_data_sources():
          "Status": _yes_no(bool(settings.luno_api_key_id and settings.luno_api_secret))},
         {"Source": "Moneyweb", "Used for": "Top movers, dividend watch",
          "Status": _yes_no(bool(settings.moneyweb_username and settings.moneyweb_password))},
+        {"Source": "Metals.dev", "Used for": "Commodity spot prices",
+         "Status": _yes_no(bool(settings.metals_dev_api_key))},
+        {"Source": "Alpha Vantage", "Used for": "Commodity price history (AV_* series)",
+         "Status": _yes_no(bool(settings.alpha_vantage_api_key))},
+        {"Source": "GoldAPI", "Used for": "Bullion spot + year-end prices",
+         "Status": _yes_no(bool(settings.gold_api_key))},
+        {"Source": "CoinGecko", "Used for": "Crypto prices + search",
+         "Status": "✅ On (no key needed)"},
+        {"Source": "NewsData.io", "Used for": "Company news",
+         "Status": _yes_no(bool(settings.newsdata_api_key))},
     ]
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)

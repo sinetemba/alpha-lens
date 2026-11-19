@@ -88,8 +88,11 @@ def update_ipo_listings(db: Session, collector=None) -> int:
     for ann in announcements:
         url = ann.get("source_url")
         headline = ann.get("headline")
+        # existing_urls is extended below: a duplicated source_url inside ONE
+        # scrape must not hit the unique index and roll back the whole batch.
         if not url or url in existing_urls or not is_ipo_announcement(headline):
             continue
+        existing_urls.add(url)
         published = ann.get("published_at")
         if published is not None and published.tzinfo is not None:
             published = published.replace(tzinfo=None)
@@ -115,7 +118,9 @@ def update_ipo_listings(db: Session, collector=None) -> int:
     _mark_newly_listed(db, notifier)
     alerted = 0
     for listing in new_listings:
-        if listing.status not in ("announced", "listed"):
+        # "listed" already got its "Now trading" alert inside
+        # _mark_newly_listed; "existing"/"expired" alert never.
+        if listing.status != "announced":
             continue
         alerted += 1
         notifier.create_notification(
@@ -154,9 +159,10 @@ def _mark_newly_listed(db: Session, notifier) -> int:
     has just started trading ("listed", "Now trading" alert). Rows older than
     ANNOUNCEMENT_EXPIRY are retired instead of being probed forever.
     """
+    # Expiry applies to ALL announced rows first - a ticker-less announcement
+    # can never be probed, so without this it would sit in "upcoming" forever.
     pending = db.query(UpcomingListing).filter(
         UpcomingListing.status == "announced",
-        UpcomingListing.symbol.isnot(None),
     ).all()
     cutoff = (utcnow_naive() - ANNOUNCEMENT_EXPIRY).date()
     changed = False
@@ -164,7 +170,10 @@ def _mark_newly_listed(db: Session, notifier) -> int:
         if _announced_on(listing) < cutoff:
             listing.status = "expired"
             changed = True
-    pending = [l for l in pending if l.status == "announced"]
+    pending = [
+        l for l in pending
+        if l.status == "announced" and l.symbol is not None
+    ]
 
     # Stored history from before the announcement settles it without Yahoo.
     if pending:

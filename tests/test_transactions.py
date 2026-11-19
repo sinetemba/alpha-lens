@@ -85,6 +85,70 @@ def test_ee_sync_records_buy_for_new_holding(db_session):
     assert tx.source == "easyequities"
 
 
+def test_ee_full_transfer_to_existing_position_is_xfer_not_sell(db_session):
+    """100 shares moved ZAR -> TFSA (TFSA already has 50) pairs as a transfer."""
+    portfolio = _portfolio(db_session)
+    stock = Stock(symbol="NPN", name="Naspers")
+    db_session.add(stock)
+    db_session.flush()
+    _holding(db_session, portfolio, stock, symbol="NPN",
+             account_type="ZAR", quantity=100.0,
+             purchase_price=100.0, current_price=120.0, current_value=12000.0)
+    _holding(db_session, portfolio, stock, symbol="NPN",
+             account_type="TFSA", quantity=50.0,
+             purchase_price=110.0, current_price=120.0, current_value=6000.0)
+    db_session.commit()
+    collector = _ee_collector([
+        {   # ZAR still reports something so it stays a "reporting" account.
+            "symbol": "SOL", "name": "Sasol", "account_name": "ZAR",
+            "shares": 1.0, "purchase_value": 10.0, "current_value": 12.0,
+            "currency": "ZAR",
+        },
+        {   # TFSA now reports all 150 shares.
+            "symbol": "NPN", "name": "Naspers", "account_name": "TFSA",
+            "shares": 150.0, "purchase_value": 16500.0, "current_value": 18000.0,
+            "currency": "ZAR",
+        },
+    ])
+
+    sync_portfolio_from_easyequities(db_session, portfolio.id, collector)
+
+    types = {(t.symbol, t.account_type, t.transaction_type)
+             for t in db_session.query(PortfolioTransaction).all()}
+    assert ("NPN", "TFSA", "xfer_in") in types
+    assert ("NPN", "ZAR", "xfer_out") in types
+    sells = db_session.query(PortfolioTransaction).filter_by(
+        symbol="NPN", transaction_type="sell").all()
+    assert sells == []
+
+
+def test_ee_unpriced_partial_sell_uses_last_known_price(db_session):
+    """EE reporting zero value still logs the reduction at last-known price."""
+    portfolio = _portfolio(db_session)
+    stock = Stock(symbol="SUS", name="Suspended")
+    db_session.add(stock)
+    db_session.flush()
+    _holding(db_session, portfolio, stock, symbol="SUS",
+             quantity=10.0, purchase_price=100.0,
+             current_price=120.0, current_value=1200.0)
+    db_session.commit()
+    collector = _ee_collector([
+        {   # Same account, reduced position, no current value.
+            "symbol": "SUS", "name": "Suspended", "account_name": "ZAR",
+            "shares": 8.0, "purchase_value": 800.0, "current_value": 0.0,
+            "currency": "ZAR",
+        },
+    ])
+
+    sync_portfolio_from_easyequities(db_session, portfolio.id, collector)
+
+    sell = db_session.query(PortfolioTransaction).filter_by(
+        symbol="SUS", transaction_type="sell").one()
+    assert sell.quantity == pytest.approx(2.0)
+    assert sell.price == pytest.approx(120.0)  # holding's last known price
+    assert sell.realized_gain == pytest.approx(40.0)
+
+
 def test_ee_sync_records_sell_when_position_disappears(db_session):
     portfolio = _portfolio(db_session)
     stock = Stock(symbol="OLD", name="OldCo")

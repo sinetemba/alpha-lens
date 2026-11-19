@@ -1,5 +1,5 @@
 """Tests for the SENS IPO scanner (app/services/ipo.py + moneyweb parser)."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -108,6 +108,58 @@ def test_update_ipo_listings_dedupes_by_url(db_session, monkeypatch):
     assert update_ipo_listings(db_session, collector=_collector(anns)) == 1
     assert update_ipo_listings(db_session, collector=_collector(anns)) == 0
     assert db_session.query(UpcomingListing).count() == 1
+
+
+def test_symbolless_announcement_expires(db_session, monkeypatch):
+    """Ticker-less rows can't be probed - they must still age out."""
+    monkeypatch.setattr(ipo, "YFinanceCollector", MagicMock())
+    old = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=181)
+    db_session.add(UpcomingListing(
+        symbol=None, name="No Ticker Co", headline="Intention to list",
+        source_url="https://example.com/old", sens_published_at=old,
+    ))
+    db_session.commit()
+
+    update_ipo_listings(db_session, collector=_collector([]))
+
+    assert db_session.query(UpcomingListing).one().status == "expired"
+
+
+def test_same_day_ipo_alerts_once_not_twice(db_session, monkeypatch):
+    """A new announcement that is already trading gets 'Now trading' only."""
+    today = datetime.now(timezone.utc).replace(tzinfo=None)
+    frame = pd.DataFrame(
+        {"Close": [10.0]}, index=pd.DatetimeIndex([today]))
+    monkeypatch.setattr(
+        ipo, "YFinanceCollector",
+        lambda: SimpleNamespace(get_latest_bars=lambda s, **kw: {"NEW": frame}))
+    anns = [{
+        "published_at": today, "symbol": "NEW", "name": "Acme",
+        "headline": "Pre-listing statement", "source_url": "https://x.co/a1",
+    }]
+
+    update_ipo_listings(db_session, collector=_collector(anns))
+
+    titles = [
+        n.title for n in db_session.query(Notification).filter_by(type="ipo").all()
+    ]
+    assert sum("Possible IPO" in t for t in titles) == 0
+    assert sum("Now trading" in t for t in titles) == 1
+
+
+def test_duplicate_source_url_within_one_scrape_keeps_unique(db_session, monkeypatch):
+    """Moneyweb returning the same URL twice must not roll back the batch."""
+    monkeypatch.setattr(ipo, "YFinanceCollector", MagicMock())
+    ann = {
+        "published_at": None, "symbol": "NEW", "name": "Acme",
+        "headline": "Pre-listing statement", "source_url": "https://x.co/dup",
+    }
+    anns = [dict(ann), dict(ann), dict(ann, source_url="https://x.co/other")]
+
+    added = update_ipo_listings(db_session, collector=_collector(anns))
+
+    assert added == 2
+    assert db_session.query(UpcomingListing).count() == 2
 
 
 def test_mark_newly_listed_flips_status(db_session, monkeypatch):

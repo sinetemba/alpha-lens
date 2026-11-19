@@ -69,7 +69,10 @@ class MoneywebCollector:
                 return None
             except Exception as e:
                 last_exception = e
-                logger.warning(f"{label} failed on attempt {attempt}: {e}")
+                # Log the class name, not str(e) - client exceptions can echo
+                # server response text containing session details.
+                logger.warning(
+                    f"{label} failed on attempt {attempt}: {e.__class__.__name__}")
                 if attempt < self.max_retries:
                     sleep_seconds = self.base_delay * (2 ** (attempt - 1))
                     logger.info(f"Retrying {label} in {sleep_seconds:.1f}s")

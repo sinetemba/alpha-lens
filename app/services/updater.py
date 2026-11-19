@@ -817,7 +817,10 @@ class UpdaterService:
                 try:
                     logger.info("Running logon-triggered update")
                     ok = self._update_prices_and_news()
-                    _record_logon_update()
+                    # A failed run must not eat the debounce - let the next
+                    # logon attempt retry instead of waiting out the interval.
+                    if ok:
+                        _record_logon_update()
                 finally:
                     process_lock.JOB_LOCK.release()
                 sys.exit(0 if ok else 1)

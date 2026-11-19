@@ -156,7 +156,7 @@ def _sync_holding_from_easyequities(
         if opened is not None:
             opened.setdefault(symbol, []).append(tx)
     else:
-        _log_quantity_change(db, holding, ee_holding)
+        _log_quantity_change(db, holding, ee_holding, opened)
 
     # EasyEquities is treated as the source of truth for quantity, cost basis, and market value on sync
     holding.quantity = ee_holding["shares"]
@@ -178,12 +178,13 @@ def _sync_holding_from_easyequities(
 QTY_TOLERANCE = 1e-6
 
 
-def _log_quantity_change(db: Session, holding, ee_holding: dict) -> None:
+def _log_quantity_change(db: Session, holding, ee_holding: dict, opened: dict | None) -> None:
     """Log a top-up (buy of the delta) or partial sale of an existing holding.
 
     Must run before the holding is overwritten with EE's values: the delta
     and the partial sale's realized gain use the previous quantity / average
-    cost.
+    cost. A top-up buy is also added to `opened` so reconciliation can pair
+    a full transfer into an existing position (transfer, not sell+rebuy).
     """
     from app.services.transactions import BUY, record_sale, record_transaction
 
@@ -197,18 +198,28 @@ def _log_quantity_change(db: Session, holding, ee_holding: dict) -> None:
         # (EE reports average cost, so the new lot's cost is the difference).
         added_cost = new_qty * ee_holding["purchase_price"] - old_qty * (holding.purchase_price or 0.0)
         price = added_cost / delta if added_cost > 0 else ee_holding["current_price"]
-        record_transaction(
+        tx = record_transaction(
             db,
             portfolio_id=holding.portfolio_id, stock_id=holding.stock_id,
             symbol=holding.symbol, account_type=holding.account_type,
             transaction_type=BUY, quantity=delta, price=price,
             source="easyequities",
         )
-    elif ee_holding["current_price"]:
-        record_sale(
-            db, holding, ee_holding["current_price"],
-            source="easyequities", quantity=-delta,
+        if opened is not None:
+            opened.setdefault(holding.symbol, []).append(tx)
+    else:
+        # No EE price on suspended/unpriced instruments - fall back to the
+        # last known stored price like the removal path does.
+        sell_px = (
+            ee_holding["current_price"]
+            or holding.current_price
+            or holding.purchase_price
         )
+        if sell_px:
+            record_sale(
+                db, holding, sell_px,
+                source="easyequities", quantity=-delta,
+            )
 
 
 def _match_transfer(opened: dict, holding) -> object | None:
@@ -357,15 +368,24 @@ def sync_portfolio_from_easyequities(
                 db.delete(holding)
                 removed.append(f"{holding.symbol} ({holding.account_type})")
         if removed:
-            db.commit()
-            logger.info(f"Removed {len(removed)} stale holding(s) no longer reported by EasyEquities")
+            try:
+                db.commit()
+            except IntegrityError:
+                # Concurrent writer raced the delete - keep their rows.
+                db.rollback()
+                logger.warning("EasyEquities removal hit a concurrent write")
+                removed = []
+            if removed:
+                logger.info(f"Removed {len(removed)} stale holding(s) no longer reported by EasyEquities")
             # Removed positions used to vanish with no trace - an in-app
-            # notification records what was dropped (deduped per symbol set).
+            # notification records what was dropped. The symbol list goes in
+            # the title because dedup keys on (type, title, symbol): two
+            # DIFFERENT same-count removals in one window must both alert.
             try:
                 from app.notifications.notification_service import NotificationService
                 NotificationService(db).create_notification(
                     notification_type="system",
-                    title=f"EasyEquities sync removed {len(removed)} holding(s)",
+                    title=f"EE sync removed: {', '.join(sorted(removed))}"[:450],
                     message=(
                         "No longer reported by EasyEquities (sold, transferred or "
                         f"delisted) and removed from the portfolio: {', '.join(sorted(removed))}"
