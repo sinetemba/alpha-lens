@@ -17,6 +17,7 @@ from app.services.penny_scan import (
     _last_trade_date,
     _liquidity_penalty,
     _sane_high_low,
+    _setup_tag,
     _summarise_symbol,
     _trailing_dividend_yield,
     is_stale as _is_stale,
@@ -175,6 +176,57 @@ def test_influences_name_the_last_trade():
     assert "Last traded" in text and "5 sessions ago" in text
 
 
+# --- setup tag ---------------------------------------------------------------
+
+def _tag(**kw):
+    """_setup_tag with sane neutral defaults; override what the case needs."""
+    args = dict(rsi=50, macd_hist=None, off_low=60.0, close=1.0,
+                sma_20=1.0, sma_50=1.0, mom_3m=0.0)
+    args.update(kw)
+    return _setup_tag(**args)
+
+
+def test_setup_overbought_is_extended_even_near_the_low():
+    assert _tag(rsi=72, off_low=5.0, macd_hist=0.01) == "Extended"
+
+
+def test_setup_near_low_with_a_turn_is_recovery():
+    # MACD histogram turning positive counts as stabilising on its own.
+    assert _tag(off_low=8.0, rsi=35, macd_hist=0.01) == "Recovery · long"
+    # So does a recovered RSI, even with a still-negative histogram.
+    assert _tag(off_low=14.9, rsi=55, macd_hist=-0.01) == "Recovery · long"
+
+
+def test_setup_near_low_still_falling_is_not_recovery():
+    """A stock at its low with momentum still falling is a knife, not a bargain."""
+    # No turn signal -> not Recovery; it falls through to the trend verdicts.
+    assert _tag(off_low=2.0, rsi=40, macd_hist=-0.05) == "Watch"
+    assert _tag(off_low=2.0, rsi=40, macd_hist=-0.05, mom_3m=-12.0, sma_20=1.5) == "Weak"
+
+
+def test_setup_oversold_is_bounce():
+    assert _tag(rsi=25, off_low=40.0) == "Bounce · short"
+
+
+def test_setup_trend_needs_both_smas_and_momentum():
+    assert _tag(close=1.5, sma_20=1.2, sma_50=1.1, mom_3m=8.0) == "Trend · mid"
+    assert _tag(close=1.5, sma_20=1.2, sma_50=1.1, mom_3m=-2.0) == "Watch"
+
+
+def test_setup_weak_and_watch_fallbacks():
+    assert _tag(close=0.8, sma_20=1.0, mom_3m=-5.0) == "Weak"
+    assert _tag() == "Watch"
+    # Missing indicators degrade gracefully rather than forcing a tag.
+    assert _tag(rsi=None, sma_20=None, sma_50=None, off_low=None) == "Watch"
+
+
+def test_scanned_row_carries_a_setup():
+    row = _summarise_symbol(_bars([1_000] * 60), "X.JO", "X")
+    assert row["setup"] in {
+        "Extended", "Recovery · long", "Bounce · short", "Trend · mid", "Weak", "Watch",
+    }
+
+
 # --- dividend yield --------------------------------------------------------
 
 def _frame(dividends):
@@ -298,3 +350,46 @@ def test_coverage_text():
     assert _coverage_text(5, ["X", "Y"]) == " · 3 of 5 symbols returned data (no data: X, Y)"
     many = [f"S{i}" for i in range(10)]
     assert _coverage_text(90, many).endswith("(no data: S0, S1, S2, S3, S4, S5, S6, S7 +2 more)")
+
+
+# --- dormant filter, volume rule, chart ------------------------------------
+
+def test_is_dormant_threshold():
+    from app.services.penny_scan import DORMANT_ZERO_DAYS, is_dormant
+    assert is_dormant({"zero_volume_days": DORMANT_ZERO_DAYS})
+    assert not is_dormant({"zero_volume_days": DORMANT_ZERO_DAYS - 1})
+    assert not is_dormant({})  # cached pre-liquidity row
+
+
+@pytest.mark.parametrize("recent, points", [(110.0, 0), (125.0, 10)])
+def test_volume_rule_needs_a_real_rise(recent, points):
+    """Score and Key Influences both use VOLUME_RISE_RATIO (1.2x)."""
+    from app.services.penny_scan import _potential_score
+    base = dict(rsi=None, macd=None, macd_signal=None, macd_hist=None,
+                close=1.0, sma_20=None, sma_50=None, mom_3m=0.0, vol_base=100.0)
+    assert _potential_score(vol_recent=recent, **base) == points
+
+
+def test_influences_and_score_agree_on_volume():
+    from app.services.penny_scan import _potential_score
+    row = _summarise_symbol(_bars([100_000] * 50 + [110_000] * 10), "Y.JO", "Y")
+    assert row["vol_recent"] < row["vol_base"] * 1.2
+    assert not any("rising" in i for i in _influences(row))
+
+
+def test_price_chart_overlays():
+    from app.dashboard.penny_stocks import CHART_DAYS, _price_chart
+    row = _summarise_symbol(_bars([1_000] * 150), "Y.JO", "Y")  # a real scan has ~250
+    fig = _price_chart(row)
+    names = [t.name for t in fig.data]
+    assert names == ["Close", "SMA-20", "SMA-50"]
+    assert len(fig.data[0].x) == CHART_DAYS
+    assert fig.data[2].y[0] == pytest.approx(2.0)  # warmed up: real average from bar 1
+    labels = [a.text for a in fig.layout.annotations]
+    assert labels == ["52w low R 2.00", "52w high R 2.00"]
+
+
+def test_price_chart_short_history_skips_unwarmed_sma():
+    from app.dashboard.penny_stocks import _price_chart
+    row = _summarise_symbol(_bars([1_000] * 40), "Y.JO", "Y")
+    assert [t.name for t in _price_chart(row).data] == ["Close", "SMA-20"]

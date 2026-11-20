@@ -11,23 +11,22 @@ from app.collectors.yfinance import YFinanceCollector
 from app.dashboard.company import _get_company_news
 from app.dashboard.utils import format_price, format_stock_label, style_price_columns, _to_display_tz, render_last_fetch_caption
 from app.models.news import NewsArticle
-from app.models.portfolio import (
-    EXCLUDED_ACCOUNT_TYPES,
-    EXCLUDED_PORTFOLIO_SYMBOLS,
-    PortfolioHolding,
-    is_jse_tracked_account,
-)
 from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
 # The scan itself is Streamlit-free (the updater's near-52w-low alerts run it
 # too); this page caches it and renders the results.
 from app.services.penny_scan import (
+    DORMANT_ZERO_DAYS,
     JSE_PENNY_CANDIDATES,
     LIQUIDITY_WINDOW,
     MIN_HISTORY_ROWS,
     PENNY_PRICE_LIMIT,
     STALE_SESSIONS,
+    VOLUME_FALL_RATIO,
+    VOLUME_RISE_RATIO,
     extra_scan_symbols,
+    held_jse_symbols,
+    is_dormant,
     is_stale,
     scan_penny_stocks,
     scannable_db_stocks,
@@ -60,19 +59,22 @@ def show_penny_stocks(db: Session):
         level, message = flash
         getattr(st, level)(message)
 
-    # Symbols actually held (JSE-tracked, real accounts only) get a ★ in the
-    # Stock column below.
-    held_symbols = {
-        h.symbol
-        for h in db.query(PortfolioHolding.symbol, PortfolioHolding.account_type).all()
-        if is_jse_tracked_account(h.account_type)
-        and h.account_type not in EXCLUDED_ACCOUNT_TYPES
-        and h.symbol not in EXCLUDED_PORTFOLIO_SYMBOLS
-    }
+    # Symbols actually held get a ★ in the Stock column and are never hidden
+    # by the dormant filter.
+    held_symbols = held_jse_symbols(db)
     db_stocks = scannable_db_stocks(db)
     extra_symbols = extra_scan_symbols(db_stocks)
 
-    _, rescan_col = st.columns([3, 1])
+    toggle_col, rescan_col = st.columns([3, 1])
+    with toggle_col:
+        hide_dormant = st.toggle(
+            "Hide dormant stocks", value=True, key="penny_hide_dormant",
+            help=(
+                f"Hide shares with no trades on {DORMANT_ZERO_DAYS}+ of the last "
+                f"{LIQUIDITY_WINDOW} sessions - you couldn't get in or out. "
+                "Shares you hold are always shown."
+            ),
+        )
     with rescan_col:
         if st.button("🔄 Rescan", key="penny_rescan"):
             _scan_penny_stocks.clear()
@@ -97,11 +99,25 @@ def show_penny_stocks(db: Session):
         st.info("No JSE shares currently trading below the threshold were found.")
         return
 
-    top = results[:TOP_N]
+    visible = results
+    if hide_dormant:
+        visible = [r for r in results if r["symbol"] in held_symbols or not is_dormant(r)]
+    hidden = len(results) - len(visible)
+    if not visible:
+        st.info("Every share under the threshold is dormant - switch off **Hide dormant stocks** to see them.")
+        return
+    if hidden:
+        st.caption(
+            f"{hidden} dormant stock{'s' if hidden != 1 else ''} hidden "
+            f"(no trades on {DORMANT_ZERO_DAYS}+ of the last {LIQUIDITY_WINDOW} sessions)."
+        )
+
+    top = visible[:TOP_N]
     grid_df = pd.DataFrame([{
         "Stock": ("★ " if r["symbol"] in held_symbols else "")
         + ("⏸ " if is_stale(r) else "")
         + format_stock_label(r["symbol"], r["name"]),
+        "Setup": r.get("setup"),
         "Price": r["price"],
         "Day %": r["day_change"],
         "52w Low": r["low_52w"],
@@ -122,13 +138,26 @@ def show_penny_stocks(db: Session):
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        key="penny_stock_grid",
+        # Selection is a row index into `top`; a key per filter state stops a
+        # selection made before toggling from pointing at a different stock.
+        key=f"penny_stock_grid_{'active' if hide_dormant else 'all'}",
         column_config={
             "Stock": st.column_config.TextColumn(
                 "Stock",
                 help=(
                     "Ticker and company name of the scanned share (★ = held in your portfolio, "
                     f"⏸ = no trade in the last {STALE_SESSIONS}+ sessions - Price is an old close)"
+                ),
+            ),
+            "Setup": st.column_config.TextColumn(
+                "Setup",
+                help=(
+                    "Trade setup and its natural holding horizon. "
+                    "Recovery · long = near the 52w low with momentum stabilising; "
+                    "Bounce · short = oversold (RSI<30) snap-back; "
+                    "Trend · mid = above SMA-20/50 with positive momentum; "
+                    "Extended = overbought (RSI>70) - wait for a pullback; "
+                    "Weak = still falling - no entry; Watch = no clear setup."
                 ),
             ),
             "Price": st.column_config.NumberColumn(
@@ -255,15 +284,44 @@ def _render_penny_detail(db: Session, row: dict):
         _render_outlook(row)
 
     with tab_chart:
-        fig = go.Figure(go.Scatter(
-            x=row["dates"][-90:], y=row["closes"][-90:],
-            mode="lines", name=symbol, line=dict(color="cornflowerblue"),
-        ))
-        fig.update_layout(height=350, yaxis_title="Price (ZAR)", showlegend=False, margin=dict(t=20))
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(_price_chart(row), width="stretch")
 
     with tab_news:
         _render_penny_news(db, symbol, row.get("name"))
+
+
+CHART_DAYS = 90
+
+
+def _price_chart(row: dict) -> go.Figure:
+    """Last CHART_DAYS closes with SMA-20/50 and the 52-week low/high.
+
+    SMAs are computed over the full year and then sliced, so the first
+    visible points are real averages rather than a warm-up gap.
+    """
+    closes = pd.Series(row["closes"], index=pd.to_datetime(row["dates"]))
+    window = closes.index[-CHART_DAYS:]
+    fig = go.Figure()
+    fig.add_scatter(x=window, y=closes.loc[window], mode="lines", name="Close",
+                    line=dict(color="cornflowerblue", width=2))
+    for days, colour in ((20, "orange"), (50, "mediumpurple")):
+        sma = closes.rolling(days).mean().loc[window]
+        if sma.notna().any():
+            fig.add_scatter(x=window, y=sma, mode="lines", name=f"SMA-{days}",
+                            line=dict(color=colour, width=1))
+    for value, label, colour, position in (
+        (row.get("low_52w"), "52w low", "seagreen", "bottom right"),
+        (row.get("high_52w"), "52w high", "indianred", "top right"),
+    ):
+        if value:
+            fig.add_hline(y=value, line_dash="dot", line_color=colour,
+                          annotation_text=f"{label} {format_price(value)}",
+                          annotation_position=position)
+    fig.update_layout(
+        height=380, yaxis_title="Price (ZAR)", margin=dict(t=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    )
+    return fig
 
 
 def _render_outlook(row: dict):
@@ -437,6 +495,8 @@ def _render_fundamentals(db: Session, row: dict):
 def _influences(row: dict) -> list:
     """Build human-readable signal bullets from the scanned stats."""
     influences = []
+    if row.get("setup"):
+        influences.append(f"Setup: {row['setup']}")
     rsi, macd, macd_sig = row["rsi"], row["macd"], row["macd_signal"]
 
     if rsi is not None:
@@ -494,9 +554,9 @@ def _influences(row: dict) -> list:
         else:
             influences.append(f"Liquid — typical day R {traded_value:,.0f} traded{no_trades}")
 
-    if row["vol_base"] > 0 and row["vol_recent"] > row["vol_base"] * 1.2:
+    if row["vol_base"] > 0 and row["vol_recent"] > row["vol_base"] * VOLUME_RISE_RATIO:
         influences.append("Recent volume rising vs 60-day average — growing interest")
-    elif row["vol_base"] > 0 and row["vol_recent"] < row["vol_base"] * 0.8:
+    elif row["vol_base"] > 0 and row["vol_recent"] < row["vol_base"] * VOLUME_FALL_RATIO:
         influences.append("Recent volume declining vs 60-day average — fading interest")
 
     return influences

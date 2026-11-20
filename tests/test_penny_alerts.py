@@ -55,6 +55,25 @@ def test_candidates_within_threshold_and_not_stale():
     assert [r["symbol"] for r in picked] == ["GPL"]
 
 
+def test_dormant_rows_skipped_unless_held():
+    dormant = _row("TRL", price=1.26, low=1.17, zero_volume_days=14)
+    active = _row("BAT", price=1.80, low=1.72, zero_volume_days=0)
+    assert [r["symbol"] for r in near_low_candidates([dormant, active], 10.0)] == ["BAT"]
+    picked = near_low_candidates([dormant, active], 10.0, held=frozenset({"TRL"}))
+    assert [r["symbol"] for r in picked] == ["TRL", "BAT"]
+
+
+def test_run_passes_held_symbols(db_session, monkeypatch):
+    monkeypatch.setattr(penny_scan, "settings", SimpleNamespace(
+        penny_low_alert_enabled=True, yfinance_enabled=True, penny_low_alert_pct=10.0))
+    monkeypatch.setattr(penny_scan, "held_jse_symbols", lambda db: {"TRL"})
+    monkeypatch.setattr(penny_scan, "scan_penny_stocks", lambda extra: (
+        [_row("TRL", price=1.26, low=1.17, zero_volume_days=14),
+         _row("TEX", price=1.0, low=0.95, zero_volume_days=15)], None, None, []))
+    assert run_near_low_alerts(db_session) == 1
+    assert db_session.query(Notification).one().stock_symbol == "TRL"
+
+
 def test_alert_message_and_metadata(db_session, quiet_notifier):
     created = check_near_low_alerts(db_session, [_row()], 10.0, {"GPL": "Grand Parade Investments"})
     assert created == 1 and quiet_notifier  # external delivery attempted

@@ -20,7 +20,12 @@ from app.collectors.yfinance import JSE_PRICE_SCALE
 from app.config.settings import settings
 from app.models.base import utcnow_naive
 from app.models.notification import Notification
-from app.models.portfolio import PortfolioHolding, is_jse_tracked_account
+from app.models.portfolio import (
+    EXCLUDED_ACCOUNT_TYPES,
+    EXCLUDED_PORTFOLIO_SYMBOLS,
+    PortfolioHolding,
+    is_jse_tracked_account,
+)
 from app.models.stock import Stock
 from app.notifications.notification_service import NotificationService
 from app.utils.formatting import format_price
@@ -36,8 +41,23 @@ STALE_SESSIONS = 5
 LIQUIDITY_WINDOW = 20
 # (minimum median R/day, score penalty) - checked in order.
 LIQUIDITY_PENALTIES = ((10_000, 30), (100_000, 15))
+# "Dormant" = no trades on this many of the last LIQUIDITY_WINDOW sessions;
+# the page hides these by default.
+DORMANT_ZERO_DAYS = 10
+# Recent (10-day) vs 60-day average volume: above RISE scores +10 and reads
+# "growing interest", below FALL reads "fading interest". One constant for
+# both so the score and Key Influences can't disagree.
+VOLUME_RISE_RATIO = 1.2
+VOLUME_FALL_RATIO = 0.8
 # A trailing yield above this is a cents/Rand unit glitch, not a real payout.
 DIVIDEND_YIELD_CEILING = 50.0
+
+# Setup tag thresholds - a label naming the trade setup and its natural
+# holding horizon, so "buy low / wait / avoid" reads at a glance.
+SETUP_RECOVERY_OFF_LOW = 15.0  # % above the 52w low
+SETUP_BOUNCE_RSI = 30.0        # deeply oversold
+SETUP_EXTENDED_RSI = 70.0      # overbought - too late to chase
+SETUP_RECOVERY_RSI = 45.0      # RSI this high near the lows counts as stabilising
 
 # JSE equities that traded below R10 at some point in the year to 2026-11-20
 # (R10, not R5, leaves headroom for names drifting down towards the
@@ -156,6 +176,18 @@ def scannable_db_stocks(db: Session) -> dict:
         for s in db.query(Stock).filter(Stock.is_active == True).all()
         if s.symbol and not any(c in s.symbol for c in ".^_=")
         and s.symbol not in non_jse_symbols
+    }
+
+
+def held_jse_symbols(db: Session) -> set:
+    """JSE symbols actually held in real accounts - the page's ★, and exempt
+    from the dormant filter on both the page and the near-low alerts."""
+    return {
+        h.symbol
+        for h in db.query(PortfolioHolding.symbol, PortfolioHolding.account_type).all()
+        if is_jse_tracked_account(h.account_type)
+        and h.account_type not in EXCLUDED_ACCOUNT_TYPES
+        and h.symbol not in EXCLUDED_PORTFOLIO_SYMBOLS
     }
 
 
@@ -310,21 +342,26 @@ def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Option
     # A great chart is worthless if you can't get out of the position.
     score = max(0, score - liquidity_penalty)
 
+    off_low = ((current - low_52w) / low_52w * 100) if low_52w else 0.0
+    off_high = ((current - high_52w) / high_52w * 100) if high_52w else 0.0
+    mom_3m = ((current - close_3m) / close_3m * 100) if close_3m else 0.0
+
     return {
         "symbol": symbol,
         "price": current,
         "day_change": ((current - prev) / prev * 100) if prev else 0.0,
         "low_52w": low_52w,
         "high_52w": high_52w,
-        "off_low": ((current - low_52w) / low_52w * 100) if low_52w else 0.0,
-        "off_high": ((current - high_52w) / high_52w * 100) if high_52w else 0.0,
+        "off_low": off_low,
+        "off_high": off_high,
         "rsi": rsi,
         "macd": macd_val,
         "macd_signal": macd_sig,
         "macd_hist": macd_hist,
         "sma_20": sma_20,
         "sma_50": sma_50,
-        "mom_3m": ((current - close_3m) / close_3m * 100) if close_3m else 0.0,
+        "mom_3m": mom_3m,
+        "setup": _setup_tag(rsi, macd_hist, off_low, current, sma_20, sma_50, mom_3m),
         "vol_recent": vol_recent,
         "vol_base": vol_base,
         # Yahoo forward-fills no-trade days as zero-volume bars, so the last
@@ -341,6 +378,11 @@ def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Option
 
 
 GLITCH_RATIO = 20.0
+
+
+def is_dormant(row: dict) -> bool:
+    """No trades on DORMANT_ZERO_DAYS+ of the last LIQUIDITY_WINDOW sessions."""
+    return row.get("zero_volume_days", 0) >= DORMANT_ZERO_DAYS
 
 
 def _drop_unit_glitches(df: pd.DataFrame) -> pd.DataFrame:
@@ -413,6 +455,36 @@ def _liquidity_penalty(traded_value: float) -> int:
     return 0
 
 
+def _setup_tag(rsi, macd_hist, off_low, close, sma_20, sma_50, mom_3m) -> str:
+    """Classify the trade setup; the suffix is the natural holding horizon.
+
+    First match wins: Extended (overbought - wait for a pullback) >
+    Recovery (near the 52w low AND momentum stabilising - the long-term
+    "buy low" play) > Bounce (deeply oversold snap-back, short-term) >
+    Trend (established uptrend, mid-term) > Weak (still falling - no
+    entry) > Watch (no setup). Recovery needs a turn signal, not just a low
+    price - a stock at its low with momentum still falling is a knife, not
+    a bargain.
+    """
+    if rsi is not None and rsi >= SETUP_EXTENDED_RSI:
+        return "Extended"
+    stabilising = (macd_hist is not None and macd_hist > 0) or (
+        rsi is not None and rsi >= SETUP_RECOVERY_RSI
+    )
+    if off_low is not None and off_low <= SETUP_RECOVERY_OFF_LOW and stabilising:
+        return "Recovery · long"
+    if rsi is not None and rsi < SETUP_BOUNCE_RSI:
+        return "Bounce · short"
+    if (
+        sma_20 is not None and sma_50 is not None
+        and close > sma_20 and close > sma_50 and mom_3m > 0
+    ):
+        return "Trend · mid"
+    if sma_20 is not None and close < sma_20 and mom_3m < 0:
+        return "Weak"
+    return "Watch"
+
+
 def _potential_score(rsi, macd, macd_signal, macd_hist, close, sma_20, sma_50, mom_3m, vol_recent, vol_base) -> int:
     """Heuristic 0-100 upside score for a penny stock."""
     score = 0
@@ -436,7 +508,7 @@ def _potential_score(rsi, macd, macd_signal, macd_hist, close, sma_20, sma_50, m
         score += 10
     if mom_3m > 0:
         score += 10
-    if vol_base > 0 and vol_recent > vol_base:
+    if vol_base > 0 and vol_recent > vol_base * VOLUME_RISE_RATIO:
         score += 10
 
     return min(score, 100)
@@ -446,16 +518,20 @@ def near_low_title(symbol: str) -> str:
     return f"Near 52-week low: {symbol}"
 
 
-def near_low_candidates(results: list, threshold_pct: float) -> list:
+def near_low_candidates(results: list, threshold_pct: float, held: frozenset = frozenset()) -> list:
     """Scanned rows closing within threshold_pct of their 52-week low.
 
     Stale rows are skipped - an old close sitting near the low says nothing
-    about today's price.
+    about today's price. Dormant rows are skipped too (same rule as the
+    page's default filter: a cheap share you can't trade isn't an
+    opportunity), except for symbols in `held` - you'd want to know about
+    a position you already own.
     """
     return [
         r for r in results
         if not is_stale(r) and r.get("low_52w") and r.get("off_low") is not None
         and r["off_low"] <= threshold_pct
+        and (r["symbol"] in held or not is_dormant(r))
     ]
 
 
@@ -477,7 +553,10 @@ def _near_low_message(row: dict, name: str) -> str:
     )
 
 
-def check_near_low_alerts(db: Session, results: list, threshold_pct: float, names: Optional[dict] = None) -> int:
+def check_near_low_alerts(
+    db: Session, results: list, threshold_pct: float,
+    names: Optional[dict] = None, held: frozenset = frozenset(),
+) -> int:
     """Create type="price" notifications for near-low rows; returns how many.
 
     Skips a symbol that already got this alert within NEAR_LOW_COOLDOWN.
@@ -488,7 +567,7 @@ def check_near_low_alerts(db: Session, results: list, threshold_pct: float, name
     notifier = NotificationService(db)
     cutoff = utcnow_naive() - NEAR_LOW_COOLDOWN
     created = 0
-    for row in near_low_candidates(results, threshold_pct):
+    for row in near_low_candidates(results, threshold_pct, held):
         symbol = row["symbol"]
         title = near_low_title(symbol)
         recent = db.query(Notification.id).filter(
@@ -531,7 +610,9 @@ def run_near_low_alerts(db: Session) -> int:
     if error:
         raise RuntimeError(f"penny scan failed: {error}")
     names = {**JSE_PENNY_CANDIDATES, **db_stocks}
-    created = check_near_low_alerts(db, results, settings.penny_low_alert_pct, names)
+    created = check_near_low_alerts(
+        db, results, settings.penny_low_alert_pct, names, frozenset(held_jse_symbols(db)),
+    )
     logger.info(
         f"Penny near-52w-low check: {len(results)} scanned, {created} new alert(s) "
         f"(threshold {settings.penny_low_alert_pct:g}%)"
