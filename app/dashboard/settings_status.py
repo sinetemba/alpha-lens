@@ -77,7 +77,7 @@ def _render_notifications(db: Session):
              "Needs": "NOTIFICATION_TELEGRAM_BOT_TOKEN, NOTIFICATION_TELEGRAM_CHAT_ID"},
         ]),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
     st.caption(
         "Per-stock alert rules (target, stop loss, daily-move threshold) are set on the "
@@ -131,7 +131,7 @@ def _render_updater_status(db: Session):
             "Last success": _to_display_tz(last_ok).strftime("%Y-%m-%d %H:%M") if last_ok else "-",
             "Detail": (run.detail or "") if run else "",
         })
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     st.caption(
         "Times are SAST. Missed runs (e.g. while the PC slept) are made up automatically "
         "once it wakes. If nothing has run recently, check the scheduled task with "
@@ -216,4 +216,4 @@ def _render_data_sources():
         {"Source": "NewsData.io", "Used for": "Company news",
          "Status": _yes_no(bool(settings.newsdata_api_key))},
     ]
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")

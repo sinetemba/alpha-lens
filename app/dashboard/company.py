@@ -285,7 +285,7 @@ def _render_price_chart(db: Session, symbol: str):
         xaxis_rangeslider_visible=False,
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # Add moving averages if available
     st.subheader("Moving Averages")
@@ -346,7 +346,7 @@ def _render_historical_data(db: Session, symbol: str):
     st.caption(f"Page {page} of {total_pages} ({total} rows, {page_size} per page)")
     st.dataframe(
         styled_history,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Open": st.column_config.NumberColumn(),
@@ -401,7 +401,7 @@ def _render_financials(symbol: str):
             if df is None or df.empty:
                 st.info(f"No {label.lower()} available.")
                 continue
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
 
 
 def _render_company_news(db: Session, symbol: str):

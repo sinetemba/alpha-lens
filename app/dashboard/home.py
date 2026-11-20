@@ -431,7 +431,7 @@ def _render_top_movers(db: Session):
         if winners:
             st.dataframe(
                 _movers_table(winners),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config=column_config,
             )
@@ -443,7 +443,7 @@ def _render_top_movers(db: Session):
         if losers:
             st.dataframe(
                 _movers_table(losers),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config=column_config,
             )

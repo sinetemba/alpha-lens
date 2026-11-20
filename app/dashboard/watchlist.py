@@ -220,7 +220,7 @@ def show_watchlist(db: Session):
         )
         st.dataframe(
             styled_table,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),

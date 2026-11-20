@@ -119,7 +119,7 @@ def show_dividends(db: Session):
                 "Type": d.dividend_type or "N/A",
                 "Value": d.value or "N/A",
             })
-        st.dataframe(data, use_container_width=True)
+        st.dataframe(data, width="stretch")
     else:
         st.info("No Moneyweb Dividend Watch data yet. Click 'Fetch from Moneyweb' to load it.")
 
@@ -185,7 +185,7 @@ def show_dividends(db: Session):
             style_price_columns(
                 dividends_table.style, dividends_table, price_cols=("Amount (per share)",),
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Amount (per share)": st.column_config.NumberColumn("Amount (per share)"),
@@ -215,7 +215,7 @@ def show_dividends(db: Session):
             style_price_columns(
                 income_table.style, income_table, price_cols=("Dividends per Share",),
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Dividends per Share": st.column_config.NumberColumn("Dividends per Share"),

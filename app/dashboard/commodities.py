@@ -275,7 +275,7 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
 
     if latest_prices:
         st.dataframe(
-            latest_prices, use_container_width=True, hide_index=True,
+            latest_prices, width="stretch", hide_index=True,
             column_config={
                 "Price (ZAR/g)": st.column_config.NumberColumn(format="R %.2f"),
                 "Price (USD)": st.column_config.NumberColumn(format="$ %.2f"),
@@ -338,4 +338,4 @@ def _render_commodity_charts(db: Session):
         height=500
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")

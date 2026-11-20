@@ -115,7 +115,7 @@ def show_penny_stocks(db: Session):
     )
     event = st.dataframe(
         styled_grid,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
@@ -247,7 +247,7 @@ def _render_penny_detail(db: Session, row: dict):
             mode="lines", name=symbol, line=dict(color="cornflowerblue"),
         ))
         fig.update_layout(height=350, yaxis_title="Price (ZAR)", showlegend=False, margin=dict(t=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with tab_news:
         _render_penny_news(db, symbol, row.get("name"))

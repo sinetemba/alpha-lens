@@ -246,7 +246,7 @@ def _render_direct_table(rows: list) -> None:
         table.style, table, "Price (ZAR)", price_cols=("Price (ZAR)", "Paid per coin"),
     )
     st.dataframe(
-        styled, use_container_width=True, hide_index=True,
+        styled, width="stretch", hide_index=True,
         column_config={
             "Qty": st.column_config.NumberColumn(format="%g"),
             "Price (ZAR)": st.column_config.NumberColumn(),
@@ -305,7 +305,7 @@ def _render_bundle(
         style_price_columns(
             breakdown_table.style, breakdown_table, "Price (ZAR)", price_cols=("Price (ZAR)",),
         ),
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
         column_config={
             "Weight %": st.column_config.NumberColumn(format="%.2f%%"),
             "Value": st.column_config.NumberColumn(format="R %.2f"),
@@ -545,7 +545,7 @@ def _render_market_snapshot(markets: dict, held_ids: tuple):
             "24h %": row.get("price_change_percentage_24h"),
             "Market cap (R bn)": row["market_cap"] / 1e9 if row.get("market_cap") else None,
         } for coin_id, row in snapshot.items()],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Price (ZAR)": st.column_config.NumberColumn(format="R %.2f"),

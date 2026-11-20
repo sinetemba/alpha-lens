@@ -334,7 +334,7 @@ def _render_krugerrand_calculator(gold_zar: float, silver_zar: float):
             "Spot value": f"R {oz * spot:,.2f}",
             f"Retail value ({premium:g}% premium)": f"R {oz * spot * premium_factor:,.2f}",
         } for label, oz in sizes.items()],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -391,7 +391,7 @@ def _render_holdings(db: Session, gold_zar: float, silver_zar: float):
         render_holding_totals(holding_totals(valued))
         # Numeric cells (not "R x" strings) so column sorting works.
         st.dataframe(
-            rows, use_container_width=True, hide_index=True,
+            rows, width="stretch", hide_index=True,
             column_config={
                 "Qty": st.column_config.NumberColumn(format="%g"),
                 "Paid per item": st.column_config.NumberColumn(format="R %.2f"),
@@ -612,7 +612,7 @@ def _render_historical_grid(
         st.info("No historical data available. Check your GoldAPI or Alpha Vantage configuration.")
         return
 
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
 
 
 

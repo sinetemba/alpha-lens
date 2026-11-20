@@ -447,7 +447,7 @@ def _render_value_history(db: Session, portfolio_id: int) -> None:
             yaxis_tickprefix="R ", yaxis_tickformat=",.0f", hovermode="x unified",
             legend={"orientation": "h", "y": 1.1},
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         first, last = rows[0], rows[-1]
         change = last.total_value - first.total_value
         st.caption(
@@ -476,7 +476,7 @@ def _render_sector_allocation(db: Session, holdings: list) -> None:
             height=320, margin={"l": 10, "r": 10, "t": 10, "b": 10},
             showlegend=False,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         if "Unclassified" in sectors:
             st.caption(
                 "'Unclassified' = holdings whose sector hasn't been fetched yet "
@@ -533,7 +533,7 @@ def _render_transaction_history(db: Session, portfolio_id: int) -> None:
         # Price per row: a penny-stock trade (R0.0085) must not show as R0.01.
         st.dataframe(
             style_price_columns(table.style, table, "Price", price_cols=("Price",)),
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
             column_config={
                 "Qty": st.column_config.NumberColumn(format="%g"),
                 "Price": st.column_config.NumberColumn(),
@@ -672,7 +672,7 @@ def _render_holdings_table(
         )
         st.dataframe(
             styled_table,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol and company name."),
@@ -797,7 +797,7 @@ def _render_easyequities_debug(
                 "Reason if excluded": "; ".join(reasons),
             })
 
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Raw EasyEquities total", f"R {raw_total:,.2f}")
