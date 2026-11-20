@@ -12,6 +12,7 @@ from app.collectors.twelve_data import TwelveDataCollector
 from app.collectors.yfinance import YFinanceCollector
 from app.scrapers.news import NewsScraper
 from app.analytics.technical_indicators import TechnicalIndicators
+from app.utils.formatting import format_price
 from loguru import logger
 from typing import List, Optional, Dict
 
@@ -337,8 +338,8 @@ class DataService:
                     notification_type="system",
                     title=f"Large price move accepted: {symbol}",
                     message=(
-                        f"{symbol} closed at R {close:.2f} on {timestamp:%Y-%m-%d} vs the previous "
-                        f"close of R {prev_close:.2f} - implausible on its own but corroborated by "
+                        f"{symbol} closed at {format_price(close)} on {timestamp:%Y-%m-%d} vs the previous "
+                        f"close of {format_price(prev_close)} - implausible on its own but corroborated by "
                         "the alternate data source. Possibly a market crash or corporate action "
                         "(split/consolidation). Historical bars are NOT adjusted for corporate actions."
                     ),
@@ -349,8 +350,8 @@ class DataService:
                     notification_type="system",
                     title=f"Suspicious price rejected: {symbol}",
                     message=(
-                        f"{symbol} reported a close of R {close:.2f} on {timestamp:%Y-%m-%d} vs the "
-                        f"previous close of R {prev_close:.2f} and it was not corroborated by the "
+                        f"{symbol} reported a close of {format_price(close)} on {timestamp:%Y-%m-%d} vs the "
+                        f"previous close of {format_price(prev_close)} and it was not corroborated by the "
                         "alternate data source, so it was rejected. Prices for this symbol may "
                         "appear frozen until a plausible close arrives - check for a ticker "
                         "change, delisting or corporate action."
@@ -853,7 +854,7 @@ class DataService:
                         if any(day == ex_date.date() for day, _ in existing_by_key):
                             logger.info(
                                 f"{symbol}: storing additional same-day dividend "
-                                f"R {amount_rand:.2f} on {ex_date:%Y-%m-%d} "
+                                f"{format_price(amount_rand)} on {ex_date:%Y-%m-%d} "
                                 "(special/other payment sharing an ex-date)"
                             )
 
@@ -909,7 +910,7 @@ class DataService:
                     if any(day == ex_date.date() for day, _ in existing_by_key):
                         logger.info(
                             f"{symbol}: storing additional same-day dividend "
-                            f"R {amount_rand:.2f} on {ex_date:%Y-%m-%d} "
+                            f"{format_price(amount_rand)} on {ex_date:%Y-%m-%d} "
                             "(special/other payment sharing an ex-date)"
                         )
 

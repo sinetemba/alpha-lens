@@ -106,6 +106,28 @@ def test_price_increase_alert(db_session, monkeypatch):
     assert "Price Increase Alert" in note.title
 
 
+def test_penny_price_alert_keeps_sub_rand_decimals(db_session, monkeypatch):
+    """A R0.0085 move used to read "Previous: R 0.01, Current: R 0.01"."""
+    _seed_stock_and_watchlist(
+        db_session, symbol="SKA",
+        notify_price_increase=True, price_change_threshold=10.0, target_price=0.009,
+    )
+    stock_id = db_session.query(Stock).filter_by(symbol="SKA").first().id
+    for day, close in ((14, 0.0075), (15, 0.0095)):
+        db_session.add(StockPrice(
+            stock_id=stock_id, symbol="SKA", close_price=close,
+            timestamp=datetime(2024, 1, day, 10, 0, 0, tzinfo=timezone.utc),
+        ))
+    db_session.commit()
+
+    _service(db_session, monkeypatch).check_price_alerts()
+
+    notes = {n.title.split(":")[0]: n.message
+             for n in db_session.query(Notification).filter_by(stock_symbol="SKA")}
+    assert "Previous: R 0.0075, Current: R 0.0095" in notes["Price Increase Alert"]
+    assert "target price of R 0.0090. Current price: R 0.0095" in notes["Target Price Reached"]
+
+
 def test_rsi_overbought_alert(db_session, monkeypatch):
     _seed_stock_and_watchlist(db_session)
     price = StockPrice(

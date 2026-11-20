@@ -10,6 +10,7 @@ from app.models.watchlist import WatchlistItem
 # the headless updater (importing app.dashboard.home would drag Streamlit and a
 # ThreadPoolExecutor into that process).
 from app.services.price_queries import get_latest_and_previous_prices
+from app.utils.formatting import format_price
 from app.config.settings import settings
 from loguru import logger
 import json
@@ -238,7 +239,7 @@ class NotificationService:
                 self.create_notification(
                     notification_type="price",
                     title=f"Target Price Reached: {item.symbol}",
-                    message=f"{item.symbol} has reached your target price of R {item.target_price:.2f}. Current price: R {current_price:.2f}",
+                    message=f"{item.symbol} has reached your target price of {format_price(item.target_price)}. Current price: {format_price(current_price)}",
                     stock_symbol=item.symbol,
                     metadata={"target_price": item.target_price, "current_price": current_price}
                 )
@@ -248,7 +249,7 @@ class NotificationService:
                 self.create_notification(
                     notification_type="price",
                     title=f"Stop Loss Triggered: {item.symbol}",
-                    message=f"{item.symbol} has hit your stop loss at R {item.stop_loss:.2f}. Current price: R {current_price:.2f}",
+                    message=f"{item.symbol} has hit your stop loss at {format_price(item.stop_loss)}. Current price: {format_price(current_price)}",
                     stock_symbol=item.symbol,
                     metadata={"stop_loss": item.stop_loss, "current_price": current_price}
                 )
@@ -261,7 +262,7 @@ class NotificationService:
                     self.create_notification(
                         notification_type="price",
                         title=f"Price Increase Alert: {item.symbol}",
-                        message=f"{item.symbol} has increased by {change_pct:.2f}%. Previous: R {prev.close_price:.2f}, Current: R {current_price:.2f}",
+                        message=f"{item.symbol} has increased by {change_pct:.2f}%. Previous: {format_price(prev.close_price)}, Current: {format_price(current_price)}",
                         stock_symbol=item.symbol,
                         metadata={"change_percentage": change_pct}
                     )
@@ -270,7 +271,7 @@ class NotificationService:
                     self.create_notification(
                         notification_type="price",
                         title=f"Price Decrease Alert: {item.symbol}",
-                        message=f"{item.symbol} has decreased by {abs(change_pct):.2f}%. Previous: R {prev.close_price:.2f}, Current: R {current_price:.2f}",
+                        message=f"{item.symbol} has decreased by {abs(change_pct):.2f}%. Previous: {format_price(prev.close_price)}, Current: {format_price(current_price)}",
                         stock_symbol=item.symbol,
                         metadata={"change_percentage": change_pct}
                     )

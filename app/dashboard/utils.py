@@ -178,18 +178,9 @@ def style_gain_loss_row(row: pd.Series) -> list[str]:
     return [f"background-color: {color}; color: #1f2937"] * len(row)
 
 
-# Prices below this are shown with 4 decimals - "R 0.01" for a R0.0085
-# penny stock hides the price entirely.
-SUB_RAND = 1.0
-
-
-def format_price(value: Optional[float], na: str = "N/A") -> str:
-    """Per-share Rand price: 2 decimals, or 4 for sub-Rand prices."""
-    if value is None or pd.isna(value):
-        return na
-    if 0 < abs(value) < SUB_RAND:
-        return f"R {value:,.4f}"
-    return f"R {value:,.2f}"
+# Defined in the Streamlit-free app.utils.formatting so alert messages built
+# by the headless updater use the same rules; re-exported for dashboard code.
+from app.utils.formatting import SUB_RAND, format_price  # noqa: E402,F401
 
 
 def format_price_cell(
