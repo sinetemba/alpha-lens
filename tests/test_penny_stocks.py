@@ -393,3 +393,51 @@ def test_price_chart_short_history_skips_unwarmed_sma():
     from app.dashboard.penny_stocks import _price_chart
     row = _summarise_symbol(_bars([1_000] * 40), "Y.JO", "Y")
     assert [t.name for t in _price_chart(row).data] == ["Close", "SMA-20"]
+
+
+# --- SA public holidays in staleness ---------------------------------------
+
+from datetime import date
+
+
+@pytest.mark.parametrize("year, easter", [
+    (2022, date(2022, 4, 17)), (2025, date(2025, 4, 20)),
+    (2026, date(2026, 4, 5)), (2027, date(2027, 3, 28)),
+])
+def test_easter(year, easter):
+    from app.services.penny_scan import _easter_sunday
+    assert _easter_sunday(year) == easter
+
+
+def test_sa_holidays_2026():
+    from app.services.penny_scan import sa_public_holidays
+    assert sorted(sa_public_holidays(2026)) == [
+        date(2026, 1, 1), date(2026, 4, 3), date(2026, 4, 6), date(2026, 4, 27),
+        date(2026, 5, 1), date(2026, 6, 16),
+        date(2026, 8, 10),  # Women's Day 9 Aug is a Sunday -> Monday
+        date(2026, 9, 24), date(2026, 12, 16), date(2026, 12, 25),
+    ]  # 21 Mar and 26 Dec fall on Saturdays: no substitute day
+
+
+def test_sunday_christmas_does_not_cascade():
+    from app.services.penny_scan import sa_public_holidays
+    dec = sorted(d for d in sa_public_holidays(2022) if d.month == 12)
+    assert dec == [date(2022, 12, 16), date(2022, 12, 26)]
+
+
+def test_staleness_skips_public_holidays():
+    # Last trade Tue 15 Dec 2026; 16 Dec (Reconciliation) is closed, so by
+    # Thu 17 Dec only one session (the 16th doesn't count) has passed.
+    row = _scan_row("2026-12-17", "2026-12-15")
+    _apply_staleness([row])
+    assert row["sessions_since_trade"] == 1
+    # Across Christmas: Thu 24 Dec -> Mon 28 Dec counts only the 24th itself
+    xmas = _scan_row("2026-12-28", "2026-12-24")
+    _apply_staleness([xmas])
+    assert xmas["sessions_since_trade"] == 1  # 25 Dec holiday, 26-27 weekend
+
+
+def test_staleness_spans_new_year():
+    row = _scan_row("2027-01-04", "2026-12-31")  # 1 Jan holiday, then weekend
+    _apply_staleness([row])
+    assert row["sessions_since_trade"] == 1

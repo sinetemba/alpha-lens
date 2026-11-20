@@ -6,7 +6,8 @@ PENNY_PRICE_LIMIT gets stats and a heuristic potential score. The Penny
 Stocks page caches scan_penny_stocks(); the daily historical job calls
 run_near_low_alerts() to raise "near 52-week low" notifications.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Optional
 
 import numpy as np
@@ -272,16 +273,67 @@ def _apply_staleness(results: list) -> None:
     zero-volume bars. A row that didn't trade on that session has no real
     day change - its 0% (or a move from an older session) would read as a
     live quote, so day_change becomes None. sessions_since_trade counts
-    weekdays (JSE holidays aren't modelled); None = no trade in the year.
+    JSE trading days (weekdays minus SA public holidays); None = no trade
+    in the year.
     """
     if not results:
         return
     market_day = max(r["dates"][-1] for r in results)
     for r in results:
         last = r.get("last_trade")
-        r["sessions_since_trade"] = int(np.busday_count(last, market_day)) if last else None
+        r["sessions_since_trade"] = (
+            int(np.busday_count(last, market_day, holidays=_holidays_between(last, market_day)))
+            if last else None
+        )
         if last != market_day:
             r["day_change"] = None
+
+
+# Fixed-date South African public holidays (Public Holidays Act 36 of 1994);
+# the JSE is closed on all of them. Good Friday and Family Day move with
+# Easter. One-off proclaimed days (election days, e.g.) aren't modelled -
+# they can only over-count by one session.
+_SA_FIXED_HOLIDAYS = (
+    (1, 1), (3, 21), (4, 27), (5, 1), (6, 16), (8, 9), (9, 24), (12, 16), (12, 25), (12, 26),
+)
+
+
+def _easter_sunday(year: int) -> date:
+    """Gregorian Easter (anonymous Gregorian / Meeus-Jones-Butcher algorithm)."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = (h + l - 7 * m + 114) % 31 + 1
+    return date(year, month, day)
+
+
+@lru_cache(maxsize=None)
+def sa_public_holidays(year: int) -> frozenset:
+    """JSE-closed weekdays from South African public holidays in `year`.
+
+    A holiday on a Sunday makes the following Monday a holiday (s2(1) of
+    the Act) - unless that Monday already is one (Christmas on a Sunday:
+    the 26th is Day of Goodwill either way, no third day).
+    """
+    days = {date(year, m, d) for m, d in _SA_FIXED_HOLIDAYS}
+    easter = _easter_sunday(year)
+    days |= {easter - timedelta(days=2), easter + timedelta(days=1)}  # Good Friday, Family Day
+    for day in sorted(days):
+        if day.weekday() == 6:
+            days.add(day + timedelta(days=1))
+    return frozenset(d for d in days if d.weekday() < 5)
+
+
+def _holidays_between(start: str, end: str) -> list:
+    """Holiday dates for every year spanned by two YYYY-MM-DD strings."""
+    first, last = int(start[:4]), int(end[:4])
+    return sorted(d for y in range(first, last + 1) for d in sa_public_holidays(y))
 
 
 def is_stale(row: dict) -> bool:
