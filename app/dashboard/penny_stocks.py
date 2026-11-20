@@ -79,12 +79,15 @@ def show_penny_stocks(db: Session):
             st.rerun()
 
     with st.spinner("Scanning JSE penny stocks via Yahoo Finance..."):
-        results, scanned_at, scan_error = _scan_penny_stocks(extra_symbols)
+        results, scanned_at, scan_error, missing = _scan_penny_stocks(extra_symbols)
 
     for row in results:
         row["name"] = db_stocks.get(row["symbol"]) or JSE_PENNY_CANDIDATES.get(row["symbol"]) or row["symbol"]
 
-    st.caption(f"Scanned at {_to_display_tz(scanned_at).strftime('%d %b %Y %H:%M')} SAST")
+    st.caption(
+        f"Scanned at {_to_display_tz(scanned_at).strftime('%d %b %Y %H:%M')} SAST"
+        + ("" if scan_error else _coverage_text(len(JSE_PENNY_CANDIDATES) + len(extra_symbols), missing))
+    )
 
     if scan_error:
         st.warning(f"The penny-stock scan failed ({scan_error}) - try Rescan later.")
@@ -186,6 +189,16 @@ def show_penny_stocks(db: Session):
         st.caption("Click a row to view projections, influences and news.")
 
 
+
+
+def _coverage_text(requested: int, missing: list, shown: int = 8) -> str:
+    """ · 118 of 121 symbols returned data (no data: X, Y, Z)."""
+    text = f" · {requested - len(missing)} of {requested} symbols returned data"
+    if missing:
+        names = ", ".join(missing[:shown])
+        more = f" +{len(missing) - shown} more" if len(missing) > shown else ""
+        text += f" (no data: {names}{more})"
+    return text
 
 
 @st.cache_data(ttl=SCAN_TTL_SECONDS, show_spinner=False)

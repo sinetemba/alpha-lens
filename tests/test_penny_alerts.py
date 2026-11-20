@@ -101,7 +101,7 @@ def test_run_scans_and_alerts(db_session, monkeypatch):
 
     def fake_scan(extra):
         scanned["extra"] = extra
-        return [_row("GPL", price=1.40), _row("HUG", price=2.40, low=0.85)], None, None
+        return [_row("GPL", price=1.40), _row("HUG", price=2.40, low=0.85)], None, None, []
     monkeypatch.setattr(penny_scan, "scan_penny_stocks", fake_scan)
 
     assert run_near_low_alerts(db_session) == 1
@@ -113,6 +113,6 @@ def test_run_scans_and_alerts(db_session, monkeypatch):
 def test_run_raises_on_scan_failure(db_session, monkeypatch):
     monkeypatch.setattr(penny_scan, "settings", SimpleNamespace(
         penny_low_alert_enabled=True, yfinance_enabled=True, penny_low_alert_pct=10.0))
-    monkeypatch.setattr(penny_scan, "scan_penny_stocks", lambda extra: ([], None, "Yahoo down"))
+    monkeypatch.setattr(penny_scan, "scan_penny_stocks", lambda extra: ([], None, "Yahoo down", []))
     with pytest.raises(RuntimeError, match="Yahoo down"):
         run_near_low_alerts(db_session)

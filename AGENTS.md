@@ -147,6 +147,10 @@ is announced so they can subscribe during the offer window (before listing day).
   `JSE_PENNY_CANDIDATES` + `scannable_db_stocks`, 1y bars + dividends). The
   Penny Stocks page only caches it (`_scan_penny_stocks`, 30 min) and renders.
   Keep Streamlit out of `penny_scan.py` - the updater imports it.
+- `JSE_PENNY_CANDIDATES` (82) = JSE equities that traded below R10 in the
+  year to 2026-11-20, from probing ~290 tickers on Yahoo (202 had data). The
+  scan returns `missing` (symbols with no usable history) and logs them; the
+  page caption shows "N of M symbols returned data". Re-probe roughly yearly.
 - `run_near_low_alerts` runs at the end of the daily historical job (so it
   gets the catch-up after sleep; a failure only logs a warning). Rows that
   are not stale and close within `PENNY_LOW_ALERT_PCT` (default 10) of their

@@ -189,6 +189,20 @@ def test_trailing_yield_uses_cents_scale():
     assert _trailing_dividend_yield(_frame(divs), 1.34) == pytest.approx(17.91, abs=0.01)
 
 
+def test_trailing_yield_handles_rand_denominated_dividends():
+    """Yahoo mixes units per ticker: the same payout served in Rand must
+    give the same yield as cents - a blanket /100 understates it 100x."""
+    divs = [0.0] * 365
+    divs[100], divs[250] = 0.08, 0.16  # R0.08 + R0.16 on a R1.34 share
+    assert _trailing_dividend_yield(_frame(divs), 1.34) == pytest.approx(17.91, abs=0.01)
+
+
+def test_trailing_yield_only_counts_the_last_365_days():
+    divs = [0.0] * 400
+    divs[0], divs[300] = 40.0, 8.0  # the 40c payment is >365 days back
+    assert _trailing_dividend_yield(_frame(divs), 1.34) == pytest.approx(5.97, abs=0.01)
+
+
 def test_trailing_yield_zero_unknown_and_implausible():
     assert _trailing_dividend_yield(_frame([0.0] * 30), 1.34) == 0.0
     assert _trailing_dividend_yield(pd.DataFrame({"Close": [1.0]}, index=[pd.Timestamp("2026-01-01")]), 1.0) is None
@@ -240,3 +254,47 @@ def test_fundamentals_flag_loss_makers_and_reject_junk():
 ])
 def test_format_rand_compact(value, expected):
     assert _format_rand_compact(value) == expected
+
+
+# --- scan coverage ---------------------------------------------------------
+
+def test_scan_reports_symbols_without_usable_history(monkeypatch):
+    """yf.download silently drops failures; the scan must name them."""
+    from app.services import penny_scan
+
+    n = 60
+    idx = pd.bdate_range("2026-01-01", periods=n)
+
+    def frame(rows, close=200.0):
+        values = [close] * rows + [float("nan")] * (n - rows)
+        return pd.DataFrame({"Open": values, "High": values, "Low": values, "Close": values,
+                             "Volume": [100_000] * n, "Dividends": [0.0] * n}, index=idx)
+
+    data = pd.concat(
+        {"AAA.JO": frame(n), "BBB.JO": frame(10), "DDD.JO": frame(n, close=900.0)}, axis=1
+    )  # CCC absent entirely; BBB too short; DDD fine but above R5
+    monkeypatch.setattr(penny_scan, "JSE_PENNY_CANDIDATES", {"AAA": "A", "BBB": "B"})
+    monkeypatch.setattr(penny_scan.yf, "download", lambda *a, **k: data)
+
+    results, _, error, missing = penny_scan.scan_penny_stocks(("CCC", "DDD"))
+    assert error is None
+    assert [r["symbol"] for r in results] == ["AAA"]
+    assert missing == ["BBB", "CCC"]  # DDD returned data, it's just not a penny stock
+
+
+def test_scan_failure_returns_empty_missing(monkeypatch):
+    from app.services import penny_scan
+
+    def boom(*a, **k):
+        raise ConnectionError("offline")
+    monkeypatch.setattr(penny_scan.yf, "download", boom)
+    results, _, error, missing = penny_scan.scan_penny_stocks(())
+    assert results == [] and missing == [] and "offline" in error
+
+
+def test_coverage_text():
+    from app.dashboard.penny_stocks import _coverage_text
+    assert _coverage_text(82, []) == " · 82 of 82 symbols returned data"
+    assert _coverage_text(5, ["X", "Y"]) == " · 3 of 5 symbols returned data (no data: X, Y)"
+    many = [f"S{i}" for i in range(10)]
+    assert _coverage_text(90, many).endswith("(no data: S0, S1, S2, S3, S4, S5, S6, S7 +2 more)")

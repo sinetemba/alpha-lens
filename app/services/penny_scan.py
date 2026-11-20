@@ -39,48 +39,93 @@ LIQUIDITY_PENALTIES = ((10_000, 30), (100_000, 15))
 # A trailing yield above this is a cents/Rand unit glitch, not a real payout.
 DIVIDEND_YIELD_CEILING = 50.0
 
-# JSE-listed small caps and penny stocks that frequently trade below R5.
-# The live scan still filters by actual price, so listings that have moved
-# above the threshold simply drop off the grid. Symbols that no longer
-# resolve on Yahoo Finance are skipped silently.
+# JSE equities that traded below R10 at some point in the year to 2026-11-20
+# (R10, not R5, leaves headroom for names drifting down towards the
+# threshold). Built by probing ~290 JSE tickers on Yahoo: 202 had data, 82
+# met the price test. The live scan still filters by the actual price, so
+# a listing above R5 today just doesn't show. Re-probe once a year or so -
+# the scan logs symbols that stop returning data.
 JSE_PENNY_CANDIDATES = {
     "ACL": "ArcelorMittal South Africa",
+    "ACT": "AfroCentric Investment Corporation",
     "ADR": "Adcorp Holdings",
     "AEG": "Aveng",
+    "AFH": "Alexander Forbes Group Holdings",
+    "AON": "African and Overseas Enterprises",
     "APF": "Accelerate Property Fund",
-    "ART": "Argent Industrial",
+    "AXX": "Araxi",
     "BAT": "Brait",
+    "BIK": "Brikor",
     "BLU": "Blue Label Telecoms",
+    "BRN": "Brimstone Investment Corporation",
+    "BRT": "Brimstone Investment Corporation (N)",
+    "BTN": "Burstone Group",
+    "CCD": "Cell C Holdings",
+    "CGR": "Calgro M3 Holdings",
+    "CHP": "Choppies Enterprises",
+    "CKS": "Crookes Brothers",
     "CLH": "City Lodge Hotels",
+    "CPR": "Copper 360",
+    "CVW": "Castleview Property Fund",
+    "DIB": "Dipula Properties",
+    "DLT": "Delta Property Fund",
+    "DNB": "Deneb Investments",
+    "EEL": "Efora Energy",
     "EMH": "eMedia Holdings",
-    "EMI": "Emira Property Fund",
-    "EQU": "Equites Property Fund",
+    "EMN": "eMedia Holdings (N)",
+    "ENX": "enX Group",
+    "EPE": "EPE Capital Partners",
+    "EUZ": "Europa Metals",
+    "EXP": "Exemplar REITail",
     "FGL": "Finbond Group",
+    "FTB": "Fairvest",
+    "GML": "Gemfields Group",
     "GPL": "Grand Parade Investments",
-    "HMN": "Hammerson",
+    "GTC": "Globe Trade Centre",
+    "HET": "Heriot REIT",
+    "HLM": "Hulamin",
     "HUG": "Huge Group",
     "ISA": "ISA Holdings",
+    "ISB": "Insimbi Industrial Holdings",
+    "ITE": "Italtile",
+    "KAP": "KAP",
+    "LAB": "Labat Africa",
     "LBR": "Libstar",
     "LTE": "Lighthouse Properties",
     "MRF": "Merafe Resources",
-    "MST": "Mustek",
     "MTA": "Metair Investments",
-    "NPK": "Nampak",
     "NVS": "Niveus Investments",
-    "OCT": "Octodec Investments",
-    "PAN": "Pan African Resources",
+    "OAO": "Oando",
     "PMV": "Primeserv Group",
+    "PPC": "PPC",
     "PPE": "Purple Group",
+    "PPR": "Putprop",
+    "QFH": "Quantum Foods Holdings",
+    "RCL": "RCL Foods",
     "RDF": "Redefine Properties",
     "RMH": "RMB Holdings",
     "RNG": "Renergen",
+    "RTO": "Rex Trueform Group",
     "SAC": "SA Corporate Real Estate",
+    "SAP": "Sappi",
+    "SEB": "Sebata Holdings",
     "SEP": "Sephaku Holdings",
+    "SHC": "Shaftesbury Capital",
+    "SKA": "Shuka Minerals",
     "SNV": "Santova",
+    "SOH": "South Ocean Holdings",
     "SSK": "Stefanutti Stocks",
+    "SSU": "Southern Sun",
+    "TEX": "Texton Property Fund",
+    "TLM": "TeleMasters Holdings",
+    "TMT": "Trematon Capital Investments",
     "TRL": "Trellidor",
     "TSG": "Tsogo Sun",
+    "TTO": "Trustco Group Holdings",
+    "UPL": "Universal Partners",
+    "VIS": "Visual International Holdings",
     "VUN": "Vunani",
+    "WEZ": "Wesizwe Platinum",
     "YRK": "York Timber",
     "ZED": "Zeder Investments",
 }
@@ -122,8 +167,11 @@ def extra_scan_symbols(db_stocks: dict) -> tuple:
 def scan_penny_stocks(extra_symbols: tuple = ()) -> tuple:
     """Batch-download 1y daily history for all candidates and score those below the threshold.
 
-    Returns (results, scanned_at, error) so the page can distinguish "no
-    candidates" from "the scan itself failed".
+    Returns (results, scanned_at, error, missing): error distinguishes "the
+    scan itself failed" from "no candidates"; missing lists the requested
+    symbols Yahoo returned no usable history for (absent, all-NaN or under
+    MIN_HISTORY_ROWS bars) - yf.download drops those silently, so without
+    this a dead ticker just vanishes.
     """
     symbols = sorted(set(JSE_PENNY_CANDIDATES) | set(extra_symbols))
     scanned_at = datetime.now(timezone.utc)
@@ -144,20 +192,38 @@ def scan_penny_stocks(extra_symbols: tuple = ()) -> tuple:
         )
     except Exception as e:
         logger.error(f"Penny stock scan failed: {e}")
-        return [], scanned_at, str(e)
+        return [], scanned_at, str(e), []
 
     if data is None or data.empty:
-        return [], scanned_at, "Yahoo Finance returned no data"
+        return [], scanned_at, "Yahoo Finance returned no data", []
 
     results = []
+    missing = []
     for symbol in symbols:
+        if not _has_history(data, f"{symbol}.JO"):
+            missing.append(symbol)
+            continue
         stats = _summarise_symbol(data, f"{symbol}.JO", symbol)
         if stats:
             results.append(stats)
 
+    if missing:
+        logger.warning(
+            f"Penny scan: no usable Yahoo data for {len(missing)}/{len(symbols)} "
+            f"symbols: {', '.join(missing)}"
+        )
     _apply_staleness(results)
     results.sort(key=lambda r: r["score"], reverse=True)
-    return results, scanned_at, None
+    return results, scanned_at, None, missing
+
+
+def _has_history(data: pd.DataFrame, yf_symbol: str) -> bool:
+    """True when the batch download holds MIN_HISTORY_ROWS+ closes for the symbol."""
+    try:
+        frame = data[yf_symbol] if isinstance(data.columns, pd.MultiIndex) else data
+        return int(frame["Close"].notna().sum()) >= MIN_HISTORY_ROWS
+    except (KeyError, TypeError):
+        return False
 
 
 def _last_trade_date(volume: pd.Series) -> Optional[str]:
@@ -312,14 +378,21 @@ def _sane_high_low(df: pd.DataFrame) -> tuple:
 def _trailing_dividend_yield(df: pd.DataFrame, price: float) -> Optional[float]:
     """Dividends paid over the last 365 days as a % of the current price.
 
-    Yahoo reports JSE dividends in the same unit as the close (ZAc), so they
-    share JSE_PRICE_SCALE. None = unknown (no Dividends column, or an
-    implausible yield that signals a unit mismatch); 0.0 = paid nothing.
+    Yahoo reports .JO OHLC in cents (ZAc) but dividends in cents for some
+    tickers and Rand for others, so a blanket conversion is wrong - each
+    payment is unit-checked against its own day's close, the same rule as
+    DataService._dividend_amount_rand: a dividend larger than half the share
+    price was served in cents and is rescaled. None = unknown (no Dividends
+    column, or an implausible yield that still signals a unit mismatch);
+    0.0 = paid nothing.
     """
-    if "Dividends" not in df.columns or not price:
+    if "Dividends" not in df.columns or not price or df.empty:
         return None
     cutoff = df.index[-1] - pd.Timedelta(days=365)
-    paid = float(df.loc[df.index > cutoff, "Dividends"].fillna(0).sum()) / JSE_PRICE_SCALE
+    window = df.loc[df.index > cutoff, ["Close", "Dividends"]].dropna(subset=["Close"])
+    close_rand = window["Close"] / JSE_PRICE_SCALE
+    divs = window["Dividends"].fillna(0)
+    paid = float(divs.where(divs <= close_rand * 0.5, divs / JSE_PRICE_SCALE).sum())
     if paid <= 0:
         return 0.0
     yield_pct = paid / price * 100
@@ -454,7 +527,7 @@ def run_near_low_alerts(db: Session) -> int:
     if not settings.penny_low_alert_enabled or not settings.yfinance_enabled:
         return 0
     db_stocks = scannable_db_stocks(db)
-    results, _, error = scan_penny_stocks(extra_scan_symbols(db_stocks))
+    results, _, error, _missing = scan_penny_stocks(extra_scan_symbols(db_stocks))
     if error:
         raise RuntimeError(f"penny scan failed: {error}")
     names = {**JSE_PENNY_CANDIDATES, **db_stocks}
