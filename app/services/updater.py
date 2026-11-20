@@ -7,8 +7,9 @@ Scheduler or a Windows Service wrapper.
 
 Schedule defaults (all Africa/Johannesburg):
 - 09:00, 13:00, 17:00 : stock prices + news
-- 18:00 daily          : historical prices + dividends (made up from the
-                         heartbeat if missed while the machine slept)
+- 18:00 daily          : historical prices + dividends + penny near-52w-low
+                         alerts (made up from the heartbeat if missed while
+                         the machine slept)
 - Sunday 02:00         : clean old news
 - every 7 days         : database backup (checked each minute, so a sleeping
                          machine catches up on wake - see services/backup.py)
@@ -532,6 +533,16 @@ class UpdaterService:
             except Exception as e:
                 db.rollback()
                 logger.warning(f"Dividend watch refresh failed: {e}")
+
+            # Near-52w-low penny alerts ride on this job so they run on the
+            # day's closes and inherit its catch-up after sleep. One batched
+            # Yahoo request; a failure here never fails the historical run.
+            try:
+                from app.services.penny_scan import run_near_low_alerts
+                run_near_low_alerts(db)
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"Penny near-52w-low alert check failed: {e}")
 
             logger.info(f"Daily historical update completed for {len(symbols)} symbols")
             if symbols and failed == len(symbols):

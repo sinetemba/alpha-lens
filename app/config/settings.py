@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     notification_discord_webhook_url: str = Field(default="", alias="NOTIFICATION_DISCORD_WEBHOOK_URL")
     notification_telegram_bot_token: str = Field(default="", alias="NOTIFICATION_TELEGRAM_BOT_TOKEN")
     notification_telegram_chat_id: str = Field(default="", alias="NOTIFICATION_TELEGRAM_CHAT_ID")
+    # Daily penny-stock scan (end of the historical job) alerts when a sub-R5
+    # share closes within this % of its 52-week low.
+    penny_low_alert_enabled: bool = Field(default=True, alias="PENNY_LOW_ALERT_ENABLED")
+    penny_low_alert_pct: float = Field(default=10.0, alias="PENNY_LOW_ALERT_PCT")
 
     # Streamlit Configuration
     streamlit_server_port: int = Field(default=8501, alias="STREAMLIT_SERVER_PORT")

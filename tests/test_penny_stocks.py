@@ -1,4 +1,4 @@
-"""Tests for the penny stock page's projection and fundamentals helpers."""
+"""Tests for the penny stock scan (services/penny_scan) and page helpers."""
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,17 +7,19 @@ import pytest
 
 from app.dashboard.penny_stocks import (
     _build_fundamentals,
+    _format_rand_compact,
+    _influences,
+    _trend_projection,
+)
+from app.services.penny_scan import (
     _apply_staleness,
     _drop_unit_glitches,
-    _is_stale,
     _last_trade_date,
-    _influences,
     _liquidity_penalty,
     _sane_high_low,
     _summarise_symbol,
-    _format_rand_compact,
     _trailing_dividend_yield,
-    _trend_projection,
+    is_stale as _is_stale,
 )
 
 

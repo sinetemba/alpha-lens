@@ -2,14 +2,12 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
-from datetime import datetime, timezone
+from datetime import datetime
 from sqlalchemy.orm import Session
 from typing import Optional
 from loguru import logger
 
-from app.analytics.technical_indicators import TechnicalIndicators
-from app.collectors.yfinance import JSE_PRICE_SCALE, YFinanceCollector
+from app.collectors.yfinance import YFinanceCollector
 from app.dashboard.company import _get_company_news
 from app.dashboard.utils import format_price, format_stock_label, style_price_columns, _to_display_tz, render_last_fetch_caption
 from app.models.news import NewsArticle
@@ -21,73 +19,27 @@ from app.models.portfolio import (
 )
 from app.models.stock import Stock
 from app.models.watchlist import WatchlistItem
+# The scan itself is Streamlit-free (the updater's near-52w-low alerts run it
+# too); this page caches it and renders the results.
+from app.services.penny_scan import (
+    JSE_PENNY_CANDIDATES,
+    LIQUIDITY_WINDOW,
+    MIN_HISTORY_ROWS,
+    PENNY_PRICE_LIMIT,
+    STALE_SESSIONS,
+    extra_scan_symbols,
+    is_stale,
+    scan_penny_stocks,
+    scannable_db_stocks,
+)
 
-PENNY_PRICE_LIMIT = 5.00
 TOP_N = 20
 SCAN_TTL_SECONDS = 1800
 PROJECTION_DAYS = 30
-MIN_HISTORY_ROWS = 30
 FUNDAMENTALS_TTL_SECONDS = 6 * 3600
 # Daily % move that alerts for stocks added to the watchlist from this page.
 # Penny stocks routinely move 5% a day; 10% keeps the alerts meaningful.
 WATCHLIST_MOVE_THRESHOLD = 10.0
-# Rows whose last trade is this many weekdays behind the market get the ⏸
-# marker - their Price is a stale close, not a live quote.
-STALE_SESSIONS = 5
-# Liquidity = median daily Rand value traded over the last N sessions (a
-# no-trade day counts as R0, so a mostly-dormant stock's median is ~0). Mean
-# is skewed by one-off block trades (ISA: R38k mean, R26 median).
-LIQUIDITY_WINDOW = 20
-# (minimum median R/day, score penalty) - checked in order.
-LIQUIDITY_PENALTIES = ((10_000, 30), (100_000, 15))
-# A trailing yield above this is a cents/Rand unit glitch, not a real payout.
-DIVIDEND_YIELD_CEILING = 50.0
-
-# JSE-listed small caps and penny stocks that frequently trade below R5.
-# The live scan still filters by actual price, so listings that have moved
-# above the threshold simply drop off the grid. Symbols that no longer
-# resolve on Yahoo Finance are skipped silently.
-JSE_PENNY_CANDIDATES = {
-    "ACL": "ArcelorMittal South Africa",
-    "ADR": "Adcorp Holdings",
-    "AEG": "Aveng",
-    "APF": "Accelerate Property Fund",
-    "ART": "Argent Industrial",
-    "BAT": "Brait",
-    "BLU": "Blue Label Telecoms",
-    "CLH": "City Lodge Hotels",
-    "EMH": "eMedia Holdings",
-    "EMI": "Emira Property Fund",
-    "EQU": "Equites Property Fund",
-    "FGL": "Finbond Group",
-    "GPL": "Grand Parade Investments",
-    "HMN": "Hammerson",
-    "HUG": "Huge Group",
-    "ISA": "ISA Holdings",
-    "LBR": "Libstar",
-    "LTE": "Lighthouse Properties",
-    "MRF": "Merafe Resources",
-    "MST": "Mustek",
-    "MTA": "Metair Investments",
-    "NPK": "Nampak",
-    "NVS": "Niveus Investments",
-    "OCT": "Octodec Investments",
-    "PAN": "Pan African Resources",
-    "PMV": "Primeserv Group",
-    "PPE": "Purple Group",
-    "RDF": "Redefine Properties",
-    "RMH": "RMB Holdings",
-    "RNG": "Renergen",
-    "SAC": "SA Corporate Real Estate",
-    "SEP": "Sephaku Holdings",
-    "SNV": "Santova",
-    "SSK": "Stefanutti Stocks",
-    "TRL": "Trellidor",
-    "TSG": "Tsogo Sun",
-    "VUN": "Vunani",
-    "YRK": "York Timber",
-    "ZED": "Zeder Investments",
-}
 
 
 def show_penny_stocks(db: Session):
@@ -108,35 +60,17 @@ def show_penny_stocks(db: Session):
         level, message = flash
         getattr(st, level)(message)
 
-    # Merge the curated list with active DB stocks so user-tracked small caps
-    # are scanned too. Index/forex symbols (containing '.' or '^') and
-    # synthetic pseudo-symbols (commodity rows like AV_*/XAU_*, which would
-    # resolve to nothing under a ".JO" suffix) are skipped.
-    # Symbols held only under non-JSE accounts (e.g. a bare "AAPL" from a USD
-    # holding) are not JSE tickers - scanning "<symbol>.JO" wastes a slot or
-    # worse, resolves a different instrument that shares the ticker.
-    holding_rows = db.query(PortfolioHolding.symbol, PortfolioHolding.account_type).all()
-    non_jse_symbols = {
-        h.symbol
-        for h in holding_rows
-        if not is_jse_tracked_account(h.account_type)
-    }
     # Symbols actually held (JSE-tracked, real accounts only) get a ★ in the
     # Stock column below.
     held_symbols = {
         h.symbol
-        for h in holding_rows
+        for h in db.query(PortfolioHolding.symbol, PortfolioHolding.account_type).all()
         if is_jse_tracked_account(h.account_type)
         and h.account_type not in EXCLUDED_ACCOUNT_TYPES
         and h.symbol not in EXCLUDED_PORTFOLIO_SYMBOLS
     }
-    db_stocks = {
-        s.symbol: s.name
-        for s in db.query(Stock).filter(Stock.is_active == True).all()
-        if s.symbol and "." not in s.symbol and "^" not in s.symbol and "_" not in s.symbol
-        and s.symbol not in non_jse_symbols
-    }
-    extra_symbols = tuple(sorted(s for s in db_stocks if s not in JSE_PENNY_CANDIDATES))
+    db_stocks = scannable_db_stocks(db)
+    extra_symbols = extra_scan_symbols(db_stocks)
 
     _, rescan_col = st.columns([3, 1])
     with rescan_col:
@@ -163,7 +97,7 @@ def show_penny_stocks(db: Session):
     top = results[:TOP_N]
     grid_df = pd.DataFrame([{
         "Stock": ("★ " if r["symbol"] in held_symbols else "")
-        + ("⏸ " if _is_stale(r) else "")
+        + ("⏸ " if is_stale(r) else "")
         + format_stock_label(r["symbol"], r["name"]),
         "Price": r["price"],
         "Day %": r["day_change"],
@@ -239,7 +173,7 @@ def show_penny_stocks(db: Session):
         },
     )
 
-    if any(_is_stale(r) for r in top):
+    if any(is_stale(r) for r in top):
         st.caption(
             f"⏸ = no trade in the last {STALE_SESSIONS}+ sessions - the price shown is "
             "the last close, not a live quote."
@@ -252,255 +186,12 @@ def show_penny_stocks(db: Session):
         st.caption("Click a row to view projections, influences and news.")
 
 
+
+
 @st.cache_data(ttl=SCAN_TTL_SECONDS, show_spinner=False)
 def _scan_penny_stocks(extra_symbols: tuple) -> tuple:
-    """Batch-download 1y daily history for all candidates and score those below the threshold.
-
-    Returns (results, scanned_at, error) so the page can distinguish "no
-    candidates" from "the scan itself failed".
-    """
-    symbols = sorted(set(JSE_PENNY_CANDIDATES) | set(extra_symbols))
-    scanned_at = datetime.now(timezone.utc)
-
-    try:
-        data = yf.download(
-            [f"{s}.JO" for s in symbols],
-            period="1y",
-            interval="1d",
-            group_by="ticker",
-            threads=True,
-            progress=False,
-            auto_adjust=True,
-            # Dividends ride along in the same request - used for the
-            # trailing yield (Yahoo's own dividendYield field is unreliable
-            # for JSE listings).
-            actions=True,
-        )
-    except Exception as e:
-        logger.error(f"Penny stock scan failed: {e}")
-        return [], scanned_at, str(e)
-
-    if data is None or data.empty:
-        return [], scanned_at, "Yahoo Finance returned no data"
-
-    results = []
-    for symbol in symbols:
-        stats = _summarise_symbol(data, f"{symbol}.JO", symbol)
-        if stats:
-            results.append(stats)
-
-    _apply_staleness(results)
-    results.sort(key=lambda r: r["score"], reverse=True)
-    return results, scanned_at, None
-
-
-def _last_trade_date(volume: pd.Series) -> Optional[str]:
-    """Date (YYYY-MM-DD) of the last bar with volume, or None if none traded."""
-    traded = volume[volume > 0]
-    return traded.index[-1].strftime("%Y-%m-%d") if len(traded) else None
-
-
-def _apply_staleness(results: list) -> None:
-    """Stamp sessions_since_trade and blank Day % for rows that didn't trade.
-
-    The market's latest session is the newest bar across the whole scan, so
-    a symbol Yahoo stopped serving bars for is caught too, not just one with
-    zero-volume bars. A row that didn't trade on that session has no real
-    day change - its 0% (or a move from an older session) would read as a
-    live quote, so day_change becomes None. sessions_since_trade counts
-    weekdays (JSE holidays aren't modelled); None = no trade in the year.
-    """
-    if not results:
-        return
-    market_day = max(r["dates"][-1] for r in results)
-    for r in results:
-        last = r.get("last_trade")
-        r["sessions_since_trade"] = int(np.busday_count(last, market_day)) if last else None
-        if last != market_day:
-            r["day_change"] = None
-
-
-def _is_stale(row: dict) -> bool:
-    """No trade in the last STALE_SESSIONS weekdays (or none all year)."""
-    if "sessions_since_trade" not in row:
-        return False  # pre-staleness cached scan result
-    sessions = row["sessions_since_trade"]
-    return sessions is None or sessions >= STALE_SESSIONS
-
-
-def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Optional[dict]:
-    """Compute stats and a potential score for one ticker from the batch download."""
-    try:
-        df = data[yf_symbol].dropna(subset=["Close"]) if isinstance(data.columns, pd.MultiIndex) else data.dropna(subset=["Close"])
-    except (KeyError, TypeError):
-        return None
-
-    if df is None:
-        return None
-    df = _drop_unit_glitches(df)
-    if len(df) < MIN_HISTORY_ROWS:
-        return None
-
-    # Yahoo reports JSE prices in cents (ZAc); convert to Rand.
-    close = df["Close"] / JSE_PRICE_SCALE
-    high, low = _sane_high_low(df)
-    high, low = high / JSE_PRICE_SCALE, low / JSE_PRICE_SCALE
-    volume = df["Volume"].fillna(0)
-
-    current = float(close.iloc[-1])
-    if not (0 < current < PENNY_PRICE_LIMIT):
-        return None
-
-    prev = float(close.iloc[-2]) if len(close) > 1 else current
-    low_52w = float(low.min())
-    high_52w = float(high.max())
-    close_3m = float(close.iloc[-63]) if len(close) >= 63 else float(close.iloc[0])
-
-    rsi = _last(TechnicalIndicators.calculate_rsi(close))
-    macd_data = TechnicalIndicators.calculate_macd(close)
-    macd_val = _last(macd_data["macd"])
-    macd_sig = _last(macd_data["signal"])
-    macd_hist = _last(macd_data["histogram"])
-    sma_20 = _last(close.rolling(20).mean())
-    sma_50 = _last(close.rolling(50).mean())
-    vol_recent = float(volume.tail(10).mean())
-    vol_base = float(volume.tail(60).mean())
-    traded_value = float((volume * close).tail(LIQUIDITY_WINDOW).median())
-    zero_volume_days = int((volume.tail(LIQUIDITY_WINDOW) == 0).sum())
-    liquidity_penalty = _liquidity_penalty(traded_value)
-
-    score = _potential_score(
-        rsi=rsi, macd=macd_val, macd_signal=macd_sig, macd_hist=macd_hist,
-        close=current, sma_20=sma_20, sma_50=sma_50,
-        mom_3m=((current - close_3m) / close_3m * 100) if close_3m else 0.0,
-        vol_recent=vol_recent, vol_base=vol_base,
-    )
-    # A great chart is worthless if you can't get out of the position.
-    score = max(0, score - liquidity_penalty)
-
-    return {
-        "symbol": symbol,
-        "price": current,
-        "day_change": ((current - prev) / prev * 100) if prev else 0.0,
-        "low_52w": low_52w,
-        "high_52w": high_52w,
-        "off_low": ((current - low_52w) / low_52w * 100) if low_52w else 0.0,
-        "off_high": ((current - high_52w) / high_52w * 100) if high_52w else 0.0,
-        "rsi": rsi,
-        "macd": macd_val,
-        "macd_signal": macd_sig,
-        "macd_hist": macd_hist,
-        "sma_20": sma_20,
-        "sma_50": sma_50,
-        "mom_3m": ((current - close_3m) / close_3m * 100) if close_3m else 0.0,
-        "vol_recent": vol_recent,
-        "vol_base": vol_base,
-        # Yahoo forward-fills no-trade days as zero-volume bars, so the last
-        # bar's date isn't the last trade - the last bar WITH volume is.
-        "last_trade": _last_trade_date(volume),
-        "traded_value": traded_value,
-        "zero_volume_days": zero_volume_days,
-        "liquidity_penalty": liquidity_penalty,
-        "div_yield": _trailing_dividend_yield(df, current),
-        "score": score,
-        "dates": [d.strftime("%Y-%m-%d") for d in close.index],
-        "closes": [float(c) for c in close],
-    }
-
-
-GLITCH_RATIO = 20.0
-
-
-def _drop_unit_glitches(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop bars whose close is >20x off the local median.
-
-    Yahoo sometimes serves thin JSE shares' zero-volume days in Rand instead
-    of cents (PMV: 3.10 among ~300 closes) - one such bar wrecks the 52w low,
-    RSI and the projection band. The window is centred, so a genuine
-    permanent re-rating flips the median within a few bars and survives.
-    """
-    median = df["Close"].rolling(11, center=True, min_periods=3).median()
-    ratio = df["Close"] / median
-    keep = ratio.isna() | ((ratio > 1 / GLITCH_RATIO) & (ratio < GLITCH_RATIO))
-    return df[keep]
-
-
-def _sane_high_low(df: pd.DataFrame) -> tuple:
-    """Intraday High/Low with impossible values replaced by the bar's close.
-
-    _drop_unit_glitches only checks closes, so a bar with a good close can
-    still carry a Rand-vs-cents High/Low that becomes the 52w extreme. A Low
-    above the close (or High below it), a missing value, or one >20x off the
-    close is not a real trade - fall back to the close for that bar.
-    """
-    close = df["Close"]
-    high = df["High"].where(
-        (df["High"] >= close) & (df["High"] < close * GLITCH_RATIO), close
-    )
-    low = df["Low"].where(
-        (df["Low"] <= close) & (df["Low"] > close / GLITCH_RATIO), close
-    )
-    return high, low
-
-
-def _trailing_dividend_yield(df: pd.DataFrame, price: float) -> Optional[float]:
-    """Dividends paid over the last 365 days as a % of the current price.
-
-    Yahoo reports JSE dividends in the same unit as the close (ZAc), so they
-    share JSE_PRICE_SCALE. None = unknown (no Dividends column, or an
-    implausible yield that signals a unit mismatch); 0.0 = paid nothing.
-    """
-    if "Dividends" not in df.columns or not price:
-        return None
-    cutoff = df.index[-1] - pd.Timedelta(days=365)
-    paid = float(df.loc[df.index > cutoff, "Dividends"].fillna(0).sum()) / JSE_PRICE_SCALE
-    if paid <= 0:
-        return 0.0
-    yield_pct = paid / price * 100
-    return yield_pct if yield_pct <= DIVIDEND_YIELD_CEILING else None
-
-
-def _last(series: pd.Series) -> Optional[float]:
-    """Last non-NaN value of a series, or None."""
-    value = series.iloc[-1]
-    return None if pd.isna(value) else float(value)
-
-
-def _liquidity_penalty(traded_value: float) -> int:
-    """Score points removed for thin trading (median Rand value per day)."""
-    for minimum, penalty in LIQUIDITY_PENALTIES:
-        if traded_value < minimum:
-            return penalty
-    return 0
-
-
-def _potential_score(rsi, macd, macd_signal, macd_hist, close, sma_20, sma_50, mom_3m, vol_recent, vol_base) -> int:
-    """Heuristic 0-100 upside score for a penny stock."""
-    score = 0
-
-    if macd_hist is not None and macd_hist > 0:
-        score += 20
-    if macd is not None and macd_signal is not None and macd > macd_signal:
-        score += 15
-
-    if rsi is not None:
-        if rsi < 30:
-            score += 20  # oversold — bounce potential
-        elif rsi <= 45:
-            score += 25  # low but not collapsing
-        elif rsi <= 60:
-            score += 15
-
-    if sma_20 is not None and close > sma_20:
-        score += 10
-    if sma_50 is not None and close > sma_50:
-        score += 10
-    if mom_3m > 0:
-        score += 10
-    if vol_base > 0 and vol_recent > vol_base:
-        score += 10
-
-    return min(score, 100)
+    """Cached scan_penny_stocks - Rescan clears it."""
+    return scan_penny_stocks(extra_symbols)
 
 
 def _render_penny_detail(db: Session, row: dict):

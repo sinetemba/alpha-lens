@@ -140,6 +140,22 @@ is announced so they can subscribe during the offer window (before listing day).
 - **Caveat:** early warning only — subscribing still goes through a broker
   during the offer window in the pre-listing statement.
 
+## Penny stocks scan and near-52w-low alerts
+
+- The scan lives in Streamlit-free `app/services/penny_scan.py`
+  (`scan_penny_stocks`: one batched `yf.download` of the curated
+  `JSE_PENNY_CANDIDATES` + `scannable_db_stocks`, 1y bars + dividends). The
+  Penny Stocks page only caches it (`_scan_penny_stocks`, 30 min) and renders.
+  Keep Streamlit out of `penny_scan.py` - the updater imports it.
+- `run_near_low_alerts` runs at the end of the daily historical job (so it
+  gets the catch-up after sleep; a failure only logs a warning). Rows that
+  are not stale and close within `PENNY_LOW_ALERT_PCT` (default 10) of their
+  52w low raise `type="price"` "Near 52-week low: SYM" notifications, at most
+  once per symbol per 30 days (`NEAR_LOW_COOLDOWN` - `create_notification`'s
+  own dedup only spans 20h). `PENNY_LOW_ALERT_ENABLED=false` turns it off.
+- `scannable_db_stocks` excludes symbols containing `. ^ _ =` (indexes,
+  forex, `AV_*`/`XAU_*`, Yahoo futures like `NG=F`) - they 404 as `X.JO`.
+
 ## Cross-DB SQL expressions
 
 The `strftime('%Y-%m-%d', timestamp)` function is SQLite-only. For PostgreSQL, use `func.date_trunc('day', timestamp)`. The `app/dashboard/utils.py` helper `day_of(db, col)` selects the right one from the session's engine dialect (not `settings.database_url`, so SQLite tests work against a Postgres-configured `.env`).
