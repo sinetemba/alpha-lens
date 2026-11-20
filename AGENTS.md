@@ -159,6 +159,16 @@ is announced so they can subscribe during the offer window (before listing day).
   own dedup only spans 20h). `PENNY_LOW_ALERT_ENABLED=false` turns it off.
 - `scannable_db_stocks` excludes symbols containing `. ^ _ =` (indexes,
   forex, `AV_*`/`XAU_*`, Yahoo futures like `NG=F`) - they 404 as `X.JO`.
+- Each row carries `setup` (`_setup_tag`, first match wins): "Extended"
+  (RSI≥70) > "Recovery · long" (≤15% off the 52w low AND stabilising -
+  MACD hist >0 or RSI≥45) > "Bounce · short" (RSI<30) > "Trend · mid"
+  (above SMA-20/50, positive 3m momentum) > "Weak" (below SMA-20, negative
+  momentum) > "Watch". Near-low without a turn signal is deliberately NOT
+  Recovery - a knife isn't a bargain. Thresholds: `SETUP_*` constants.
+- `_trailing_dividend_yield` unit-checks each Yahoo dividend against its
+  own day's close (>50% of the share price = cents, same rule as
+  `_dividend_amount_rand`) - Yahoo mixes ZAc/ZAR per ticker, so a blanket
+  /100 understates Rand-denominated yields 100x.
 
 ## Cross-DB SQL expressions
 
