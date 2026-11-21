@@ -17,6 +17,7 @@ from loguru import logger
 from sqlalchemy.orm import Session
 
 from app.analytics.technical_indicators import TechnicalIndicators
+from app.collectors.jse_units import frame_to_rand
 from app.collectors.yfinance import JSE_PRICE_SCALE
 from app.config.settings import settings
 from app.models.base import utcnow_naive
@@ -353,14 +354,14 @@ def _summarise_symbol(data: pd.DataFrame, yf_symbol: str, symbol: str) -> Option
 
     if df is None:
         return None
-    df = _drop_unit_glitches(df)
+    # Yahoo reports JSE prices in cents (ZAc) with stretches served in Rand;
+    # convert bar by bar (collectors/jse_units.py), then drop lone glitches.
+    df = _drop_unit_glitches(frame_to_rand(df))
     if len(df) < MIN_HISTORY_ROWS:
         return None
 
-    # Yahoo reports JSE prices in cents (ZAc); convert to Rand.
-    close = df["Close"] / JSE_PRICE_SCALE
+    close = df["Close"]
     high, low = _sane_high_low(df)
-    high, low = high / JSE_PRICE_SCALE, low / JSE_PRICE_SCALE
     volume = df["Volume"].fillna(0)
 
     current = float(close.iloc[-1])
@@ -484,7 +485,7 @@ def _trailing_dividend_yield(df: pd.DataFrame, price: float) -> Optional[float]:
         return None
     cutoff = df.index[-1] - pd.Timedelta(days=365)
     window = df.loc[df.index > cutoff, ["Close", "Dividends"]].dropna(subset=["Close"])
-    close_rand = window["Close"] / JSE_PRICE_SCALE
+    close_rand = window["Close"]  # already Rand (frame_to_rand in _summarise_symbol)
     divs = window["Dividends"].fillna(0)
     paid = float(divs.where(divs <= close_rand * 0.5, divs / JSE_PRICE_SCALE).sum())
     if paid <= 0:

@@ -79,7 +79,11 @@ def update_ipo_listings(db: Session, collector=None) -> int:
     from app.notifications.notification_service import NotificationService
 
     collector = collector or MoneywebCollector()
-    announcements = collector.get_sens_announcements() or []
+    announcements = collector.get_sens_announcements()
+    from app.services.source_health import record_source
+    record_source(db, "moneyweb_sens", announcements is not None,
+                  None if announcements is not None else "SENS page fetch/parse failed")
+    announcements = announcements or []
     existing_urls = {
         u for (u,) in db.query(UpcomingListing.source_url).all()
     }

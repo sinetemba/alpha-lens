@@ -2,6 +2,7 @@ import time
 import yfinance as yf
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
+from app.collectors.jse_units import frame_to_rand
 from app.config.settings import settings
 from loguru import logger
 
@@ -9,7 +10,6 @@ from loguru import logger
 # Yahoo Finance reports JSE-listed prices in South African cents (ZAc), not Rand,
 # so OHLC values for ".JO"-suffixed tickers must be divided by 100.
 JSE_PRICE_SCALE = 100
-_OHLC_COLUMNS = ["Open", "High", "Low", "Close", "Adj Close"]
 
 
 class YFinanceCollector:
@@ -58,15 +58,14 @@ class YFinanceCollector:
 
     @staticmethod
     def _to_rand(hist, symbol: str):
-        """Convert JSE OHLC prices from cents to Rand in-place."""
+        """Convert JSE OHLC prices from cents to Rand, bar by bar.
+
+        Not a blanket /100: Yahoo's .JO history mixes stretches served in
+        Rand among the cents bars - see collectors/jse_units.py.
+        """
         if hist is None or hist.empty or "." in symbol:
             return hist
-
-        for column in _OHLC_COLUMNS:
-            if column in hist.columns:
-                hist[column] = hist[column] / JSE_PRICE_SCALE
-
-        return hist
+        return frame_to_rand(hist)
     
     _usd_zar_cache: Optional[tuple] = None  # (rate, aware-utc fetched_at)
     _USD_ZAR_TTL = timedelta(hours=1)

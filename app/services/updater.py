@@ -63,6 +63,7 @@ from app.collectors.luno import LunoCollector
 from app.collectors.easyequities import EasyEquitiesCollector
 from app.collectors.moneyweb import MoneywebCollector
 from app.services.easyequities_sync import sync_portfolio_from_easyequities
+from app.services.source_health import check_source_health, record_source
 
 
 def _run_notification_checks(db: Session) -> None:
@@ -480,12 +481,21 @@ class UpdaterService:
             # A total price failure (e.g. Yahoo down) must not also stop news,
             # alert checks or the daily portfolio snapshot - they don't depend
             # on this run's prices.
+            if symbols:
+                record_source(db, "yahoo_prices", prices_ok, detail)
+
             news_scraper = NewsScraper(db)
             articles = news_scraper.scrape_all_sources()
             logger.info(f"Collected {len(articles)} news articles")
 
             _run_notification_checks(db)
             _snapshot_portfolio(db)
+            # Alert on sources that have failed for 2+ days (Settings lists all).
+            try:
+                check_source_health(db)
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"Source health check failed: {e}")
             ok = prices_ok
             return prices_ok
         except Exception as e:
@@ -540,6 +550,7 @@ class UpdaterService:
                 if moneyweb.enabled:
                     watch_rows = moneyweb.save_dividend_watch(db)
                     logger.info(f"Moneyweb dividend watch refreshed: {watch_rows} rows")
+                    record_source(db, "moneyweb_login", moneyweb.last_error is None, moneyweb.last_error)
             except Exception as e:
                 db.rollback()
                 logger.warning(f"Dividend watch refresh failed: {e}")

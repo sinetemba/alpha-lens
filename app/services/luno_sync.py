@@ -120,6 +120,9 @@ def sync_luno_holdings(db: Session, collector: Optional[LunoCollector] = None) -
     """
     collector = collector or LunoCollector()
     accounts = collector.get_accounts()
+    from app.services.source_health import record_source
+    record_source(db, "luno", accounts is not None,
+                  None if accounts is not None else (getattr(collector, "last_error", None) or "balance fetch failed"))
     if accounts is None:
         return None
 

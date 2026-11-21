@@ -230,8 +230,9 @@ def test_scanned_row_carries_a_setup():
 # --- dividend yield --------------------------------------------------------
 
 def _frame(dividends):
+    # Closes arrive in Rand: _summarise_symbol converts with frame_to_rand first.
     idx = pd.date_range("2025-11-20", periods=len(dividends), freq="D")
-    return pd.DataFrame({"Close": [134.0] * len(dividends), "Dividends": dividends}, index=idx)
+    return pd.DataFrame({"Close": [1.34] * len(dividends), "Dividends": dividends}, index=idx)
 
 
 def test_trailing_yield_uses_cents_scale():

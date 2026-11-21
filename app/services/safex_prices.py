@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.collectors.safex import SafexCollector, contract_month
 from app.models.base import utcnow_naive
 from app.models.stock import Stock, StockPrice
+from app.services.source_health import record_source
 
 # CBOT contract sizes for the SA-vs-world gap: bushels per metric tonne.
 BUSHELS_PER_TONNE_CORN = 39.3679   # 25.401 kg/bushel (also soybeans)
@@ -74,6 +75,7 @@ def refresh_safex(db: Session, collector: SafexCollector | None = None) -> Optio
     written, or None when the fetch or the save failed."""
     rows = (collector or SafexCollector()).get_contracts()
     if rows is None:
+        record_source(db, "safex", False, "Grain SA page unreachable or table not found (layout changed?)")
         return None
     now = utcnow_naive()
     written = 0
@@ -94,7 +96,10 @@ def refresh_safex(db: Session, collector: SafexCollector | None = None) -> Optio
     except SQLAlchemyError as e:
         db.rollback()
         logger.error(f"Saving SAFEX prices failed: {e}")
+        record_source(db, "safex", False, f"save failed: {e.__class__.__name__}")
         return None
+    record_source(db, "safex", written == len(SAFEX_GRAINS),
+                  None if written == len(SAFEX_GRAINS) else f"only {written}/{len(SAFEX_GRAINS)} grains found")
     return written
 
 

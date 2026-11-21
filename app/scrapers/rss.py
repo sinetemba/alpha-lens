@@ -12,9 +12,14 @@ class RSSScraper:
     
     def __init__(self):
         self.feeds = settings.rss_feeds
+        # {url: error message or None} for the last fetch_all_feeds() run -
+        # NewsScraper records them as source-health heartbeats.
+        self.feed_results: Dict[str, Optional[str]] = {}
+        self._last_error: Optional[str] = None
     
     def fetch_feed(self, url: str) -> Optional[List[Dict]]:
         """Fetch and parse an RSS feed."""
+        self._last_error = None
         try:
             # feedparser.parse(url) uses urllib with no timeout - a hung feed
             # would block the whole update job, so fetch the bytes ourselves.
@@ -25,6 +30,7 @@ class RSSScraper:
             if feed.bozo:
                 logger.warning(f"Error parsing RSS feed from {url}: {feed.bozo_exception}")
                 if not feed.entries:
+                    self._last_error = f"unparseable feed: {feed.bozo_exception}"[:300]
                     return None
             
             articles = []
@@ -43,15 +49,18 @@ class RSSScraper:
         
         except Exception as e:
             logger.error(f"Error fetching RSS feed from {url}: {e}")
+            self._last_error = f"{e.__class__.__name__}: {e}"[:300]
             return None
     
     def fetch_all_feeds(self) -> List[Dict]:
         """Fetch all configured RSS feeds."""
         all_articles = []
-        
+        self.feed_results = {}
+
         for feed_url in self.feeds:
             logger.info(f"Fetching RSS feed: {feed_url}")
             articles = self.fetch_feed(feed_url)
+            self.feed_results[feed_url] = None if articles is not None else (self._last_error or "fetch failed")
             if articles:
                 all_articles.extend(articles)
                 logger.info(f"Fetched {len(articles)} articles from {feed_url}")

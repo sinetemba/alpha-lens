@@ -14,9 +14,11 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import settings
 from app.dashboard.utils import _to_display_tz, format_twelve_data_quota
+from app.models.base import utcnow_naive
 from app.models.updater_run import UpdaterRun
 from app.notifications.notification_service import NotificationService
 from app.services import backup
+from app.services.source_health import FAILING_ALERT_AFTER, source_statuses
 
 # Heartbeat job names written by the updater -> what the user sees.
 _JOB_LABELS = {
@@ -41,7 +43,44 @@ def show_settings(db: Session):
     st.markdown("---")
     _render_backups(db)
     st.markdown("---")
+    _render_source_health(db)
+    st.markdown("---")
     _render_data_sources()
+
+
+def _render_source_health(db: Session):
+    st.subheader("🩺 Data source health")
+    statuses = source_statuses(db)
+    if not statuses:
+        st.info("No source fetches recorded yet - they appear after the next updater run.")
+        return
+    now = utcnow_naive()
+    fmt = lambda ts: _to_display_tz(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"  # noqa: E731
+    rows = []
+    for s in statuses:
+        failing = s.failing_for(now)
+        if s.ok:
+            status = "✅ OK"
+        elif failing is not None and failing >= FAILING_ALERT_AFTER:
+            status = f"❌ Failing {failing.days}d {failing.seconds // 3600}h"
+        else:
+            status = "⚠️ Last attempt failed"
+        rows.append({
+            "Source": s.label,
+            "Status": status,
+            "Last success": fmt(s.last_success),
+            "Last failure": fmt(s.last_failure),
+            "Last error": "" if s.ok else (s.last_detail or ""),
+        })
+    failing_long = sum(r["Status"].startswith("❌") for r in rows)
+    if failing_long:
+        st.error(f"{failing_long} source(s) have failed every attempt for 2+ days - a system notification was raised.")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption(
+        "One heartbeat per fetch (updater runs and dashboard refreshes), kept 30 days. Times "
+        "are SAST. A source that simply wasn't fetched is not a failure - Metals.dev, for "
+        "example, is only fetched when the Commodities page is open."
+    )
 
 
 def _yes_no(value: bool) -> str:

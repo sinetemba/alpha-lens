@@ -36,6 +36,9 @@ class NewsScraper:
         logger.info("Starting news scraping from all sources")
 
         all_articles_data = self.rss_scraper.fetch_all_feeds()
+        from app.services.source_health import record_source, rss_key
+        for url, error in self.rss_scraper.feed_results.items():
+            record_source(self.db, rss_key(url), error is None, error)
 
         # One query for every URL in the batch replaces a SELECT per article.
         # `seen` also dedups inside the batch: the session runs with

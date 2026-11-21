@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.collectors.yfinance import YFinanceCollector
 from app.models.base import utcnow_naive
 from app.models.stock import Stock, StockPrice
+from app.services.source_health import record_source
 
 _USD = 1.0
 _US_CENTS = 0.01  # Yahoo currency "USX": grains, softs and livestock
@@ -132,6 +133,7 @@ def refresh_futures(db: Session, collector: YFinanceCollector | None = None) -> 
     period = _BACKFILL_PERIOD if _needs_backfill(db) else _INCREMENTAL_PERIOD
     closes = collector.get_futures_closes([meta[2] for meta in FUTURES.values()], period=period)
     if closes is None:
+        record_source(db, "yahoo_futures", False, "Yahoo download failed (see updater/dashboard log)")
         return None
     series = zar_closes(closes)
     missing = [meta[2] for meta in FUTURES.values() if meta[1] not in series]
@@ -144,6 +146,8 @@ def refresh_futures(db: Session, collector: YFinanceCollector | None = None) -> 
         # roll back so the shared session stays usable for the metals.
         db.rollback()
         logger.error(f"Saving commodity futures failed: {e}")
+        record_source(db, "yahoo_futures", False, f"save failed: {e.__class__.__name__}")
         return None
+    record_source(db, "yahoo_futures", True, f"missing: {', '.join(missing)}" if missing else None)
     logger.info(f"Commodity futures refresh ({period}): {written} bars written")
     return written

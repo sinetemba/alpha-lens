@@ -186,7 +186,10 @@ class DataService:
             if value is not None and value > 0:
                 setattr(price, attr, value)
         volume = self._to_float(record.get("volume"))
-        if volume is not None:
+        # stock_prices.volume is a 32-bit INTEGER; Yahoo has glitch volumes
+        # beyond it (RMH 2011-12-12: 8.35bn) that abort the whole save on
+        # PostgreSQL - store those as unknown.
+        if volume is not None and 0 <= volume <= 2_147_483_647:
             price.volume = int(volume)
 
     def _quote_bar_timestamp(self, quote: Dict) -> datetime:
@@ -233,10 +236,38 @@ class DataService:
     MAX_CLOSE_RATIO = 3.0
     _PRICE_FIELDS = ("open", "high", "low", "close", "adjusted_close")
 
+    # The JSE's minimum price is 1c: a unit "correction" that lands below it
+    # is matching a corrupted reference, not fixing the incoming bar (SKA
+    # R0.85 was "corrected" to R0.0085 against a bad stored bar).
+    MIN_JSE_PRICE = 0.0095
+
     def _ratio_ok(self, a: float, b: float) -> bool:
         if not a or not b:
             return False
         return max(a, b) / min(a, b) <= self.MAX_CLOSE_RATIO
+
+    @staticmethod
+    def _is_jse_equity(symbol: str) -> bool:
+        """Plain JSE share codes - not indexes, FX, futures or pseudo-symbols."""
+        return not any(ch in symbol for ch in ".^_=")
+
+    def _unit_factor(self, symbol: str, close: float, ref_close: float) -> Optional[float]:
+        """x100 / x0.01 factor that reconciles `close` with `ref_close`, or None.
+
+        A factor yielding a sub-cent JSE price is refused - it can only mean
+        the reference itself is 100x off.
+        """
+        for factor in (100.0, 0.01):
+            if not self._ratio_ok(close * factor, ref_close):
+                continue
+            if self._is_jse_equity(symbol) and close * factor < self.MIN_JSE_PRICE:
+                logger.warning(
+                    f"{symbol}: x{factor} would give sub-cent R{close * factor:.5f} - "
+                    f"reference close {ref_close} looks corrupted; not rescaling"
+                )
+                return None
+            return factor
+        return None
 
     def _close_scale_factor(
         self, symbol: str, timestamp: datetime, close: float
@@ -263,10 +294,7 @@ class DataService:
             return 1.0, prev.close_price
         if self._ratio_ok(close, prev.close_price):
             return 1.0, prev.close_price
-        for factor in (100.0, 0.01):
-            if self._ratio_ok(close * factor, prev.close_price):
-                return factor, prev.close_price
-        return None, prev.close_price
+        return self._unit_factor(symbol, close, prev.close_price), prev.close_price
 
     def _rescale_record(self, record: Dict, factor: float) -> None:
         """Multiply all numeric OHLC fields in a record dict by `factor`."""
@@ -536,12 +564,19 @@ class DataService:
             logger.warning(f"Could not populate details for {stock.symbol}: {e}")
 
     def _bulk_save_stock_prices(
-        self, symbol: str, records: List[Dict], source: str = "yfinance"
+        self, symbol: str, records: List[Dict], source: str = "yfinance",
+        trust_units: bool = False,
     ) -> int:
         """Batch-save historical prices. Existing bars are refreshed in place.
 
         Returns the number of NEW bars inserted - existing rows are updated
         but not counted, so the return value means "history points added".
+
+        `trust_units=True` (repairs) neither anchors on the stored bar before
+        the batch nor applies x100/x0.01 unit corrections: the incoming
+        series is already unit-normalised (collectors/jse_units.py) and the
+        stored bars are what is being repaired. Implausible jumps WITHIN the
+        batch are still rejected.
         """
         if not records:
             return 0
@@ -569,10 +604,11 @@ class DataService:
             StockPrice.symbol == symbol,
             StockPrice.timestamp < ordered[0],
         ).order_by(StockPrice.timestamp.desc()).first()
-        ref_close = prev_stored.close_price if prev_stored else None
-        ref_ts = prev_stored.timestamp if prev_stored else None
+        ref_close = prev_stored.close_price if prev_stored and not trust_units else None
+        ref_ts = prev_stored.timestamp if prev_stored and not trust_units else None
 
         rejected_ts = set()
+        rescaled = []
         for ts in ordered:
             record = records_by_ts[ts]
             close = self._to_float(record.get("close"))
@@ -581,21 +617,23 @@ class DataService:
             factor: Optional[float] = 1.0
             if ref_close and ts - ref_ts <= timedelta(days=31):
                 if not self._ratio_ok(close, ref_close):
-                    factor = next(
-                        (f for f in (100.0, 0.01) if self._ratio_ok(close * f, ref_close)),
-                        None,
-                    )
+                    factor = None if trust_units else self._unit_factor(symbol, close, ref_close)
             if factor is None:
                 rejected_ts.add(ts)
                 continue
             if factor != 1.0:
                 self._rescale_record(record, factor)
                 close = self._to_float(record.get("close"))
-                logger.warning(
-                    f"Rescaled {symbol} @ {ts:%Y-%m-%d}: x{factor} "
-                    f"(close now {close}, reference {ref_close})"
-                )
+                rescaled.append((ts, factor))
             ref_close, ref_ts = close, ts
+
+        if rescaled:
+            # One line per batch, not per bar (a single run logged 930).
+            factors = sorted({f for _, f in rescaled})
+            logger.warning(
+                f"Rescaled {len(rescaled)} {symbol} bar(s) x{'/x'.join(f'{f:g}' for f in factors)} "
+                f"({rescaled[0][0]:%Y-%m-%d} .. {rescaled[-1][0]:%Y-%m-%d}) to match the stored series"
+            )
 
         if rejected_ts:
             newest_bad = max(rejected_ts)
@@ -1251,7 +1289,8 @@ class DataService:
                         "adjusted_close": row.get("Adj Close"),
                         "volume": row.get("Volume"),
                     })
-                self._bulk_save_stock_prices(symbol, records)
+                # The stored bars are what's being repaired - don't anchor on them.
+                self._bulk_save_stock_prices(symbol, records, trust_units=True)
                 self._update_technical_indicators(symbol, full=True)
                 self.db.commit()
                 fixed += 1

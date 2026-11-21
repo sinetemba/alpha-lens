@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 
 from loguru import logger
 from sqlalchemy.exc import IntegrityError
+
+from app.utils.formatting import format_price
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -34,13 +36,15 @@ def _normalize_account_type(account_type: str | None) -> str:
 def _ee_reconcile_units(
     db: Session, ee_holding: dict, account_type: str, latest_closes: dict | None = None
 ) -> None:
-    """Rescale EasyEquities amounts that look like cents, in place.
+    """Cross-check EasyEquities' implied price against the stored JSE close.
 
-    The aggregated holding derives price from value/shares, so internal
-    consistency can't detect a units glitch - compare the implied price
-    against the stored JSE close instead (same ~100x rule as the bar unit
-    check on the price-feed path). USD-denominated amounts on JSE-tracked
-    accounts are flagged rather than rescaled.
+    EE's ZAR amounts are never rescaled: every time this used to "fix" EE
+    to match the stored close (SKA, KBO) it was the stored series that was
+    100x off - Yahoo serves stretches of .JO history in Rand instead of
+    cents. On a ~100x disagreement EE's values are kept and a system
+    notification names the symbol so the stored series gets repaired
+    (`run_updater.py --normalize-closes`). USD-denominated amounts on
+    JSE-tracked accounts are flagged and skipped.
 
     `latest_closes` is an optional {symbol: latest close} map - syncs prefetch
     it in one grouped query instead of querying per holding.
@@ -68,19 +72,40 @@ def _ee_reconcile_units(
     ratio = max(price, stored_close) / min(price, stored_close)
     if ratio <= 3.0:
         return
-    if abs(price / 100 - stored_close) / stored_close <= 0.2:
-        logger.warning(
-            f"EasyEquities {symbol}: implied price {price:.2f} looks like cents "
-            f"vs stored close {stored_close:.2f} - rescaling /100"
-        )
-        for key in ("current_price", "purchase_price", "current_value", "purchase_value"):
-            if ee_holding.get(key):
-                ee_holding[key] /= 100
-    else:
-        logger.warning(
-            f"EasyEquities {symbol}: implied price {price:.2f} diverges {ratio:.0f}x "
-            f"from stored close {stored_close:.2f} - keeping EE values"
-        )
+    unit_mismatch = 50 <= ratio <= 200
+    logger.warning(
+        f"EasyEquities {symbol}: implied price {format_price(price)} vs stored close "
+        f"{format_price(stored_close)} ({ratio:.0f}x) - keeping EE values"
+        + (" - stored series looks 100x off" if unit_mismatch else "")
+    )
+    if unit_mismatch:
+        # Notified after the sync commits (create_notification commits).
+        ee_holding["unit_conflict"] = (price, stored_close, ratio)
+
+
+def _notify_unit_conflicts(db: Session, holdings) -> None:
+    """System notification per holding _ee_reconcile_units flagged ~100x off."""
+    for ee_holding in holdings:
+        conflict = ee_holding.get("unit_conflict")
+        if not conflict:
+            continue
+        price, stored_close, ratio = conflict
+        symbol = ee_holding.get("symbol", "?")
+        try:
+            from app.notifications.notification_service import NotificationService
+            NotificationService(db).create_notification(
+                notification_type="system",
+                title=f"Price unit conflict: {symbol}",
+                message=(
+                    f"EasyEquities prices {symbol} at {format_price(price)} but the stored close is "
+                    f"{format_price(stored_close)} (~{ratio:.0f}x apart). EasyEquities' value is kept; "
+                    "the stored price history is probably in the wrong unit - run "
+                    "`python scripts\\run_updater.py --normalize-closes` (backup first)."
+                ),
+                stock_symbol=symbol,
+            )
+        except Exception as e:
+            logger.warning(f"Could not record unit-conflict notification for {symbol}: {e}")
 
 
 def _sync_holding_from_easyequities(
@@ -244,7 +269,10 @@ def sync_portfolio_from_easyequities(
     Returns (synced_count, raw_holdings); synced_count is None when the
     upstream fetch failed (raw is then whatever came back, possibly []).
     """
+    from app.services.source_health import record_source
     ee_holdings = collector.get_all_holdings()
+    record_source(db, "easyequities", ee_holdings is not None,
+                  None if ee_holdings is not None else (getattr(collector, "last_error", None) or "fetch failed"))
     if ee_holdings is None:
         return None, []
 
@@ -345,6 +373,7 @@ def sync_portfolio_from_easyequities(
         db.rollback()
         opened = {}  # rolled back - nothing to pair transfers against
         logger.warning("EasyEquities sync hit a concurrent write; keeping the other writer's rows")
+    _notify_unit_conflicts(db, aggregated_holdings.values())
 
     # EasyEquities is the source of truth: remove holdings under the account
     # types we just synced that it no longer reports (fully sold/delisted

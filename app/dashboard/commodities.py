@@ -9,6 +9,7 @@ from app.collectors.alpha_vantage import AlphaVantageCollector
 from app.collectors.metals_dev import MetalsDevCollector
 from app.collectors.yfinance import YFinanceCollector
 from app.services.commodity_futures import FUTURES, FUTURES_DB_SYMBOLS, refresh_futures
+from app.services.source_health import record_source
 from app.services.safex_prices import SAFEX_DB_SYMBOLS, SAFEX_GRAINS, cbot_rand_per_tonne, refresh_safex
 from loguru import logger
 
@@ -239,11 +240,15 @@ def _refresh_commodity_prices(db: Session) -> tuple[int, int]:
         try:
             latest_rates = api_collector.get_latest_rates()
             _save_latest_rates(db, latest_rates)
+            record_source(db, "metals_dev", bool(latest_rates), None if latest_rates else "no rates returned (see log)")
             if latest_rates:
                 saved += len(latest_rates)
+            else:
+                failures += 1
         except Exception as e:
             failures += 1
             logger.error(f"Failed to fetch latest commodity rates: {e}")
+            record_source(db, "metals_dev", False, e.__class__.__name__)
 
     historical_collector = AlphaVantageCollector()
     if historical_collector.enabled:
@@ -358,6 +363,7 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
             st.session_state["commodities_live_fetched"] = True
             fetch_attempted = True
             latest_rates = api_collector.get_latest_rates() or {}
+            record_source(db, "metals_dev", bool(latest_rates), None if latest_rates else "no rates returned (see log)")
             if latest_rates:
                 _save_latest_rates(db, latest_rates)
 

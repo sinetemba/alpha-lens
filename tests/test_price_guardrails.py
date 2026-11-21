@@ -79,10 +79,21 @@ def test_close_scale_factor_stale_reference_does_not_gate(db_session):
 
 def test_close_scale_factor_rescales_zac_to_zar(db_session):
     """Incoming cents values (100x too big) are rescaled, not rejected."""
+    _add_bar(db_session, "WEZ", datetime(2024, 1, 15), 0.45)
+    svc = _service(db_session)
+    factor, prev = svc._close_scale_factor("WEZ", datetime(2024, 1, 16), 45.0)
+    assert factor == pytest.approx(0.01)
+    assert prev == pytest.approx(0.45)
+
+
+def test_close_scale_factor_refuses_a_sub_cent_result(db_session):
+    """The JSE minimum is 1c: matching a R0.0085 stored bar by turning a
+    correct R0.85 into R0.0085 is how SKA was corrupted - the stored bar is
+    the bad one, so the incoming close is rejected, not rescaled."""
     _add_bar(db_session, "SKA", datetime(2024, 1, 15), 0.0085)
     svc = _service(db_session)
     factor, prev = svc._close_scale_factor("SKA", datetime(2024, 1, 16), 0.85)
-    assert factor == pytest.approx(0.01)
+    assert factor is None
     assert prev == pytest.approx(0.0085)
 
 
@@ -157,12 +168,12 @@ def test_unit_adjust_close_plausible_passes_untouched(db_session):
 
 
 def test_unit_adjust_close_rescales_record(db_session):
-    _add_bar(db_session, "SKA", datetime(2024, 1, 15), 0.0085)
+    _add_bar(db_session, "WEZ", datetime(2024, 1, 15), 0.45)
     svc = _service(db_session)
-    record = {"open": 0.87, "high": 0.9, "low": 0.84, "close": 0.85, "adjusted_close": 0.85}
-    assert svc._unit_adjust_close("SKA", datetime(2024, 1, 16), record, 0.85, "yfinance")
-    assert record["close"] == pytest.approx(0.0085)
-    assert record["open"] == pytest.approx(0.0087)
+    record = {"open": 46.0, "high": 47.0, "low": 44.0, "close": 45.0, "adjusted_close": 45.0}
+    assert svc._unit_adjust_close("WEZ", datetime(2024, 1, 16), record, 45.0, "yfinance")
+    assert record["close"] == pytest.approx(0.45)
+    assert record["open"] == pytest.approx(0.46)
 
 
 def test_unit_adjust_close_accepts_corroborated_crash(db_session):
@@ -190,17 +201,33 @@ def test_unit_adjust_close_rejects_uncorroborated(db_session):
 
 def test_bulk_save_mixed_unit_frame_rescales_only_bad_bars(db_session):
     """A frame where only some bars are cents gets each bad bar rescaled."""
-    _add_bar(db_session, "SKA", datetime(2024, 1, 12), 0.0085)
+    _add_bar(db_session, "WEZ", datetime(2024, 1, 12), 0.45)
     svc = _service(db_session)
     records = [
-        {"timestamp": datetime(2024, 1, 15), "close": 0.0086},
-        {"timestamp": datetime(2024, 1, 16), "close": 0.87},    # cents glitch
-        {"timestamp": datetime(2024, 1, 17), "close": 0.0088},
+        {"timestamp": datetime(2024, 1, 15), "close": 0.46},
+        {"timestamp": datetime(2024, 1, 16), "close": 47.0},    # cents glitch
+        {"timestamp": datetime(2024, 1, 17), "close": 0.48},
     ]
-    assert svc._bulk_save_stock_prices("SKA", records) == 3
+    assert svc._bulk_save_stock_prices("WEZ", records) == 3
     closes = {p.timestamp.day: p.close_price
-              for p in db_session.query(StockPrice).filter_by(symbol="SKA")}
-    assert closes[16] == pytest.approx(0.0087)  # rescaled x0.01, not rejected
+              for p in db_session.query(StockPrice).filter_by(symbol="WEZ")}
+    assert closes[16] == pytest.approx(0.47)  # rescaled x0.01, not rejected
+
+
+def test_bulk_save_trust_units_ignores_a_corrupted_stored_series(db_session):
+    """The --normalize-closes repair: stored bars are 100x low (SKA at
+    R0.0085) and the incoming series is already unit-normalised - it must
+    overwrite them, not be "corrected" down to match."""
+    _add_bar(db_session, "SKA", datetime(2024, 1, 12), 0.0085)
+    _add_bar(db_session, "SKA", datetime(2024, 1, 15), 0.0086)
+    svc = _service(db_session)
+    records = [
+        {"timestamp": datetime(2024, 1, 12), "close": 0.85},
+        {"timestamp": datetime(2024, 1, 15), "close": 0.86},
+    ]
+    svc._bulk_save_stock_prices("SKA", records, trust_units=True)
+    closes = sorted(p.close_price for p in db_session.query(StockPrice).filter_by(symbol="SKA"))
+    assert closes == [pytest.approx(0.85), pytest.approx(0.86)]
 
 
 def test_bulk_save_lone_rejection_corroborated_is_accepted(db_session):
