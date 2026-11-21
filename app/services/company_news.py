@@ -78,7 +78,7 @@ class CompanyNewsService:
                 # Fetch failed (retried inside the collector) - distinct from
                 # "Yahoo returned no articles", so the caller can tell an
                 # outage from quiet news.
-                logger.warning(f"Yahoo news unavailable for {symbol}")
+                logger.debug(f"Yahoo news unavailable for {symbol}")  # collector already logged the error
                 return []
             articles = []
             for article in raw:

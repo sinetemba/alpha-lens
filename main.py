@@ -13,6 +13,7 @@ from app.dashboard.home import show_home
 from app.database.init_db import init_database
 from app.config.settings import settings
 from loguru import logger
+from app.utils.logging_setup import configure_logging
 
 # Must be the first Streamlit command in the script - the cache_resource
 # spinner below already counts as one.
@@ -30,12 +31,7 @@ st.set_page_config(
 # fire ~a dozen table-existence checks on every single rerun.
 @st.cache_resource(show_spinner="Initializing database...")
 def _init_database_once():
-    logger.add(
-        settings.log_file,
-        rotation="10 MB",
-        retention="30 days",
-        level=settings.log_level
-    )
+    configure_logging(settings.log_file)
     # init_database() runs create_all plus the lightweight schema migrations.
     init_database()
     return True

@@ -28,23 +28,34 @@ class RSSScraper:
             feed = feedparser.parse(response.content)
             
             if feed.bozo:
-                logger.warning(f"Error parsing RSS feed from {url}: {feed.bozo_exception}")
                 if not feed.entries:
+                    logger.warning(f"Error parsing RSS feed from {url}: {feed.bozo_exception}")
                     self._last_error = f"unparseable feed: {feed.bozo_exception}"[:300]
                     return None
-            
+                # Recoverable (e.g. IOL declares us-ascii but serves UTF-8):
+                # the entries parsed fine, so this isn't worth a warning per run.
+                logger.debug(f"RSS feed {url} parsed with a recoverable error: {feed.bozo_exception}")
+
             articles = []
-            
+            undated = []
             for entry in feed.entries:
-                article = {
+                published = entry.get("published")
+                published_at = self._parse_date(published)
+                if published and published_at is None:
+                    undated.append(published)
+                articles.append({
                     "title": entry.get("title", ""),
                     "summary": entry.get("summary", ""),
                     "url": entry.get("link", ""),
-                    "published_at": self._parse_date(entry.get("published")),
+                    "published_at": published_at,
                     "source": feed.feed.get("title", url),
-                }
-                articles.append(article)
-            
+                })
+            if undated:
+                # One line per feed per run, not one per article.
+                logger.warning(
+                    f"{len(undated)}/{len(articles)} dates unparseable in {url} "
+                    f"(e.g. {undated[0]!r}) - those articles are dated at fetch time"
+                )
             return articles
         
         except Exception as e:
@@ -67,19 +78,29 @@ class RSSScraper:
         
         return all_articles
     
+    # Non-RFC-822 formats seen in configured feeds. All are UTC: News24's
+    # capi24 feed ('Friday Nov 20 2026 17:24:41') matches the article pages'
+    # datePublished (+00:00) to the second - checked 2026-11-21.
+    _FALLBACK_FORMATS = ("%A %b %d %Y %H:%M:%S",)
+
     def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
-        """Parse various date formats from RSS feeds."""
+        """Parse an RSS date to aware UTC; None if no known format matches
+        (the caller reports unparseable dates once per feed)."""
         if not date_str:
             return None
-        
+        date_str = date_str.strip()
         try:
             parsed = parsedate_to_datetime(date_str)
             if parsed.tzinfo is None:
                 return parsed.replace(tzinfo=timezone.utc)
             return parsed.astimezone(timezone.utc)
-        except Exception as e:
-            logger.warning(f"Error parsing date '{date_str}': {e}")
-        
+        except (TypeError, ValueError, IndexError):
+            pass
+        for fmt in self._FALLBACK_FORMATS:
+            try:
+                return datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
         return None
     
     def fetch_moneyweb(self) -> List[Dict]:

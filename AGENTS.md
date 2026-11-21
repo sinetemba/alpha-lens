@@ -107,6 +107,8 @@ schtasks /run /tn AlphaLensUpdater
 - `scripts\install_updater_task.ps1` must be run from the repo root and as Administrator. The correct design is two tasks: `AlphaLensUpdater` (daemon) and `AlphaLensUpdaterLogon` (`--logon`). A single task with multiple actions runs every action on every trigger, which is wrong.
 - Docker may be installed but the engine may not be running; verify before relying on a container.
 - The `updater.log` file is written to `data/logs/updater.log`; the parent directory is created automatically.
+- Logging goes through `app/utils/logging_setup.configure_logging` (main.py + updater): it removes loguru's default DEBUG stderr sink and adds the log file, plus a console sink only when stderr is a TTY. Under the scheduled tasks stderr is redirected, so `dashboard.log` now holds only Streamlit's own output/tracebacks - app lines are in `app.log` (they used to be duplicated in both). Recurring per-item warnings are summarised per batch/feed (rescales, unparseable RSS dates); Yahoo retry notices are INFO (the caller logs the final failure).
+- RSS dates: News24's capi24 feed uses `Friday Nov 20 2026 17:24:41` (no zone) - it is UTC (matches the article pages' `datePublished +00:00`, checked 2026-11-21); `RSSScraper._FALLBACK_FORMATS` parses it. Before 2026-11-21 ~25% of News24 articles were dated at fetch time; 39 older ones still are.
 - The JSE index symbol `^J203.JO` must be explicitly tracked by the updater; otherwise the Home page "last market data" caption goes stale.
 
 ## SQLite to PostgreSQL migration

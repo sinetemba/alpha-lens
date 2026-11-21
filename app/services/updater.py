@@ -64,6 +64,7 @@ from app.collectors.easyequities import EasyEquitiesCollector
 from app.collectors.moneyweb import MoneywebCollector
 from app.services.easyequities_sync import sync_portfolio_from_easyequities
 from app.services.source_health import check_source_health, record_source
+from app.utils.logging_setup import configure_logging
 
 
 def _run_notification_checks(db: Session) -> None:
@@ -810,12 +811,7 @@ class UpdaterService:
         # every retry - each unguarded logger.add stacks another file sink and
         # another stdlib->loguru handler, duplicating every line.
         if not UpdaterService._logging_configured:
-            logger.add(
-                settings.updater_log_file,
-                rotation="10 MB",
-                retention="30 days",
-                level=settings.log_level,
-            )
+            configure_logging(settings.updater_log_file)
 
             # APScheduler logs misfires/errors through stdlib logging, not loguru -
             # route them into the same file so dropped jobs are visible.

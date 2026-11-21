@@ -35,7 +35,7 @@ class YFinanceCollector:
             except Exception as e:
                 if attempt < max_retries:
                     delay = base_delay * (2 ** (attempt - 1))
-                    logger.warning(f"{label} failed ({e}); retrying in {delay:.1f}s")
+                    logger.info(f"{label} failed ({e}); retrying in {delay:.1f}s")  # caller logs the final failure
                     time.sleep(delay)
                 else:
                     raise
