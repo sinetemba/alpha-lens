@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from app.collectors.moneyweb import MoneywebCollector
+from app.models.base import utcnow_naive
 from app.models.notification import Notification
 from app.models.upcoming_listing import UpcomingListing
 from app.services import ipo
@@ -269,7 +270,9 @@ def test_bars_only_after_announcement_mark_listed(db_session, monkeypatch):
 def test_old_announcements_expire_without_probe(db_session, monkeypatch):
     db_session.add(UpcomingListing(
         symbol="GONE", headline="Intention to list", source_url="https://example.com/gone",
-        sens_published_at=datetime.now() - ipo.ANNOUNCEMENT_EXPIRY - pd.Timedelta(days=1),
+        # Naive UTC like the column (datetime.now() is SAST locally: from 00:00 to
+        # 02:00 SAST it is a calendar day ahead of UTC and lands ON the cutoff).
+        sens_published_at=utcnow_naive() - ipo.ANNOUNCEMENT_EXPIRY - pd.Timedelta(days=1),
     ))
     db_session.commit()
     calls = []
