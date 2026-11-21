@@ -554,6 +554,14 @@ class UpdaterService:
             except Exception as e:
                 db.rollback()
                 logger.warning(f"Commodity futures refresh failed: {e}")
+            # SAFEX maize/wheat (Grain SA page, published after the 12:00 close).
+            try:
+                from app.services.safex_prices import refresh_safex
+                if refresh_safex(db) is None:
+                    logger.warning("SAFEX grain refresh failed (Grain SA)")
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"SAFEX grain refresh failed: {e}")
 
             # Near-52w-low penny alerts ride on this job so they run on the
             # day's closes and inherit its catch-up after sleep. One batched

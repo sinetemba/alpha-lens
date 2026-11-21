@@ -192,6 +192,18 @@ is announced so they can subscribe during the offer window (before listing day).
   stale + Refresh button) and the daily historical job. The page renders
   one table and one chart tab per `CATEGORY_ORDER` entry; copper is stored
   per gram but displayed per tonne (`_DISPLAY_PER_TONNE`).
+- SA grains (`services/safex_prices.py`, `collectors/safex.py`): SAFEX white
+  maize / yellow maize / wheat as `SFX_WMAZ`/`SFX_YMAZ`/`SFX_WEAT` in R/tonne,
+  scraped from Grain SA's public SAFEX Feeds page (server-rendered table; the
+  JSE site 403s scripts). "The price" = front contract: nearest month AFTER
+  the trading day's month (the delivery-month contract goes thin). The "SA
+  Grains (SAFEX)" table shows a `vs CBOT` gap against `YF_CORN`/`YF_WHEAT`
+  converted at 39.3679 / 36.7437 bushels per tonne (white maize vs CBOT corn
+  - no white-maize CBOT contract). Refreshed with the futures (page + daily
+  historical job). No history backfill: SAGIS publishes yearly .xls files
+  only after year-end (2025 = latest), useless for the 90-day charts, so the
+  series accumulates from 2026-11-20. A Grain SA redesign makes
+  `get_contracts()` return None and logs "layout changed?".
 
 ## Cross-DB SQL expressions
 

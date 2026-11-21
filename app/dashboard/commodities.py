@@ -9,6 +9,7 @@ from app.collectors.alpha_vantage import AlphaVantageCollector
 from app.collectors.metals_dev import MetalsDevCollector
 from app.collectors.yfinance import YFinanceCollector
 from app.services.commodity_futures import FUTURES, FUTURES_DB_SYMBOLS, refresh_futures
+from app.services.safex_prices import SAFEX_DB_SYMBOLS, SAFEX_GRAINS, cbot_rand_per_tonne, refresh_safex
 from loguru import logger
 
 
@@ -44,12 +45,16 @@ _AV_GRAMS_PER_UNIT = {
 }
 
 # Page sections, in display order. Metals come from Metals.dev/Alpha
-# Vantage (COMMODITY_SYMBOLS); the rest from Yahoo futures (FUTURES).
-CATEGORY_ORDER = ["Precious Metals", "Industrial Metals", "Energy", "Agriculture", "Livestock"]
+# Vantage (COMMODITY_SYMBOLS); SA grains from SAFEX via Grain SA
+# (SAFEX_GRAINS); the rest from Yahoo futures (FUTURES).
+SA_GRAINS = "SA Grains (SAFEX)"
+CATEGORY_ORDER = ["Precious Metals", "Industrial Metals", "Energy", "Agriculture", SA_GRAINS, "Livestock"]
 CATEGORY_ICONS = {
     "Precious Metals": "🥇", "Industrial Metals": "🏗️", "Energy": "🛢️",
-    "Agriculture": "🌾", "Livestock": "🐄",
+    "Agriculture": "🌾", SA_GRAINS: "🇿🇦", "Livestock": "🐄",
 }
+# Rand-per-tonne tables run to four-to-six figures - no cents.
+_WHOLE_RAND_CATEGORIES = {"Industrial Metals", SA_GRAINS}
 METAL_CATEGORIES = {
     "gold": "Precious Metals", "silver": "Precious Metals",
     "platinum": "Precious Metals", "palladium": "Precious Metals",
@@ -76,19 +81,30 @@ def commodity_catalog() -> dict[str, dict]:
             "name": name, "db_symbol": db_symbol, "category": category,
             "unit": unit, "source": "Yahoo futures",
         }
+    for key, (name, db_symbol, _instrument, cbot_symbol, bushels_per_tonne) in SAFEX_GRAINS.items():
+        catalog[key] = {
+            "name": name, "db_symbol": db_symbol, "category": SA_GRAINS,
+            "unit": "tonne", "source": "SAFEX",
+            # The CBOT series this grain is compared against for the gap.
+            "cbot": (cbot_symbol, bushels_per_tonne),
+        }
     return catalog
 
 
 def _all_db_symbols() -> list[str]:
-    return [db_sym for _, db_sym, _u in COMMODITY_SYMBOLS.values()] + FUTURES_DB_SYMBOLS
+    return (
+        [db_sym for _, db_sym, _u in COMMODITY_SYMBOLS.values()]
+        + FUTURES_DB_SYMBOLS + SAFEX_DB_SYMBOLS
+    )
 
 
 def show_commodities(db: Session):
     """Display the commodities tracking page."""
     st.header("🌍 Commodities")
     st.markdown(
-        "Track global commodity prices and recent performance, in Rand. Metals from "
-        "Metals.dev; energy, agriculture and livestock from Yahoo Finance front-month futures."
+        "Track commodity prices and recent performance, in Rand. Metals from Metals.dev; "
+        "energy, agriculture and livestock from Yahoo Finance front-month futures; SA "
+        "maize and wheat from SAFEX (front contract, via Grain SA)."
     )
     render_last_fetch_caption(db, _all_db_symbols())
 
@@ -199,7 +215,7 @@ def _ensure_commodity_stocks(db: Session) -> None:
 
 
 def _refresh_commodity_prices(db: Session) -> tuple[int, int]:
-    """Fetch Yahoo futures, latest Metals.dev rates and Alpha Vantage history.
+    """Fetch Yahoo futures, SAFEX grains, latest Metals.dev rates and Alpha Vantage history.
 
     Returns (saved_points, failed_sources) so the UI can report honestly.
     """
@@ -211,6 +227,12 @@ def _refresh_commodity_prices(db: Session) -> tuple[int, int]:
         failures += 1
     else:
         saved += futures_written
+
+    safex_written = refresh_safex(db)
+    if safex_written is None:
+        failures += 1
+    else:
+        saved += safex_written
 
     api_collector = MetalsDevCollector()
     if api_collector.enabled:
@@ -316,6 +338,14 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
         st.session_state["commodities_futures_fetched"] = True
         if refresh_futures(db) is None:
             st.warning("Could not fetch energy/agriculture prices from Yahoo Finance - showing stored prices.")
+    # SAFEX publishes once a day after the 12:00 close; same once-per-session guard.
+    if (
+        is_market_data_stale(get_latest_market_data_timestamp(db, SAFEX_DB_SYMBOLS))
+        and not st.session_state.get("commodities_safex_fetched")
+    ):
+        st.session_state["commodities_safex_fetched"] = True
+        if refresh_safex(db) is None:
+            st.warning("Could not fetch SAFEX grain prices from Grain SA - showing stored prices.")
 
     fetch_attempted = False
     latest_rates = {}
@@ -334,7 +364,7 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
     # Queried after any just-saved rates so `latest` reflects today's write.
     # One batched lookup replaces a latest-bar query plus a previous-day
     # query per commodity.
-    snapshots = get_latest_and_previous_prices(db, yf_symbols + FUTURES_DB_SYMBOLS)
+    snapshots = get_latest_and_previous_prices(db, yf_symbols + FUTURES_DB_SYMBOLS + SAFEX_DB_SYMBOLS)
 
     if api_collector.enabled and not fetch_attempted:
         # Reuse today's already-persisted snapshot instead of hitting the
@@ -360,16 +390,30 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
         if not rows:
             st.caption("No prices stored yet - click Refresh Prices.")
             continue
+        price_format = "R %.0f" if category in _WHOLE_RAND_CATEGORIES else "R %.2f"
         st.dataframe(
             rows, width="stretch", hide_index=True,
             column_config={
-                # Per-tonne metals and cocoa run to six figures - no cents.
-                "Price (R)": st.column_config.NumberColumn(
-                    format="R %.0f" if category == "Industrial Metals" else "R %.2f"
-                ),
+                "Price (R)": st.column_config.NumberColumn(format=price_format),
                 "Change %": st.column_config.NumberColumn(format="%+.2f%%"),
+                "CBOT (R)": st.column_config.NumberColumn(
+                    format=price_format,
+                    help="The CBOT price from the Agriculture table, converted to Rand per tonne.",
+                ),
+                "vs CBOT": st.column_config.NumberColumn(
+                    format="%+.1f%%",
+                    help=(
+                        "SA premium (+) or discount (-) to the world price. Near import "
+                        "parity SA is short of grain; a discount means surplus/export pricing."
+                    ),
+                ),
             },
         )
+        if category == SA_GRAINS:
+            st.caption(
+                "White maize has no CBOT contract - it is compared with CBOT (yellow) corn. "
+                "Each grain is priced at its front SAFEX contract, so the series steps at contract rolls."
+            )
 
 
 def build_price_rows(latest_rates: dict[str, float], snapshots: dict) -> dict[str, list[dict]]:
@@ -408,15 +452,22 @@ def build_price_rows(latest_rates: dict[str, float], snapshots: dict) -> dict[st
             source = "Metals.dev" if api_rate is not None else "Stored close"
         else:
             source = info["source"]
-        rows.setdefault(info["category"], []).append({
+        row = {
             "Commodity": info["name"],
-            # No High/Low columns: every stored bar for these pseudo-symbols
-            # carries a close only.
+            # No High/Low columns: most stored bars for these pseudo-symbols
+            # carry a close only.
             "Price (R)": price,
             "Unit": f"per {info['unit']}",
             "Change %": change_pct,
-            "Source": source,
-        })
+        }
+        if "cbot" in info:
+            cbot_symbol, bushels_per_tonne = info["cbot"]
+            cbot_snap, _ = snapshots.get(cbot_symbol, (None, None))
+            cbot = cbot_rand_per_tonne(cbot_snap.close_price if cbot_snap else None, bushels_per_tonne)
+            row["CBOT (R)"] = cbot
+            row["vs CBOT"] = (price / cbot - 1) * 100 if cbot else None
+        row["Source"] = source
+        rows.setdefault(info["category"], []).append(row)
     return rows
 
 
