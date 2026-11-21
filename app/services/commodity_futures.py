@@ -12,7 +12,7 @@ from datetime import timedelta
 
 import pandas as pd
 from loguru import logger
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.collectors.yfinance import YFinanceCollector
@@ -27,11 +27,11 @@ FUTURES = {
     "wti": ("WTI Crude Oil", "YF_WTI", "CL=F", "Energy", "bbl", _USD),
     "brent": ("Brent Crude Oil", "YF_BRENT", "BZ=F", "Energy", "bbl", _USD),
     "natgas": ("Natural Gas", "YF_NATGAS", "NG=F", "Energy", "MMBtu", _USD),
-    "gasoline": ("RBOB Gasoline", "YF_GASOLINE", "RB=F", "Energy", "gal", _USD),
+    "gasoline": ("RBOB Gasoline", "YF_RBOB", "RB=F", "Energy", "gal", _USD),
     "heating_oil": ("Heating Oil / Diesel", "YF_HEATOIL", "HO=F", "Energy", "gal", _USD),
     "wheat": ("Wheat", "YF_WHEAT", "ZW=F", "Agriculture", "bushel", _US_CENTS),
     "corn": ("Corn (Maize)", "YF_CORN", "ZC=F", "Agriculture", "bushel", _US_CENTS),
-    "soybeans": ("Soybeans", "YF_SOYBEANS", "ZS=F", "Agriculture", "bushel", _US_CENTS),
+    "soybeans": ("Soybeans", "YF_SOYBEAN", "ZS=F", "Agriculture", "bushel", _US_CENTS),
     "coffee": ("Coffee", "YF_COFFEE", "KC=F", "Agriculture", "lb", _US_CENTS),
     "sugar": ("Sugar", "YF_SUGAR", "SB=F", "Agriculture", "lb", _US_CENTS),
     "cocoa": ("Cocoa", "YF_COCOA", "CC=F", "Agriculture", "t", _USD),
@@ -126,8 +126,8 @@ def save_zar_closes(db: Session, series: dict[str, dict]) -> int:
 
 def refresh_futures(db: Session, collector: YFinanceCollector | None = None) -> int | None:
     """Fetch and store every futures contract. Returns bars written, or
-    None when the Yahoo request failed (so callers can tell failure from
-    "nothing new")."""
+    None when the Yahoo request or the save failed (so callers can tell
+    failure from "nothing new")."""
     collector = collector or YFinanceCollector()
     period = _BACKFILL_PERIOD if _needs_backfill(db) else _INCREMENTAL_PERIOD
     closes = collector.get_futures_closes([meta[2] for meta in FUTURES.values()], period=period)
@@ -137,6 +137,13 @@ def refresh_futures(db: Session, collector: YFinanceCollector | None = None) -> 
     missing = [meta[2] for meta in FUTURES.values() if meta[1] not in series]
     if missing:
         logger.warning(f"Yahoo returned no futures closes for: {', '.join(missing)}")
-    written = save_zar_closes(db, series)
+    try:
+        written = save_zar_closes(db, series)
+    except SQLAlchemyError as e:
+        # Never take the Commodities page (or the daily job) down with it -
+        # roll back so the shared session stays usable for the metals.
+        db.rollback()
+        logger.error(f"Saving commodity futures failed: {e}")
+        return None
     logger.info(f"Commodity futures refresh ({period}): {written} bars written")
     return written

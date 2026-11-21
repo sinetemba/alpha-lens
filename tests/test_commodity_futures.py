@@ -10,6 +10,31 @@ from app.models.stock import Stock, StockPrice
 from app.services.commodity_futures import FUTURES, refresh_futures, save_zar_closes, zar_closes
 
 
+def test_pseudo_symbols_fit_the_symbol_columns():
+    """Postgres enforces VARCHAR(10) on symbol columns (SQLite, used by the
+    tests, does not) - YF_GASOLINE crashed the page on Postgres."""
+    limit = min(Stock.__table__.c.symbol.type.length, StockPrice.__table__.c.symbol.type.length)
+    for db_symbol in (c["db_symbol"] for c in commodity_catalog().values()):
+        assert len(db_symbol) <= limit, db_symbol
+
+
+def test_save_failure_is_reported_and_rolled_back(db_session, monkeypatch):
+    from sqlalchemy.exc import DataError
+
+    from app.services import commodity_futures
+
+    def boom(db, series):
+        raise DataError("INSERT", {}, Exception("value too long"))
+
+    monkeypatch.setattr(commodity_futures, "save_zar_closes", boom)
+    collector = SimpleNamespace(get_futures_closes=lambda tickers, period: _frame(
+        {"CL=F": [80.0], "ZAR=X": [18.0]}, ["2026-11-20"]
+    ))
+
+    assert refresh_futures(db_session, collector) is None
+    db_session.query(Stock).count()  # session still usable after rollback
+
+
 def _frame(rows: dict, index):
     return pd.DataFrame(rows, index=pd.DatetimeIndex(index))
 
