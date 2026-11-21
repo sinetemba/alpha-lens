@@ -477,6 +477,7 @@ This project follows PEP 8 guidelines. Consider using:
 - ✅ Crypto and net-worth tracking
 
 ### Version 2 (Planned)
+- Push alert delivery to phone/email (Telegram, ntfy, email via Apprise - see [Notifications](#notifications)), with per-type filtering or a daily digest so time-critical alerts such as IPO offer windows reach you without opening the dashboard
 - AI summaries
 - Sentiment analysis
 - Strategy backtesting
