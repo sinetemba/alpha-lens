@@ -182,6 +182,16 @@ is announced so they can subscribe during the offer window (before listing day).
   metric tonne) - `_save_historical_prices` converts `USD x ZAR=X /
   _AV_GRAMS_PER_UNIT` at save time; the `commodity_av_units_v1`
   schema_meta repair deleted the legacy unit-mixed bars.
+- Energy/Agriculture/Livestock on the Commodities page come from Yahoo
+  front-month futures (`services/commodity_futures.py`, `FUTURES`: CL=F,
+  BZ=F, NG=F, RB=F, HO=F, ZW=F, ZC=F, ZS=F, KC=F, SB=F, CC=F, CT=F, LE=F,
+  HE=F) stored as `YF_*` pseudo-symbols in ZAR per quote unit, converted at
+  each day's `ZAR=X`. Grains/softs/livestock quote in **USX (US cents)** -
+  the per-contract scale is 0.01. One batched keyless request (1y backfill,
+  then 1mo incremental); refreshed by the page (auto once per session when
+  stale + Refresh button) and the daily historical job. The page renders
+  one table and one chart tab per `CATEGORY_ORDER` entry; copper is stored
+  per gram but displayed per tonne (`_DISPLAY_PER_TONNE`).
 
 ## Cross-DB SQL expressions
 

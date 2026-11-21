@@ -3,11 +3,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
 from app.models.stock import Stock, StockPrice
-from app.dashboard.utils import format_stock_label, get_latest_market_data_timestamp, is_market_data_stale, render_last_fetch_caption
+from app.dashboard.utils import get_latest_market_data_timestamp, is_market_data_stale, render_last_fetch_caption
 from app.services.price_queries import get_latest_and_previous_prices
 from app.collectors.alpha_vantage import AlphaVantageCollector
 from app.collectors.metals_dev import MetalsDevCollector
 from app.collectors.yfinance import YFinanceCollector
+from app.services.commodity_futures import FUTURES, FUTURES_DB_SYMBOLS, refresh_futures
 from loguru import logger
 
 
@@ -42,12 +43,54 @@ _AV_GRAMS_PER_UNIT = {
     "copper": _GRAMS_PER_TONNE,
 }
 
+# Page sections, in display order. Metals come from Metals.dev/Alpha
+# Vantage (COMMODITY_SYMBOLS); the rest from Yahoo futures (FUTURES).
+CATEGORY_ORDER = ["Precious Metals", "Industrial Metals", "Energy", "Agriculture", "Livestock"]
+CATEGORY_ICONS = {
+    "Precious Metals": "🥇", "Industrial Metals": "🏗️", "Energy": "🛢️",
+    "Agriculture": "🌾", "Livestock": "🐄",
+}
+METAL_CATEGORIES = {
+    "gold": "Precious Metals", "silver": "Precious Metals",
+    "platinum": "Precious Metals", "palladium": "Precious Metals",
+    "copper": "Industrial Metals", "aluminum": "Industrial Metals",
+    "nickel": "Industrial Metals", "zinc": "Industrial Metals", "lead": "Industrial Metals",
+}
+# Copper is stored ZAR/gram (it shares the AV backfill's unit) but sits in
+# the per-tonne Industrial Metals table - scaled at display time only.
+_DISPLAY_PER_TONNE = {"copper"}
+_UNIT_LABELS = {"g": "gram", "mt": "tonne"}
+
+
+def commodity_catalog() -> dict[str, dict]:
+    """Every commodity on the page: key -> name, db_symbol, category, unit, source."""
+    catalog = {}
+    for key, (name, db_symbol, unit) in COMMODITY_SYMBOLS.items():
+        catalog[key] = {
+            "name": name, "db_symbol": db_symbol, "category": METAL_CATEGORIES[key],
+            "unit": "tonne" if key in _DISPLAY_PER_TONNE else _UNIT_LABELS[unit],
+            "source": "Metals.dev",
+        }
+    for key, (name, db_symbol, _ticker, category, unit, _scale) in FUTURES.items():
+        catalog[key] = {
+            "name": name, "db_symbol": db_symbol, "category": category,
+            "unit": unit, "source": "Yahoo futures",
+        }
+    return catalog
+
+
+def _all_db_symbols() -> list[str]:
+    return [db_sym for _, db_sym, _u in COMMODITY_SYMBOLS.values()] + FUTURES_DB_SYMBOLS
+
 
 def show_commodities(db: Session):
     """Display the commodities tracking page."""
     st.header("🌍 Commodities")
-    st.markdown("Track global commodity prices and recent performance.")
-    render_last_fetch_caption(db, [db_sym for _, db_sym, _u in COMMODITY_SYMBOLS.values()])
+    st.markdown(
+        "Track global commodity prices and recent performance, in Rand. Metals from "
+        "Metals.dev; energy, agriculture and livestock from Yahoo Finance front-month futures."
+    )
+    render_last_fetch_caption(db, _all_db_symbols())
 
     _ensure_commodity_stocks(db)
 
@@ -156,12 +199,18 @@ def _ensure_commodity_stocks(db: Session) -> None:
 
 
 def _refresh_commodity_prices(db: Session) -> tuple[int, int]:
-    """Fetch latest rates from Metals.dev and historical prices via Alpha Vantage.
+    """Fetch Yahoo futures, latest Metals.dev rates and Alpha Vantage history.
 
     Returns (saved_points, failed_sources) so the UI can report honestly.
     """
     saved = 0
     failures = 0
+
+    futures_written = refresh_futures(db)
+    if futures_written is None:
+        failures += 1
+    else:
+        saved += futures_written
 
     api_collector = MetalsDevCollector()
     if api_collector.enabled:
@@ -258,6 +307,16 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
 
     yf_symbols = [db_sym for _, db_sym, _u in COMMODITY_SYMBOLS.values()]
 
+    # Yahoo futures: free and keyless, so auto-refresh when stale - once per
+    # session, same guard as the Metals.dev fetch below.
+    if (
+        is_market_data_stale(get_latest_market_data_timestamp(db, FUTURES_DB_SYMBOLS))
+        and not st.session_state.get("commodities_futures_fetched")
+    ):
+        st.session_state["commodities_futures_fetched"] = True
+        if refresh_futures(db) is None:
+            st.warning("Could not fetch energy/agriculture prices from Yahoo Finance - showing stored prices.")
+
     fetch_attempted = False
     latest_rates = {}
     if api_collector.enabled:
@@ -275,7 +334,7 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
     # Queried after any just-saved rates so `latest` reflects today's write.
     # One batched lookup replaces a latest-bar query plus a previous-day
     # query per commodity.
-    snapshots = get_latest_and_previous_prices(db, yf_symbols)
+    snapshots = get_latest_and_previous_prices(db, yf_symbols + FUTURES_DB_SYMBOLS)
 
     if api_collector.enabled and not fetch_attempted:
         # Reuse today's already-persisted snapshot instead of hitting the
@@ -290,10 +349,42 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
             if latest:
                 latest_rates[api_symbol] = latest.close_price
 
-    latest_prices = []
-    for api_symbol, (name, yf_symbol, unit) in COMMODITY_SYMBOLS.items():
-        api_rate = latest_rates.get(api_symbol)
-        latest_snap, prev_snap = snapshots.get(yf_symbol, (None, None))
+    rows_by_category = build_price_rows(latest_rates, snapshots)
+    if not rows_by_category:
+        st.info("No commodity price data available. Click Refresh Prices to fetch data.")
+        return
+
+    for category in CATEGORY_ORDER:
+        rows = rows_by_category.get(category)
+        st.markdown(f"#### {CATEGORY_ICONS[category]} {category}")
+        if not rows:
+            st.caption("No prices stored yet - click Refresh Prices.")
+            continue
+        st.dataframe(
+            rows, width="stretch", hide_index=True,
+            column_config={
+                # Per-tonne metals and cocoa run to six figures - no cents.
+                "Price (R)": st.column_config.NumberColumn(
+                    format="R %.0f" if category == "Industrial Metals" else "R %.2f"
+                ),
+                "Change %": st.column_config.NumberColumn(format="%+.2f%%"),
+            },
+        )
+
+
+def build_price_rows(latest_rates: dict[str, float], snapshots: dict) -> dict[str, list[dict]]:
+    """Group the current-price rows by category.
+
+    `latest_rates` are live Metals.dev per-gram rates (metals only);
+    `snapshots` maps db_symbol -> (latest, previous) stored bars. Every
+    price is in Rand per the row's Unit.
+    """
+    rows: dict[str, list[dict]] = {}
+    for key, info in commodity_catalog().items():
+        meta = COMMODITY_SYMBOLS.get(key)
+        stored_unit = meta[2] if meta else None
+        api_rate = latest_rates.get(key) if meta else None
+        latest_snap, prev_snap = snapshots.get(info["db_symbol"], (None, None))
 
         price = api_rate if api_rate is not None else (latest_snap.close_price if latest_snap else None)
         if price is None:
@@ -301,91 +392,87 @@ def _render_commodity_summary(db: Session, api_collector: MetalsDevCollector):
         # Metals.dev serves every metal per gram under unit=g - convert the
         # LIVE "mt" rate to per tonne; a stored "mt" close is already per
         # tonne (converted at save time).
-        if unit == "mt" and api_rate is not None:
+        if stored_unit == "mt" and api_rate is not None:
             price *= _GRAMS_PER_TONNE
 
         # Compare against the last prior calendar day's stored price, whether
-        # today's price came from the live Metals.dev rate or the DB fallback.
+        # today's price came from the live rate or the DB fallback.
         change_pct = None
         if prev_snap and prev_snap.close_price and prev_snap.close_price > 0:
             change_pct = ((price - prev_snap.close_price) / prev_snap.close_price) * 100
 
-        latest_prices.append({
-            "Commodity": format_stock_label(api_symbol, name),
-            # Stored closes are already in the stored unit (ZAR/g or ZAR/mt)
-            # - the fallback belongs in the ZAR column, never USD.
-            "Price (ZAR/g)": price if unit == "g" else None,
-            "Price (ZAR/mt)": price if unit == "mt" else None,
-            "Change %": change_pct,
-            # No High/Low columns: every stored bar for these pseudo-symbols
-            # carries a close only - neither source serves OHLC, so the
-            # columns could never populate.
-            "Source": "Metals.dev" if api_rate is not None else "Stored close",
-        })
+        if key in _DISPLAY_PER_TONNE:
+            price *= _GRAMS_PER_TONNE
 
-    if latest_prices:
-        st.dataframe(
-            latest_prices, width="stretch", hide_index=True,
-            column_config={
-                "Price (ZAR/g)": st.column_config.NumberColumn(format="R %.2f"),
-                "Price (ZAR/mt)": st.column_config.NumberColumn(format="compact"),
-                "Change %": st.column_config.NumberColumn(format="%+.2f%%"),
-            },
-        )
-    else:
-        st.info("No commodity price data available. Click Refresh Prices to fetch data.")
+        if meta:
+            source = "Metals.dev" if api_rate is not None else "Stored close"
+        else:
+            source = info["source"]
+        rows.setdefault(info["category"], []).append({
+            "Commodity": info["name"],
+            # No High/Low columns: every stored bar for these pseudo-symbols
+            # carries a close only.
+            "Price (R)": price,
+            "Unit": f"per {info['unit']}",
+            "Change %": change_pct,
+            "Source": source,
+        })
+    return rows
 
 
 def _render_commodity_charts(db: Session):
-    """Render historical price charts for commodities using Yahoo Finance data."""
+    """Render 90-day % change charts, one tab per category."""
     st.subheader("Price Charts")
 
     import plotly.graph_objects as go
 
-    database_symbols = {api_symbol: db_sym for api_symbol, (_, db_sym, _u) in COMMODITY_SYMBOLS.items()}
-    # Every tracked symbol is chartable: AV-backed ones have backfilled
-    # history, the rest chart the accumulating Metals.dev daily snapshots.
-    selected = st.multiselect(
-        "Select commodities to compare",
-        sorted(COMMODITY_SYMBOLS),
-        default=sorted(COMMODITY_SYMBOLS),
-        format_func=lambda s: format_stock_label(s, COMMODITY_SYMBOLS[s][0])
-    )
-
-    if not selected:
-        st.info("Select at least one commodity to view the chart.")
-        return
-
-    fig = go.Figure()
+    catalog = commodity_catalog()
     # StockPrice.timestamp is naive UTC - keep the filter naive to match.
     start_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=90)
 
-    for api_symbol in selected:
-        database_symbol = database_symbols[api_symbol]
-        prices = db.query(StockPrice).filter(
-            StockPrice.symbol == database_symbol,
-            StockPrice.timestamp >= start_date
-        ).order_by(StockPrice.timestamp.asc()).all()
+    tabs = st.tabs([f"{CATEGORY_ICONS[c]} {c}" for c in CATEGORY_ORDER])
+    for tab, category in zip(tabs, CATEGORY_ORDER):
+        members = {k: v for k, v in catalog.items() if v["category"] == category}
+        with tab:
+            # Every member is chartable: AV/Yahoo-backed ones have backfilled
+            # history, the rest chart the accumulating daily snapshots.
+            selected = st.multiselect(
+                "Commodities to compare",
+                list(members),
+                default=list(members),
+                format_func=lambda k: catalog[k]["name"],
+                key=f"commodities_chart_{category}",
+            )
+            if not selected:
+                st.info("Select at least one commodity to view the chart.")
+                continue
 
-        if prices:
-            # Rebase each series to % change from its first visible point -
-            # the sources report different units (ZAR/g, USD/oz, USD/lb) so
-            # raw closes on one axis are not comparable.
-            base = prices[0].close_price
-            if base:
-                fig.add_trace(go.Scatter(
-                    x=[p.timestamp for p in prices],
-                    y=[(p.close_price / base - 1) * 100 for p in prices],
-                    name=format_stock_label(api_symbol, COMMODITY_SYMBOLS[api_symbol][0]),
-                    mode="lines"
-                ))
+            fig = go.Figure()
+            for key in selected:
+                prices = db.query(StockPrice.timestamp, StockPrice.close_price).filter(
+                    StockPrice.symbol == members[key]["db_symbol"],
+                    StockPrice.timestamp >= start_date,
+                ).order_by(StockPrice.timestamp.asc()).all()
+                # Rebase each series to % change from its first visible point -
+                # units differ (R/g, R/bbl, R/bushel) so raw closes on one
+                # axis are not comparable.
+                if prices and prices[0].close_price:
+                    base = prices[0].close_price
+                    fig.add_trace(go.Scatter(
+                        x=[p.timestamp for p in prices],
+                        y=[(p.close_price / base - 1) * 100 for p in prices],
+                        name=members[key]["name"],
+                        mode="lines",
+                    ))
 
-    fig.update_layout(
-        title="90-Day Commodity Price Performance (% change)",
-        xaxis_title="Date",
-        yaxis_title="Change since first day (%)",
-        hovermode="x unified",
-        height=500
-    )
-
-    st.plotly_chart(fig, width="stretch")
+            if not fig.data:
+                st.info("No price history stored yet - click Refresh Prices.")
+                continue
+            fig.update_layout(
+                title=f"90-Day {category} Performance (% change, in Rand)",
+                xaxis_title="Date",
+                yaxis_title="Change since first day (%)",
+                hovermode="x unified",
+                height=450,
+            )
+            st.plotly_chart(fig, width="stretch", key=f"commodities_fig_{category}")

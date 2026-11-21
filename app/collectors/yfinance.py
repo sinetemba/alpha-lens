@@ -122,6 +122,31 @@ class YFinanceCollector:
             return None
         return {k: v for k, v in spots.items() if v and v == v and v > 0} or None
 
+    def get_futures_closes(self, tickers: List[str], period: str = "1y"):
+        """Daily closes for Yahoo futures tickers (e.g. "CL=F") plus "ZAR=X".
+
+        One batched download; tickers are passed verbatim (no ".JO" suffix,
+        no cents->Rand scaling - futures quote in USD or US cents). Returns
+        a DataFrame (date index, one column per ticker incl. "ZAR=X") or
+        None on failure.
+        """
+        if not self.enabled or not tickers:
+            return None
+        try:
+            closes = self._call_with_retry(
+                f"Yahoo futures closes ({len(tickers)} tickers)",
+                lambda: yf.download(
+                    list(tickers) + ["ZAR=X"], period=period,
+                    progress=False, auto_adjust=True, threads=True,
+                )["Close"],
+            )
+        except Exception as e:
+            logger.error(f"Yahoo futures fetch failed: {e}")
+            return None
+        if closes is None or closes.empty or "ZAR=X" not in closes.columns:
+            return None
+        return closes
+
     def search_jse(self, query: str, limit: int = 8) -> Optional[List[Dict]]:
         """Search Yahoo for JSE listings by company name or ticker.
 

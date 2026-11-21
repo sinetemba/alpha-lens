@@ -544,6 +544,17 @@ class UpdaterService:
                 db.rollback()
                 logger.warning(f"Dividend watch refresh failed: {e}")
 
+            # Energy/agriculture/livestock futures for the Commodities page -
+            # one keyless batched Yahoo request, so the series fills in even
+            # on days nobody opens the page. Never fails the historical run.
+            try:
+                from app.services.commodity_futures import refresh_futures
+                if refresh_futures(db) is None:
+                    logger.warning("Commodity futures refresh failed (Yahoo)")
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"Commodity futures refresh failed: {e}")
+
             # Near-52w-low penny alerts ride on this job so they run on the
             # day's closes and inherit its catch-up after sleep. One batched
             # Yahoo request; a failure here never fails the historical run.
