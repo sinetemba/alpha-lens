@@ -1,7 +1,7 @@
 import time
 import yfinance as yf
 from typing import List, Dict, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.config.settings import settings
 from loguru import logger
 
@@ -68,6 +68,36 @@ class YFinanceCollector:
 
         return hist
     
+    _usd_zar_cache: Optional[tuple] = None  # (rate, aware-utc fetched_at)
+    _USD_ZAR_TTL = timedelta(hours=1)
+
+    def get_usd_zar(self) -> Optional[float]:
+        """USD/ZAR exchange rate from Yahoo ('ZAR=X'), cached ~1h per process.
+
+        Used to convert USD-account values into Rand so portfolio totals,
+        snapshots and net worth never sum mixed currencies.
+        """
+        cached = self.__class__._usd_zar_cache
+        if cached and datetime.now(timezone.utc) - cached[1] < self._USD_ZAR_TTL:
+            return cached[0]
+        if not self.enabled:
+            return None
+        try:
+            closes = self._call_with_retry(
+                "Yahoo USD/ZAR rate",
+                lambda: yf.download(
+                    ["ZAR=X"], period="5d", progress=False, auto_adjust=False
+                )["Close"],
+            )
+            rate = float(closes["ZAR=X"].ffill().iloc[-1])
+        except Exception as e:
+            logger.error(f"USD/ZAR fetch failed: {e}")
+            return None
+        if not rate or rate != rate or rate <= 0:
+            return None
+        self.__class__._usd_zar_cache = (rate, datetime.now(timezone.utc))
+        return rate
+
     def get_metal_spots_zar(self) -> Optional[Dict[str, float]]:
         """Gold/silver ZAR per troy oz: COMEX futures x USDZAR; None on failure.
 
@@ -234,8 +264,12 @@ class YFinanceCollector:
         """Batch-download recent bars for many symbols in a single yf.download call.
 
         Returns a mapping of original symbol -> DataFrame (columns Open/High/
-        Low/Close/Adj Close/Volume). Symbols that failed to resolve are simply
-        absent from the result. JSE prices are converted from cents to Rand.
+        Low/Close/Volume; no Adj Close under auto_adjust). Symbols that failed
+        to resolve are simply absent from the result. JSE prices are
+        converted from cents to Rand. auto_adjust=True keeps close_price on
+        the same dividend-adjusted convention the history paths write - the
+        newest bar is identical either way, but raw and adjusted bars in one
+        series made phantom moves at every dividend.
         """
         if not self.enabled or not symbols:
             return {}
@@ -252,7 +286,7 @@ class YFinanceCollector:
                     group_by="ticker",
                     threads=True,
                     progress=False,
-                    auto_adjust=False,
+                    auto_adjust=True,
                 ),
             )
         except Exception as e:
@@ -268,19 +302,25 @@ class YFinanceCollector:
 
         result = {}
         for symbol, yf_symbol in yf_symbols.items():
-            frame = None
+            # Per-symbol guard: an unexpected frame shape (a Series, swapped
+            # MultiIndex levels) must skip that symbol, not fail the whole
+            # batch job that called this.
             try:
-                frame = data[yf_symbol]
-            except (KeyError, TypeError):
-                # Single-symbol downloads may not produce a ticker level.
-                if len(yf_symbols) == 1:
-                    frame = data
-            if frame is None:
-                continue
-            frame = frame.dropna(how="all")
-            if frame.empty:
-                continue
-            result[symbol] = self._to_rand(frame, symbol)
+                frame = None
+                try:
+                    frame = data[yf_symbol]
+                except (KeyError, TypeError):
+                    # Single-symbol downloads may not produce a ticker level.
+                    if len(yf_symbols) == 1:
+                        frame = data
+                if frame is None or not hasattr(frame, "dropna"):
+                    continue
+                frame = frame.dropna(how="all")
+                if frame.empty:
+                    continue
+                result[symbol] = self._to_rand(frame, symbol)
+            except Exception as e:
+                logger.error(f"Could not split downloaded frame for {symbol}: {e}")
         return result
 
     def get_history_batch(

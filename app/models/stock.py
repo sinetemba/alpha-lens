@@ -23,6 +23,10 @@ class Stock(Base):
     # sector-less listings) would otherwise trigger a get_info call on every
     # price save forever.
     details_fetched_at = Column(DateTime)
+    # Last time update_dividends fetched this symbol. Dividends change at
+    # declaration cadence (weeks), so the daily job skips symbols fetched
+    # recently instead of spending a Yahoo request on each, every run.
+    last_dividend_fetch = Column(DateTime)
     created_at = Column(DateTime, default=utcnow_naive)
     updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
 

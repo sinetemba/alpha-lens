@@ -5,7 +5,7 @@ precision: whitelist real-IPO phrases, exclude the daily flood of warrant/
 note/ETF instrument listings and interest-payment announcements. Dedup is
 by `source_url`, so the daily scan is idempotent.
 """
-from datetime import timedelta
+from datetime import timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -95,7 +95,9 @@ def update_ipo_listings(db: Session, collector=None) -> int:
         existing_urls.add(url)
         published = ann.get("published_at")
         if published is not None and published.tzinfo is not None:
-            published = published.replace(tzinfo=None)
+            # Convert to naive UTC - Moneyweb's datetime carries the SAST
+            # offset; stripping it stores local wall-clock as UTC (2h skew).
+            published = published.astimezone(timezone.utc).replace(tzinfo=None)
         listing = UpcomingListing(
             symbol=ann.get("symbol"),
             name=ann.get("name"),

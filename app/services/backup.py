@@ -30,12 +30,16 @@ from sqlalchemy.engine import make_url
 
 from app.config.settings import settings
 
+ROOT = Path(__file__).resolve().parents[2]
+
 BACKUP_PREFIX = "alphalens_"
 BACKUP_PATTERNS = (f"{BACKUP_PREFIX}*.dump", f"{BACKUP_PREFIX}*.db")
 
 
 def _backup_dir() -> Path:
     path = Path(settings.backup_dir)
+    if not path.is_absolute():
+        path = ROOT / path
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -122,7 +126,13 @@ def _backup_postgres(url, target: Path) -> None:
 
 
 def _backup_sqlite(url, target: Path) -> None:
-    source = sqlite3.connect(url.database)
+    # url.database is relative to the repo root (e.g. ./data/stock_analyzer.db)
+    # - resolve it there rather than trusting cwd, and open mode=rw so a
+    # missing file fails instead of silently backing up a new empty DB.
+    db_path = Path(url.database)
+    if not db_path.is_absolute():
+        db_path = (ROOT / db_path).resolve()
+    source = sqlite3.connect(f"file:{db_path}?mode=rw", uri=True)
     try:
         dest = sqlite3.connect(str(target))
         try:

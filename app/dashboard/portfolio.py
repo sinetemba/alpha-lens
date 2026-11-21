@@ -1,4 +1,5 @@
 from collections import Counter
+from typing import Optional
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -15,6 +16,7 @@ from app.models.portfolio import (
 from app.models.portfolio_snapshot import PortfolioSnapshot
 from app.models.transaction import PortfolioTransaction
 from app.models.stock import Stock, StockPrice
+from app.models.watchlist import WatchlistItem
 from app.dashboard.utils import (
     format_stock_label,
     is_market_data_stale,
@@ -74,6 +76,9 @@ def show_portfolio(db: Session):
         ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
     ).order_by(PortfolioHolding.purchase_date.asc()).all()
     refresh_requested, sync_caption = _render_easyequities_refresh_control(collector, portfolio)
+    sync_flash = st.session_state.pop("portfolio_sync_flash", None)
+    if sync_flash:
+        getattr(st, sync_flash[0])(sync_flash[1])
 
     # Track EasyEquities sync recency via a persistent DB column (rather than
     # holdings.updated_at, which is also bumped by unrelated writes like
@@ -219,7 +224,11 @@ def show_portfolio(db: Session):
         else:
             if st.button("Fetch EasyEquities Accounts"):
                 with st.spinner("Logging in to EasyEquities..."):
-                    accounts = collector.list_accounts()
+                    try:
+                        accounts = collector.list_accounts()
+                    except Exception as e:
+                        logger.error(f"EasyEquities account fetch failed: {e}")
+                        accounts = None
 
                 if accounts:
                     st.session_state["ee_accounts"] = accounts
@@ -241,7 +250,11 @@ def show_portfolio(db: Session):
 
                 if st.button("Sync Holdings"):
                     with st.spinner("Fetching holdings from EasyEquities..."):
-                        ee_holdings = collector.get_holdings(account_id)
+                        try:
+                            ee_holdings = collector.get_holdings(account_id)
+                        except Exception as e:
+                            logger.error(f"EasyEquities holdings fetch failed: {e}")
+                            ee_holdings = None
 
                     if ee_holdings is None:
                         st.error("Could not fetch holdings from EasyEquities.")
@@ -251,7 +264,10 @@ def show_portfolio(db: Session):
                         for ee_holding in ee_holdings:
                             _sync_holding_from_easyequities(db, portfolio.id, ee_holding)
                         db.commit()
-                        st.success(f"Synced {len(ee_holdings)} holdings from EasyEquities.")
+                        st.session_state["portfolio_sync_flash"] = (
+                            "success",
+                            f"Synced {len(ee_holdings)} holdings from EasyEquities.",
+                        )
                         st.rerun()
 
     st.markdown("---")
@@ -416,8 +432,11 @@ def _render_unpriced_notice(db: Session, holdings: list, portfolio: Portfolio) -
 
 def _render_value_history(db: Session, portfolio_id: int) -> None:
     """Total value vs cost basis over time, from the daily snapshots."""
+    # Bound the chart to ~3 years - one row per day accumulates forever.
+    since = (datetime.now(timezone.utc) - timedelta(days=3 * 365)).replace(tzinfo=None)
     rows = db.query(PortfolioSnapshot).filter(
-        PortfolioSnapshot.portfolio_id == portfolio_id
+        PortfolioSnapshot.portfolio_id == portfolio_id,
+        PortfolioSnapshot.snapshot_date >= since,
     ).order_by(PortfolioSnapshot.snapshot_date).all()
     with st.expander("📈 Value over time", expanded=len(rows) >= 2):
         if len(rows) < 2:
@@ -594,6 +613,66 @@ def _get_group_latest_and_previous_prices(
     return get_latest_and_previous_prices(db, symbols)
 
 
+def _holding_price_stats(db: Session, symbols: list[str]) -> dict[str, dict]:
+    """52-week/trend stats per symbol for the Action column - one query,
+    grouped in Python (a per-symbol query per holding would be ~20 hits).
+    """
+    if not symbols:
+        return {}
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=370)
+    rows = db.query(StockPrice.symbol, StockPrice.close_price).filter(
+        StockPrice.symbol.in_(symbols),
+        StockPrice.timestamp >= cutoff,
+        StockPrice.close_price > 0,
+    ).order_by(StockPrice.symbol, StockPrice.timestamp).all()
+    closes: dict[str, list[float]] = {}
+    for symbol, close in rows:
+        closes.setdefault(symbol, []).append(close)
+    stats = {}
+    for symbol, series in closes.items():
+        cur = series[-1]
+        stats[symbol] = {
+            "price": cur,
+            "low_52w": min(series),
+            "sma20": sum(series[-20:]) / min(20, len(series)),
+            "sma50": sum(series[-50:]) / min(50, len(series)),
+            "mom_3m": (cur - series[-63]) / series[-63] * 100
+            if len(series) >= 63 and series[-63] else 0.0,
+        }
+    return stats
+
+
+def _holding_action(gain_loss_pct, stats: dict, watch: Optional[WatchlistItem] = None) -> str:
+    """Rule-based hold/buy/sell for one holding.
+
+    Encodes the classic sell-discipline rules rather than a naked P/L read:
+    honour your own exits (watchlist stop/target) > cut what is still
+    falling (a knife isn't a bargain) > dead positions have no reason to be
+    held > add where a turn or an uptrend is confirmed > otherwise hold and
+    wait - a loss by itself is not a sell signal.
+    """
+    price = stats["price"]
+    losing = gain_loss_pct is not None and gain_loss_pct < 0
+    if watch is not None and watch.stop_loss and price <= watch.stop_loss:
+        return "Sell — stop hit"
+    if (watch is not None and watch.target_price and price >= watch.target_price
+            and gain_loss_pct is not None and gain_loss_pct > 0):
+        return "Trim — target hit"
+    mom = stats["mom_3m"]
+    # Still falling = real downtrend, or parked AT the 52w low with no bounce.
+    falling = mom < -5 or (price <= stats["low_52w"] * 1.02 and mom <= 0)
+    if losing and gain_loss_pct <= -15 and falling and price <= stats["sma20"]:
+        return "Sell — still falling"
+    if losing and mom > 0 and price >= stats["sma20"]:
+        return "Buy — recovering"
+    if (gain_loss_pct is not None and gain_loss_pct > 0
+            and price >= stats["sma50"] and mom > 0):
+        return "Buy — uptrend"
+    if losing:
+        return "Hold — watch"
+    return "Hold"
+
+
 def _render_holdings_table(
     db: Session, account_type: str, holdings: list, funds_to_invest: float | None = None
 ) -> None:
@@ -622,9 +701,35 @@ def _render_holdings_table(
     if unchanged:
         summary += f" | \U0001f7e1 {unchanged} unchanged"
     st.caption(summary)
+    if not is_jse_tracked_account(account_type):
+        st.caption(
+            "USD-account values are converted to Rand at the USD/ZAR rate from "
+            "the last EasyEquities sync."
+        )
+
+    # Action column inputs: JSE-held symbols get 52w/trend stats in one
+    # query; watchlist stops/targets become the user's own exit rules.
+    jse_symbols = [h.symbol for h in holdings if h.symbol and is_jse_tracked_account(h.account_type)]
+    stats_map = _holding_price_stats(db, jse_symbols)
+    watched = {
+        w.symbol: w
+        for w in db.query(WatchlistItem).filter(
+            WatchlistItem.symbol.in_(jse_symbols),
+            WatchlistItem.is_active == True,
+        ).all()
+    }
 
     data = []
     for holding in holdings:
+        jse = is_jse_tracked_account(holding.account_type)
+        if not jse:
+            action = "—"
+        elif holding.symbol not in stats_map:
+            action = "Sell — no prices"
+        else:
+            action = _holding_action(
+                holding.gain_loss_percentage, stats_map[holding.symbol], watched.get(holding.symbol)
+            )
         data.append({
             "Symbol": format_stock_label(holding.symbol, holding.stock.name if holding.stock else None),
             "Quantity": holding.quantity,
@@ -637,8 +742,8 @@ def _render_holdings_table(
             "Current Value": holding.current_value,
             "Gain/Loss": holding.gain_loss,
             "Gain/Loss %": holding.gain_loss_percentage,
+            "Action": action,
             "Dividends": holding.total_dividends_received,
-            "_gain_loss": holding.gain_loss,
         })
 
     if not data:
@@ -649,7 +754,7 @@ def _render_holdings_table(
         st.metric("Funds to Invest", f"R {funds_to_invest:,.2f}")
 
     holdings_table = pd.DataFrame(data)
-    available_columns = [c for c in holdings_table.columns if c != "_gain_loss"]
+    available_columns = list(holdings_table.columns)
     table_key = f"portfolio_{account_type}_columns"
     if table_key not in st.session_state:
         st.session_state[table_key] = available_columns
@@ -660,9 +765,12 @@ def _render_holdings_table(
     )
     if selected_columns:
         visible_columns = [c for c in available_columns if c in selected_columns]
-        visible_table = holdings_table[visible_columns + ["_gain_loss"]]
-        styled_table = visible_table.style.apply(style_gain_loss_row, axis=1).hide(
-            axis="columns", subset=["_gain_loss"]
+        visible_table = holdings_table[visible_columns]
+        # gain_loss comes from the full frame: the user may hide the
+        # "Gain/Loss" column but the row colouring must still work.
+        styled_table = visible_table.style.apply(
+            lambda row: style_gain_loss_row(row, holdings_table.loc[row.name, "Gain/Loss"]),
+            axis=1,
         )
         # Per-row decimals keyed on the current price - taken from the full
         # table, since the user may have hidden the Current Price column.
@@ -683,6 +791,16 @@ def _render_holdings_table(
                 "Current Value": st.column_config.NumberColumn("Current Value", format="R %.2f", help="Current market value of the holding."),
                 "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format="R %.2f", help="Current value less total purchase value."),
                 "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", format="%.2f%%", help="Gain or loss as a percentage of total purchase value."),
+                "Action": st.column_config.TextColumn(
+                    "Action",
+                    help=(
+                        "Rule-based suggestion from price history and your watchlist exits - "
+                        "Sell: stop-loss hit, still falling >15% below cost in a downtrend, or "
+                        "no prices at all; Trim: watchlist target reached while in profit; "
+                        "Buy: loser recovering above its 20-day average with positive momentum, "
+                        "or a winner in an uptrend; Hold: everything else. Not financial advice."
+                    ),
+                ),
                 "Dividends": st.column_config.NumberColumn("Dividends", format="R %.2f", help="Total dividends recorded for this holding."),
             },
         )

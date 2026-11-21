@@ -20,6 +20,7 @@ from app.models.portfolio import (
 )
 from app.models.stock import Stock, StockPrice
 from app.collectors.easyequities import EasyEquitiesCollector
+from app.collectors.yfinance import YFinanceCollector
 
 
 def _normalize_account_type(account_type: str | None) -> str:
@@ -305,8 +306,30 @@ def sync_portfolio_from_easyequities(
         holdings_by_key = {}
         latest_closes = {}
 
+    # USD-account values arrive in dollars: convert to Rand once here so
+    # portfolio totals, snapshots, net worth and transaction P&L never sum
+    # mixed currencies. Without a rate the holding is kept dollar-valued
+    # (still wrong-unit in totals, but visible and retried next sync).
+    usd_zar = None
+    if any(
+        not is_jse_tracked_account(h["account_name"])
+        for h in aggregated_holdings.values()
+    ):
+        usd_zar = YFinanceCollector().get_usd_zar()
+        if usd_zar:
+            logger.info(f"Converting USD-account EasyEquities values at USD/ZAR {usd_zar:.4f}")
+
     opened: dict = {}
     for ee_holding in aggregated_holdings.values():
+        if not is_jse_tracked_account(ee_holding["account_name"]):
+            if usd_zar and (ee_holding.get("currency") or "USD") == "USD":
+                ee_holding["purchase_value"] *= usd_zar
+                ee_holding["current_value"] *= usd_zar
+            elif not usd_zar:
+                logger.warning(
+                    "USD/ZAR rate unavailable - USD-account holding "
+                    f"{ee_holding['symbol']} keeps dollar values this sync"
+                )
         ee_holding["purchase_price"] = ee_holding["purchase_value"] / ee_holding["shares"]
         ee_holding["current_price"] = ee_holding["current_value"] / ee_holding["shares"]
         _sync_holding_from_easyequities(

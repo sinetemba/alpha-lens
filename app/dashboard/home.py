@@ -115,7 +115,8 @@ def show_home():
         data_source = PAGE_DATA_SOURCES.get(current.title, "Multiple sources")
         header_col, source_col = st.columns([4, 1])
         with header_col:
-            st.title("JSE Stock Analysis Platform")
+            st.title("AlphaLens")
+            st.caption("JSE stocks, portfolio, crypto & bullion - tracked, screened, alerted.")
         with source_col:
             st.markdown(
                 f"<p style='text-align: right; font-size: small; color: #888; margin: 0;'>"
@@ -182,7 +183,9 @@ def _render_home(db: Session):
             st.metric(
                 label="Portfolio Value",
                 value=f"R {_holdings_market_value(db, holdings):,.2f}",
-                delta=_get_portfolio_change(db, holdings)
+                delta=f"{_get_portfolio_change(db, holdings)} since cost",
+                help="Total gain/loss vs what you paid - not today's move "
+                     "(that's Daily Gain).",
             )
         else:
             # "R 0.00" looked like a real value; make the empty state explicit.
@@ -341,12 +344,15 @@ def _get_daily_gain(db: Session, holdings: list) -> float:
 
 
 def _get_daily_gain_percentage(db: Session, holdings: list) -> str:
-    """Get daily gain as a percentage of portfolio value."""
+    """Get daily gain as a percentage of yesterday's portfolio value."""
     total_value = _holdings_market_value(db, holdings)
     if total_value > 0:
         daily_gain = _get_daily_gain(db, holdings)
-        pct = (daily_gain / total_value) * 100
-        return f"{pct:+.2f}%"
+        # Denominator is yesterday's value, not today's - gain/value-today
+        # systematically understates the move.
+        base = total_value - daily_gain
+        if base > 0:
+            return f"{(daily_gain / base) * 100:+.2f}%"
     return "0.0%"
 
 

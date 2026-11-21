@@ -40,7 +40,10 @@ class NotificationService:
     def __init__(self, db: Session):
         self.db = db
         self.enabled = settings.notification_enabled
-        
+        # (type, title, symbol) -> row for the dedup window, loaded lazily so
+        # a burst of alert checks costs one query instead of one per alert.
+        self._recent_by_key: Optional[dict] = None
+
         if self.enabled:
             self.appr = apprise.Apprise()
             self._setup_notification_channels()
@@ -126,13 +129,16 @@ class NotificationService:
         ALERT_DEDUP_WINDOW return the existing row instead of inserting a
         duplicate on every update run.
         """
-        cutoff = _utcnow_naive() - ALERT_DEDUP_WINDOW
-        existing = self.db.query(Notification).filter(
-            Notification.type == notification_type,
-            Notification.title == title,
-            Notification.stock_symbol == stock_symbol,
-            Notification.created_at >= cutoff,
-        ).first()
+        if self._recent_by_key is None:
+            cutoff = _utcnow_naive() - ALERT_DEDUP_WINDOW
+            self._recent_by_key = {
+                (row.type, row.title, row.stock_symbol): row
+                for row in self.db.query(Notification).filter(
+                    Notification.created_at >= cutoff
+                ).all()
+            }
+        key = (notification_type, title, stock_symbol)
+        existing = self._recent_by_key.get(key)
         if existing:
             return existing
 
@@ -141,12 +147,18 @@ class NotificationService:
             title=title,
             message=message,
             stock_symbol=stock_symbol,
-            meta_data=json.dumps(metadata) if metadata else None
+            meta_data=json.dumps(metadata) if metadata else None,
+            # Delivery disabled = in-app channel only: mark sent so the row
+            # never queues for external delivery - otherwise the day delivery
+            # is first enabled, weeks of stale alerts flush at once.
+            is_sent=not self.enabled,
+            delivery_channel=None if self.enabled else "in-app",
         )
-        
+
         self.db.add(notification)
         self.db.commit()
-        
+        self._recent_by_key[key] = notification
+
         return notification
     
     def send_notification(self, notification: Notification, channel: Optional[str] = None) -> bool:
@@ -367,15 +379,20 @@ class NotificationService:
             )
 
     def send_pending_notifications(self):
-        """Send all pending notifications."""
+        """Send pending notifications, newest first, within the last day only.
+
+        Rows older than a day are skipped: an alert that stale is noise, and
+        a permanently failing row must not head-of-line block fresh ones.
+        """
         if not self.enabled:
             return
-        
+
         pending = self.db.query(Notification).filter(
             Notification.is_sent == False,
             or_(Notification.attempts.is_(None), Notification.attempts < MAX_SEND_ATTEMPTS),
-        ).order_by(Notification.created_at.asc()).limit(200).all()
-        
+            Notification.created_at >= _utcnow_naive() - timedelta(hours=24),
+        ).order_by(Notification.created_at.desc()).limit(200).all()
+
         for notification in pending:
             self.send_notification(notification)
     

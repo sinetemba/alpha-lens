@@ -129,6 +129,15 @@ def show_krugerrands(db: Session):
             (SILVER_USD_LIVE_SYMBOL, silver_usd),
             (SILVER_LIVE_SYMBOL, silver_zar),
         ])
+    elif not silver_zar:
+        # Same stored-bar fallback gold has - a failed fetch shouldn't leave
+        # silver holdings silently unpriced.
+        silver_zar = _get_latest_price(db, SILVER_LIVE_SYMBOL)[0]
+    if gold_api.enabled and not (silver_usd_data and silver_zar_data):
+        st.caption(
+            "Silver spot fetch failed"
+            + (" - showing the last stored price." if silver_zar else " - silver prices unavailable.")
+        )
 
     if show_silver:
         if silver_usd_data and silver_zar_data:

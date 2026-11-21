@@ -618,17 +618,23 @@ def check_near_low_alerts(
     names = names or {}
     notifier = NotificationService(db)
     cutoff = utcnow_naive() - NEAR_LOW_COOLDOWN
+    candidates = near_low_candidates(results, threshold_pct, held)
+    if not candidates:
+        return 0
+    # One grouped query for every candidate's cooldown check, not one each.
+    alerted_titles = {
+        title for (title,) in db.query(Notification.title).filter(
+            Notification.type == "price",
+            Notification.stock_symbol.in_([r["symbol"] for r in candidates]),
+            Notification.title.like("Near 52-week low:%"),
+            Notification.created_at >= cutoff,
+        ).all()
+    }
     created = 0
-    for row in near_low_candidates(results, threshold_pct, held):
+    for row in candidates:
         symbol = row["symbol"]
         title = near_low_title(symbol)
-        recent = db.query(Notification.id).filter(
-            Notification.type == "price",
-            Notification.title == title,
-            Notification.stock_symbol == symbol,
-            Notification.created_at >= cutoff,
-        ).first()
-        if recent:
+        if title in alerted_titles:
             continue
         notifier.create_notification(
             notification_type="price",

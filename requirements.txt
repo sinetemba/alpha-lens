@@ -1,4 +1,4 @@
-# JSE Stock Analysis Platform - Python Dependencies
+# AlphaLens - Python Dependencies
 
 # Python Version: 3.13+
 
@@ -7,15 +7,10 @@ streamlit==1.66.1
 
 # Charts and Visualization
 plotly==5.24.1
-streamlit-aggrid==0.3.4.post3
 
 # Data Processing
 pandas==2.2.3
 numpy==2.1.3
-
-# Technical Analysis
-ta==0.11.0
-scipy==1.14.1
 
 # Database
 sqlalchemy==2.0.35

@@ -474,7 +474,9 @@ def _render_add_form(db: Session):
                 key="crypto_add_search",
                 placeholder="e.g. near, PEPE, Injective",
             )
-            candidates = _search_coin(query) if query else []
+            # Gate at 3+ chars: a CoinGecko search call on every keystroke
+            # burns through the free rate limit.
+            candidates = _search_coin(query) if len(query.strip()) >= 3 else []
             if candidates:
                 pick = st.selectbox(
                     "Match",
@@ -484,8 +486,10 @@ def _render_add_form(db: Session):
                 )
                 custom_id = pick["id"]
                 resolved_preview = pick
-            elif query:
+            elif len(query.strip()) >= 3:
                 st.caption("No matches - check the spelling or try the exact CoinGecko id.")
+            elif query:
+                st.caption("Keep typing - search starts at 3 characters.")
 
         col1, col2 = st.columns(2)
         with col1:

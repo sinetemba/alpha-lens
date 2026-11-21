@@ -8,7 +8,7 @@ from loguru import logger
 
 from app.models.dividend import Dividend, MoneywebDividendWatch
 from app.models.portfolio import PortfolioHolding, is_jse_tracked_account
-from app.models.stock import Stock
+from app.models.stock import Stock, StockPrice
 from app.models.watchlist import WatchlistItem
 from app.services.data_service import DataService
 from app.collectors.moneyweb import MoneywebCollector
@@ -23,7 +23,8 @@ def show_dividends(db: Session):
 
     # Summary metrics
     total_dividends = db.query(Dividend).count()
-    total_amount = db.query(func.sum(Dividend.amount)).scalar() or 0.0
+    # Summing per-share amounts across symbols is meaningless; count payers.
+    paying_symbols = db.query(func.count(func.distinct(Dividend.symbol))).scalar() or 0
 
     holdings = [
         h for h in db.query(PortfolioHolding).options(
@@ -63,7 +64,7 @@ def show_dividends(db: Session):
     with col1:
         st.metric("Dividend Records", total_dividends)
     with col2:
-        st.metric("Total Dividends (per share)", f"R {total_amount:,.4f}")
+        st.metric("Symbols Paying", paying_symbols)
     with col3:
         st.metric("Dividend Income (since purchase)", f"R {total_income:,.2f}")
 
@@ -141,7 +142,9 @@ def show_dividends(db: Session):
                         .all()
                     }
                 )
-                saved = data_service.update_dividends(tracked)
+                # An explicit click forces a fetch - bypass the daily
+                # freshness gate on Stock.last_dividend_fetch.
+                saved = data_service.update_dividends(tracked, freshness_days=0)
                 if saved > 0:
                     st.session_state["dividends_fetch_flash"] = (
                         "success", f"Saved {saved} new dividend records."
@@ -265,10 +268,31 @@ def show_dividends(db: Session):
                 if any(abs((d.amount or 0.0) - amount) < 1e-6 for d in same_day):
                     st.warning(f"A dividend for {symbol} on {ex_date} already exists.")
                 else:
+                    # Same cents-vs-Rand guard as the provider paths: a cash
+                    # dividend above half the share price is almost certainly
+                    # entered in cents.
+                    stored_amount = amount
+                    if (currency or "ZAR") == "ZAR":
+                        closes = db.query(
+                            StockPrice.timestamp, StockPrice.close_price
+                        ).filter(
+                            StockPrice.symbol == symbol,
+                            StockPrice.close_price.isnot(None),
+                            StockPrice.timestamp >= ex_dt - timedelta(days=730),
+                            StockPrice.timestamp <= ex_dt + timedelta(days=730),
+                        ).all()
+                        stored_amount = DataService._dividend_amount_rand(
+                            symbol, amount, DataService._close_near(closes, ex_dt)
+                        )
+                        if stored_amount != amount:
+                            st.info(
+                                f"Amount {amount} exceeds half the share price - "
+                                f"stored as R {stored_amount:.4f} (assumed cents)."
+                            )
                     dividend = Dividend(
                         stock_id=stock.id,
                         symbol=symbol,
-                        amount=amount,
+                        amount=stored_amount,
                         currency=currency or "ZAR",
                         ex_dividend_date=ex_dt,
                         payment_date=datetime.combine(payment_date, datetime.min.time()) if payment_date else None,
@@ -283,5 +307,8 @@ def show_dividends(db: Session):
                         db.rollback()
                         st.warning(f"A dividend for {symbol} on {ex_date} already exists.")
                     else:
-                        st.success(f"Added {symbol} dividend of R {amount:.4f} per share.")
+                        st.session_state["dividends_fetch_flash"] = (
+                            "success",
+                            f"Added {symbol} dividend of R {stored_amount:.4f} per share.",
+                        )
                         st.rerun()

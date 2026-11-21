@@ -89,8 +89,12 @@ class AlphaLensUpdaterService(win32serviceutil.ServiceFramework):
     def _run(self):
         # Restart the daemon on a crash instead of dying inside a service that
         # SCM still shows as Running - a dead thread used to be invisible.
+        # A FRESH UpdaterService each attempt: run_forever's finally shuts the
+        # scheduler down, and APScheduler cannot restart a shut-down scheduler,
+        # so re-starting the same instance just crash-loops forever.
         while not self.shutdown_event.is_set():
             try:
+                self.updater = UpdaterService()
                 self.updater.start(mode="daemon", stop_event=self.shutdown_event)
                 break  # clean exit (stop event set) - don't restart
             except SystemExit as exc:

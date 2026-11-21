@@ -158,13 +158,16 @@ def render_csv_download(table: pd.DataFrame, name: str, key: str) -> None:
     )
 
 
-def style_gain_loss_row(row: pd.Series) -> list[str]:
-    """Colour a table row green/red/yellow based on its '_gain_loss' value.
+def style_gain_loss_row(row: pd.Series, gain_loss=None) -> list[str]:
+    """Colour a table row green/red/yellow based on its gain/loss value.
 
-    Shared styling used by both the Portfolio and Watchlist pages so gain/loss
-    rows are colour-coded consistently across the app.
+    Reads the "Gain/Loss" column by default; callers whose table lets the
+    user hide that column pass the value from the full frame explicitly.
+    Shared styling used by both the Portfolio and Watchlist pages so
+    gain/loss rows are colour-coded consistently across the app.
     """
-    gain_loss = row["_gain_loss"]
+    if gain_loss is None:
+        gain_loss = row.get("Gain/Loss")
     if gain_loss is None:
         color = "#fef3c7"
     elif gain_loss > 0:

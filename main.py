@@ -1,5 +1,5 @@
 """
-JSE Stock Analysis Platform - Main Application Entry Point
+AlphaLens - Main Application Entry Point
 """
 
 import sys
@@ -17,7 +17,7 @@ from loguru import logger
 # Must be the first Streamlit command in the script - the cache_resource
 # spinner below already counts as one.
 st.set_page_config(
-    page_title="JSE Stock Analysis Platform",
+    page_title="AlphaLens",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"

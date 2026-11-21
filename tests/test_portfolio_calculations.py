@@ -1,5 +1,6 @@
 """Tests for portfolio gain/loss math in app/dashboard/portfolio.py."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,6 +9,8 @@ from app.dashboard.portfolio import (
     EXCLUDED_ACCOUNT_TYPES,
     EXCLUDED_PORTFOLIO_SYMBOLS,
     _get_group_latest_and_previous_prices,
+    _holding_action,
+    _holding_price_stats,
     _normalize_account_type,
     _sync_holding_from_easyequities,
     _update_holding_values,
@@ -224,3 +227,71 @@ def test_sync_holding_from_easyequities_skips_excluded_entries(db_session, ee_ho
     db_session.commit()
 
     assert db_session.query(PortfolioHolding).count() == 0
+
+
+# --- Action column ---------------------------------------------------------
+
+def _stats(**kw):
+    base = dict(price=1.0, low_52w=0.8, sma20=1.0, sma50=1.0, mom_3m=0.0)
+    base.update(kw)
+    return base
+
+
+def _watch(**kw):
+    base = dict(stop_loss=None, target_price=None)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_action_stop_loss_wins_over_everything():
+    assert _holding_action(-80.0, _stats(), _watch(stop_loss=1.1)) == "Sell — stop hit"
+    assert _holding_action(50.0, _stats(), _watch(stop_loss=1.1)) == "Sell — stop hit"
+
+
+def test_action_target_hit_trims_a_winner_not_a_loser():
+    assert _holding_action(10.0, _stats(), _watch(target_price=0.9)) == "Trim — target hit"
+    assert _holding_action(-30.0, _stats(), _watch(target_price=0.9)) != "Trim — target hit"
+
+
+def test_action_loser_still_falling_is_a_sell():
+    assert _holding_action(-30.0, _stats(price=0.9, sma20=1.0, mom_3m=-10.0)) == "Sell — still falling"
+    # Flat at the 52w low with no bounce is dead, not "hold and hope".
+    assert _holding_action(-80.0, _stats(price=0.80, low_52w=0.80, sma20=0.81, mom_3m=0.0)) == "Sell — still falling"
+
+
+def test_action_small_loss_in_a_dip_is_not_a_sell():
+    # -10% + falling: above the -15% sell threshold, so hold and watch.
+    assert _holding_action(-10.0, _stats(price=0.9, sma20=1.0, mom_3m=-10.0)) == "Hold — watch"
+
+
+def test_action_loser_recovering_is_a_buy():
+    assert _holding_action(-20.0, _stats(price=1.05, sma20=1.0, mom_3m=5.0)) == "Buy — recovering"
+
+
+def test_action_winner_in_uptrend_is_a_buy():
+    assert _holding_action(20.0, _stats(price=1.2, sma50=1.0, mom_3m=8.0)) == "Buy — uptrend"
+
+
+def test_action_plain_hold_and_none_gain_loss():
+    assert _holding_action(5.0, _stats()) == "Hold"
+    assert _holding_action(None, _stats()) == "Hold"
+
+
+def test_holding_price_stats_computes_series_stats(db_session):
+    stock = Stock(symbol="TST", name="T")
+    db_session.add(stock)
+    db_session.flush()
+    base = datetime.now(timezone.utc).replace(tzinfo=None)
+    for i in range(80):
+        db_session.add(StockPrice(
+            stock_id=stock.id, symbol="TST",
+            timestamp=base - timedelta(days=80 - i), close_price=100.0 + i,
+        ))
+    db_session.commit()
+
+    stats = _holding_price_stats(db_session, ["TST", "MISSING"])
+    s = stats["TST"]
+    assert s["price"] == 179.0 and s["low_52w"] == 100.0
+    assert s["sma20"] == pytest.approx(169.5)  # mean of closes 160..179
+    assert s["mom_3m"] > 0
+    assert "MISSING" not in stats

@@ -39,9 +39,9 @@ def day_of(db: Session, col):
 
 
 # How far back from each symbol's own latest bar to look for the "previous
-# trading day". 92 days covers ~3 months of suspended trading; symbols idle
-# longer than that simply show no day-change, which is honest anyway.
-_PREV_DAY_WINDOW = timedelta(days=92)
+# trading day". Bounded so a suspended/delisted stock can't surface a
+# months-old bar and present a quarter's move as a "day change".
+_PREV_DAY_WINDOW = timedelta(days=10)
 
 
 def get_latest_and_previous_prices(

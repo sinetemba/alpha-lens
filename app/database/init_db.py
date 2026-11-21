@@ -189,6 +189,8 @@ def _ensure_plain_indexes(inspector):
         ("watchlist_items", "ix_watchlist_items_stock_id", "stock_id"),
         ("dividends", "ix_dividends_stock_id", "stock_id"),
         ("news_articles", "ix_news_articles_created_at", "created_at"),
+        ("notifications", "ix_notifications_is_read_created", "is_read, created_at"),
+        ("notifications", "ix_notifications_is_sent_created", "is_sent, created_at"),
     ]
 
     for table, index_name, columns in targets:
@@ -336,6 +338,40 @@ def _backfill_opening_buys():
         db.close()
 
 
+_COMMODITY_UNITS_KEY = "commodity_av_units_v1"
+
+
+def _repair_commodity_units():
+    """One-time: drop the unit-mixed AV_* commodity price series.
+
+    The Alpha Vantage backfill used to write USD-per-oz (gold/silver) and
+    USD-per-tonne (copper) closes into the same series as Metals.dev's
+    ZAR-per-gram snapshots - a ~57x seam no magnitude check can reliably
+    separate for gold. The save path now converts to the stored unit, so
+    wiping and letting the next refresh re-backfill is the honest repair;
+    daily Metals.dev snapshots re-accumulate on their own.
+    """
+    db = SessionLocal()
+    try:
+        if db.get(SchemaMeta, _COMMODITY_UNITS_KEY) is not None:
+            return
+        deleted = db.query(StockPrice).filter(
+            StockPrice.symbol.in_(("AV_GOLD", "AV_SILVER", "AV_COPPER"))
+        ).delete(synchronize_session=False)
+        db.add(SchemaMeta(key=_COMMODITY_UNITS_KEY))
+        db.commit()
+        if deleted:
+            print(
+                f"Migration: removed {deleted} unit-mixed AV_* commodity bar(s) - "
+                "the next refresh re-backfills them in ZAR/g."
+            )
+    except Exception as e:
+        db.rollback()
+        print(f"Error repairing commodity units: {e}")
+    finally:
+        db.close()
+
+
 def init_database():
     """Initialize the database with tables and seed data."""
     print("Initializing database...")
@@ -345,6 +381,7 @@ def init_database():
     _cleanup_excluded_holdings()
     _backfill_stock_names()
     _backfill_opening_buys()
+    _repair_commodity_units()
     
     # Add seed data if needed
     # For example, add default JSE stocks

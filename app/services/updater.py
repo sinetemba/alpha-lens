@@ -351,6 +351,9 @@ class UpdaterService:
     # than this - a day plus slack, so the scheduled run normally wins.
     HISTORICAL_MAX_AGE = timedelta(hours=26)
     HISTORICAL_RETRY_SECONDS = 60 * 60
+    # Class-level: the Windows service restart loop builds a fresh
+    # UpdaterService per retry, so an instance flag would never latch.
+    _logging_configured = False
 
     def __init__(self):
         self.scheduler = BackgroundScheduler(timezone=settings.scheduler_timezone)
@@ -443,10 +446,13 @@ class UpdaterService:
             logger.warning("Price + news update skipped: another update is in progress")
             return False
         logger.info("Running scheduled price + news update")
-        db = SessionLocal()
         ok = False
         detail = None
+        db = None
         try:
+            # Inside try: a SessionLocal() failure must still reach the
+            # finally that releases _job_lock or it stays held forever.
+            db = SessionLocal()
             symbols = _get_tracked_symbols(db)
             quota_ok, msg = _has_quota(symbols, include_historical=False)
             logger.info(msg)
@@ -487,13 +493,16 @@ class UpdaterService:
             logger.error(f"Price + news update failed: {e}")
             # A dirty session here would leak partial writes into
             # _record_run's commit.
-            db.rollback()
+            if db is not None:
+                db.rollback()
             return False
         finally:
             try:
-                _record_run(db, "price_news_update", ok, detail)
+                if db is not None:
+                    _record_run(db, "price_news_update", ok, detail)
             finally:
-                db.close()
+                if db is not None:
+                    db.close()
                 self._job_lock.release()
 
     @_with_process_lock("Historical update")
@@ -503,10 +512,11 @@ class UpdaterService:
             logger.warning("Historical update skipped: another historical update is in progress")
             return False
         logger.info("Running daily historical update")
-        db = SessionLocal()
         ok = False
         detail = None
+        db = None
         try:
+            db = SessionLocal()
             symbols = _get_tracked_symbols(db)
             quota_ok, msg = _has_quota(symbols, include_historical=True)
             logger.info(msg)
@@ -557,14 +567,38 @@ class UpdaterService:
             logger.error(f"Daily historical update failed: {e}")
             # A dirty session here would leak partial writes into
             # _record_run's commit.
-            db.rollback()
+            if db is not None:
+                db.rollback()
             return False
         finally:
             try:
-                _record_run(db, "daily_historical", ok, detail)
+                if db is not None:
+                    _record_run(db, "daily_historical", ok, detail)
             finally:
-                db.close()
+                if db is not None:
+                    db.close()
                 self._historical_lock.release()
+
+    @_with_process_lock("Close normalization")
+    def _normalize_closes(self) -> bool:
+        """One-shot repair: rewrite stored bars on the adjusted-close convention.
+
+        Needed once after the raw/adjusted mixing fix - see
+        DataService.normalize_closes. Run via `run_updater.py --normalize-closes`.
+        """
+        db = SessionLocal()
+        try:
+            symbols = _get_tracked_symbols(db)
+            if not symbols:
+                return True
+            fixed = DataService(db).normalize_closes(symbols)
+            return fixed > 0
+        except Exception as e:
+            logger.error(f"Close normalization failed: {e}")
+            db.rollback()
+            return False
+        finally:
+            db.close()
 
     def _historical_catch_up_if_due(self) -> None:
         """Run the historical job when no successful run is recent enough.
@@ -742,24 +776,29 @@ class UpdaterService:
         """Configure logging, set the working directory and initialize the database."""
         os.chdir(ROOT)
         Path(settings.updater_log_file).parent.mkdir(parents=True, exist_ok=True)
-        logger.add(
-            settings.updater_log_file,
-            rotation="10 MB",
-            retention="30 days",
-            level=settings.log_level,
-        )
+        # Guarded: the Windows service's crash-restart loop calls setup() on
+        # every retry - each unguarded logger.add stacks another file sink and
+        # another stdlib->loguru handler, duplicating every line.
+        if not UpdaterService._logging_configured:
+            logger.add(
+                settings.updater_log_file,
+                rotation="10 MB",
+                retention="30 days",
+                level=settings.log_level,
+            )
 
-        # APScheduler logs misfires/errors through stdlib logging, not loguru -
-        # route them into the same file so dropped jobs are visible.
-        class _LoguruHandler(logging.Handler):
-            def emit(self, record):
-                logger.opt(depth=6, exception=record.exc_info).log(
-                    record.levelname, record.getMessage()
-                )
+            # APScheduler logs misfires/errors through stdlib logging, not loguru -
+            # route them into the same file so dropped jobs are visible.
+            class _LoguruHandler(logging.Handler):
+                def emit(self, record):
+                    logger.opt(depth=6, exception=record.exc_info).log(
+                        record.levelname, record.getMessage()
+                    )
 
-        apscheduler_logger = logging.getLogger("apscheduler")
-        apscheduler_logger.addHandler(_LoguruHandler())
-        apscheduler_logger.setLevel(logging.INFO)
+            apscheduler_logger = logging.getLogger("apscheduler")
+            apscheduler_logger.addHandler(_LoguruHandler())
+            apscheduler_logger.setLevel(logging.INFO)
+            UpdaterService._logging_configured = True
 
         try:
             init_database()
@@ -850,6 +889,9 @@ class UpdaterService:
         if mode == "ipo":
             sys.exit(0 if self._update_ipo_listings() else 1)
 
+        if mode == "normalize_closes":
+            sys.exit(0 if self._normalize_closes() else 1)
+
         if mode == "full":
             logger.info("Running full update")
             ok = self._update_prices_and_news()
@@ -874,6 +916,7 @@ def main():
     group.add_argument("--logon", action="store_true", help="Run a lightweight logon update and exit")
     group.add_argument("--backup", action="store_true", help="Back up the database now and exit")
     group.add_argument("--ipo", action="store_true", help="Scan Moneyweb SENS for IPO announcements and exit")
+    group.add_argument("--normalize-closes", action="store_true", help="Rewrite all stored bars on the adjusted-close convention and exit")
     args = parser.parse_args()
 
     mode = "daemon"
@@ -887,6 +930,8 @@ def main():
         mode = "backup"
     elif args.ipo:
         mode = "ipo"
+    elif args.normalize_closes:
+        mode = "normalize_closes"
 
     service = UpdaterService()
     service.start(mode=mode)

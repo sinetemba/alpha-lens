@@ -73,16 +73,18 @@ def crypto_value(holdings: list, markets: dict, luno_prices: dict) -> Optional[f
 
 
 def bullion_value(holdings: list, spots: Optional[dict]) -> Optional[float]:
-    """fine oz x qty x spot; 0.0 with no holdings, None without spot prices."""
+    """fine oz x qty x spot; 0.0 with no holdings, None without spot prices.
+
+    None too when any HELD metal lacks a spot - summing the priced subset
+    would report a too-low total labelled complete.
+    """
     if not holdings:
         return 0.0
     if not spots:
         return None
-    values = [
-        h.fine_oz_per_unit * h.quantity * spots[h.metal]
-        for h in holdings if spots.get(h.metal)
-    ]
-    return sum(values) if values else None
+    if any(not spots.get(h.metal) for h in holdings):
+        return None
+    return sum(h.fine_oz_per_unit * h.quantity * spots[h.metal] for h in holdings)
 
 
 def fetch_crypto_prices(holdings: list) -> tuple[dict, dict]:
@@ -128,33 +130,37 @@ def _persist_yahoo_metal_spots(db: Session, spots: dict) -> None:
 
     now = utcnow_naive()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    for metal, symbol in (("XAU", "XAU_ZAR"), ("XAG", "XAG_ZAR")):
-        price = spots.get(metal)
-        if not price:
-            continue
-        stock = db.query(Stock).filter(Stock.symbol == symbol).first()
-        if not stock:
-            name = "Gold" if metal == "XAU" else "Silver"
-            stock = Stock(symbol=symbol, name=f"{name} Spot ZAR (Live)")
-            db.add(stock)
-            db.flush()
-        bar = db.query(StockPrice).filter(
-            StockPrice.symbol == symbol,
-            StockPrice.timestamp == today,
-        ).first()
-        if bar:
-            bar.close_price = price
-            bar.fetched_at = now
-        else:
-            db.add(StockPrice(
-                stock_id=stock.id, symbol=symbol, timestamp=today,
-                close_price=price, fetched_at=now,
-            ))
     try:
-        db.flush()
+        # A savepoint, not db.rollback(): this runs inside a shared read-path
+        # session, and a bare rollback would also discard the caller's
+        # uncommitted work.
+        with db.begin_nested():
+            for metal, symbol in (("XAU", "XAU_ZAR"), ("XAG", "XAG_ZAR")):
+                price = spots.get(metal)
+                if not price:
+                    continue
+                stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+                if not stock:
+                    name = "Gold" if metal == "XAU" else "Silver"
+                    stock = Stock(symbol=symbol, name=f"{name} Spot ZAR (Live)")
+                    db.add(stock)
+                    db.flush()
+                bar = db.query(StockPrice).filter(
+                    StockPrice.symbol == symbol,
+                    StockPrice.timestamp == today,
+                ).first()
+                if bar:
+                    bar.close_price = price
+                    bar.fetched_at = now
+                else:
+                    db.add(StockPrice(
+                        stock_id=stock.id, symbol=symbol, timestamp=today,
+                        close_price=price, fetched_at=now,
+                    ))
+            db.flush()
     except IntegrityError:
         # A concurrent writer (Krugerrands page) wrote today's bar first.
-        db.rollback()
+        pass
 
 
 def compute_net_worth(db: Session, jse_value: Optional[float] = None) -> NetWorth:

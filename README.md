@@ -1,17 +1,25 @@
-# JSE Stock Analysis Platform
+# AlphaLens
 
-An open-source, Python-based web application focused on providing investors with insights into companies listed on the Johannesburg Stock Exchange (JSE).
+An open-source, Python-based web application for tracking investments on and
+around the Johannesburg Stock Exchange (JSE) - stocks, dividends, IPOs and a
+penny-stock screener, plus portfolio sync, crypto and bullion in one
+net-worth view.
 
 ## Features
 
-- **Real-time Market Data**: Track stock prices from multiple data sources
-- **Watchlist Management**: Create and monitor your favorite stocks
-- **Portfolio Tracking**: Track your investments and performance
-- **News Aggregation**: Aggregate financial news from multiple South African sources
-- **Technical Analysis**: Calculate and display technical indicators (RSI, MACD, Bollinger Bands, etc.)
+- **Market Data**: JSE stock prices, history and dividends (Yahoo Finance; Twelve Data when enabled)
+- **Watchlist Management**: target/stop-loss levels and price alerts, which also become your holdings' exit rules
+- **Portfolio Tracking**: EasyEquities sync, per-holding gain/loss, and a rule-based **Action** column suggesting hold/buy/sell/trim from trend stats and your own exits
+- **Net Worth**: JSE portfolio, crypto and bullion in one view
+- **Penny Stocks Screener**: JSE shares under R5 scored on liquidity, trend and dividends, with per-row setup tags (recovery/bounce/trend) and stars on shares you already hold
+- **IPO Tracker**: Moneyweb SENS announcements filtered to real IPOs, with alerts during the offer window
+- **Commodities & Krugerrands**: Metals.dev precious and base metal spots in ZAR, plus Krugerrand prices via GoldAPI
+- **Crypto**: Luno/CoinGecko prices and holdings
+- **News Aggregation**: Financial news from multiple South African sources
+- **Technical Analysis**: RSI, MACD, Bollinger Bands and more
 - **Automated Data Collection**: Scheduled updates via the headless updater (3x/day prices+news, daily full, logon refresh)
-- **Notifications**: Get alerts for price changes, news, and technical signals
-- **Interactive Charts**: Beautiful visualizations using Plotly
+- **Notifications**: Alerts for price changes, news, technical signals, near-52w lows and new listings
+- **Interactive Charts**: Visualizations using Plotly
 
 ## Tech Stack
 
@@ -119,6 +127,17 @@ streamlit run main.py
 
 The application will be available at `http://localhost:8501`
 
+> **Note:** if the `AlphaLensDashboard` scheduled task is installed it already
+> runs the app at logon, so `streamlit run` fails with
+> `Port 8501 is not available` - just open http://localhost:8501 instead. To
+> pick up code changes restart the task
+> (`schtasks /end /tn AlphaLensDashboard` then `schtasks /run /tn
+> AlphaLensDashboard`); the running process caches imported modules. For a
+> second dev instance use
+> `.venv\Scripts\python.exe -m streamlit run main.py --server.port 8503`
+> (8502 is taken by another local Streamlit app, fantasy-vibes). See
+> [Troubleshooting](#port-8501-is-not-available) for all the options.
+
 ### Production Mode
 
 For production deployment, consider using:
@@ -133,17 +152,20 @@ See the Docker section below for containerized deployment.
 
 ### Dashboard Navigation
 
-The application has nine main sections:
+The application has twelve main sections:
 
-1. **Home**: JSE index, portfolio value, daily gain, Moneyweb top movers, and recent news
-2. **Watchlist**: Manage your stock watchlist with price alerts
-3. **Portfolio**: Track your holdings and performance
+1. **Home**: JSE index, portfolio value, net worth, daily gain, Moneyweb top movers, and recent news
+2. **Watchlist**: Manage your stock watchlist with target/stop-loss levels and alerts
+3. **Portfolio**: Track holdings and performance, with an Action column suggesting hold/buy/sell per holding
 4. **Dividends**: Track dividend history and payments
-5. **Notifications**: View price/technical alerts raised by the updater (mark read/unread)
-6. **Company View**: Detailed information about specific stocks
-7. **Penny Stocks**: Screener for JSE shares trading below R5
-8. **Commodities**: Track commodity prices
-9. **Krugerrands**: Track Krugerrand prices
+5. **IPOs**: Upcoming JSE listings detected from Moneyweb SENS announcements
+6. **Notifications**: View price/technical alerts raised by the updater (mark read/unread)
+7. **Company View**: Detailed information about specific stocks
+8. **Penny Stocks**: Screener for JSE shares trading below R5
+9. **Commodities**: Precious and base metal spot prices (gold, silver, platinum, palladium, copper, aluminum, nickel, zinc, lead)
+10. **Krugerrands**: Track Krugerrand prices
+11. **Crypto**: Track crypto prices and Luno holdings
+12. **Settings**: Data-source status, updater heartbeats and notification test
 
 Every page shows a stale-data banner when the headless updater's last
 `updater_runs` heartbeat is >20h old or its last run failed.
@@ -376,6 +398,35 @@ A GitHub Actions workflow in `.github/workflows/ci.yml` runs the test suite on p
 
 ## Troubleshooting
 
+### Port 8501 is not available
+
+The `AlphaLensDashboard` scheduled task already has the app running - it
+starts at logon and restarts on crash, so the port is never free while
+you're logged in. `.streamlit/config.toml` fixes the port at 8501, so
+Streamlit fails instead of moving to another port. Pick one:
+
+- **Just use it** - open http://localhost:8501; nothing needs starting.
+- **Second copy alongside the task** (e.g. to watch console output):
+
+  ```powershell
+  .venv\Scripts\python.exe -m streamlit run main.py --server.port 8503
+  ```
+
+  then open http://localhost:8503. Both copies share the same database.
+- **Swap the task for a terminal copy:** `schtasks /end /tn AlphaLensDashboard`,
+  then `.venv\Scripts\python.exe scripts\run_dashboard.py`. Afterwards
+  `schtasks /run /tn AlphaLensDashboard` (otherwise it returns at next logon).
+- **Stop the automatic start** if you'd rather always launch it yourself:
+  `scripts\uninstall_dashboard_task.ps1` - then `streamlit run main.py` works.
+
+Use `.venv\Scripts\python.exe -m streamlit`, not a bare `streamlit`: the bare
+command resolves to the global Python, not the venv's pinned packages.
+
+Local port map: **8501** AlphaLens, **8502** fantasy-vibes (fixed in its
+`.streamlit/config.toml` - start it from its repo root,
+`streamlit run app/main.py`; from `app\` the config isn't read and it falls
+back to 8501 on every interface). Use **8503+** for extra copies.
+
 ### Database Locked Error
 
 If you encounter a SQLite database locked error, ensure only one instance of the application is running.
@@ -413,7 +464,7 @@ This project follows PEP 8 guidelines. Consider using:
 ### Version 1 (Current)
 - ✅ Stock dashboard
 - ✅ Watchlist
-- ✅ Portfolio tracking
+- ✅ Portfolio tracking with hold/buy/sell Action suggestions
 - ✅ Historical prices
 - ✅ Technical indicators
 - ✅ Scheduled updates
@@ -421,6 +472,9 @@ This project follows PEP 8 guidelines. Consider using:
 - ✅ Dividend tracking
 - ✅ Notifications
 - ✅ Commodity and Krugerrand tracking
+- ✅ Penny-stock screener
+- ✅ IPO tracker
+- ✅ Crypto and net-worth tracking
 
 ### Version 2 (Planned)
 - AI summaries

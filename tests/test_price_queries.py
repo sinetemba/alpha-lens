@@ -157,7 +157,7 @@ def test_gap_days_skip_to_most_recent_prior_day(db_session, price_query):
     """A symbol with no bar yesterday should still resolve 'previous' to the
     most recent earlier day that does have data, not require exactly -1 day."""
     stock = _add_stock(db_session, "NPN")
-    _add_price(db_session, stock, "NPN", datetime(2023, 12, 1), 50.0)
+    _add_price(db_session, stock, "NPN", datetime(2024, 1, 4), 50.0)
     _add_price(db_session, stock, "NPN", datetime(2024, 1, 10), 100.0)
     db_session.commit()
 
@@ -166,6 +166,25 @@ def test_gap_days_skip_to_most_recent_prior_day(db_session, price_query):
 
     assert latest.close_price == 100.0
     assert prev.close_price == 50.0
+
+
+@pytest.mark.parametrize(
+    "price_query",
+    [_get_latest_and_previous_prices, _get_group_latest_and_previous_prices],
+)
+def test_stale_gap_beyond_window_yields_no_previous(db_session, price_query):
+    """A prev-day candidate older than _PREV_DAY_WINDOW is not a "day change"
+    - a suspended stock must not present a months-old close as yesterday's."""
+    stock = _add_stock(db_session, "NPN")
+    _add_price(db_session, stock, "NPN", datetime(2023, 12, 1), 50.0)
+    _add_price(db_session, stock, "NPN", datetime(2024, 1, 10), 100.0)
+    db_session.commit()
+
+    result = price_query(db_session, ["NPN"])
+    latest, prev = result["NPN"]
+
+    assert latest.close_price == 100.0
+    assert prev is None
 
 
 @pytest.mark.parametrize(

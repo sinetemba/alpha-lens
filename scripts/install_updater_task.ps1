@@ -46,7 +46,12 @@ if (-not $Python) {
 }
 
 $Principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
-$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RunOnlyIfNetworkAvailable:$false
+# The daemon task must run forever: ExecutionTimeLimit 0 disables the default
+# 72-hour kill, and RestartCount/Interval relaunches it after a crash (each
+# restart is a fresh process, which is clean). Without these a dead daemon
+# silently stops all updates until the next logon.
+$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RunOnlyIfNetworkAvailable:$false `
+    -ExecutionTimeLimit (New-TimeSpan -Days 0) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
 # Daemon task: starts at logon and runs forever.
 $DaemonAction = New-ScheduledTaskAction -Execute $Python -Argument "`"$Script`"" -WorkingDirectory $RepoRoot

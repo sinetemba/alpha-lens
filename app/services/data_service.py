@@ -1,6 +1,6 @@
 import pandas as pd
 from sqlalchemy import func, case
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from app.config.settings import settings
@@ -684,15 +684,18 @@ class DataService:
         keep NULL indicators forever. Set ``full=True`` to recalculate and
         persist the entire available history.
         """
+        # Only OHLCV + id/timestamp feed the calculation - the ~12 indicator
+        # columns being overwritten don't need to be loaded back first.
+        base_query = self.db.query(StockPrice).options(load_only(
+            StockPrice.id, StockPrice.timestamp, StockPrice.open_price,
+            StockPrice.high_price, StockPrice.low_price,
+            StockPrice.close_price, StockPrice.volume,
+        )).filter(StockPrice.symbol == symbol)
         if full:
-            prices = self.db.query(StockPrice).filter(
-                StockPrice.symbol == symbol
-            ).order_by(StockPrice.timestamp.asc()).all()
+            prices = base_query.order_by(StockPrice.timestamp.asc()).all()
         else:
             prices = list(reversed(
-                self.db.query(StockPrice).filter(
-                    StockPrice.symbol == symbol
-                ).order_by(StockPrice.timestamp.desc()).limit(250).all()
+                base_query.order_by(StockPrice.timestamp.desc()).limit(250).all()
             ))
 
         if len(prices) < 2:
@@ -788,14 +791,28 @@ class DataService:
             return amount / 100
         return amount
 
-    def update_dividends(self, symbols: List[str]) -> int:
+    def update_dividends(self, symbols: List[str], freshness_days: int = 7) -> int:
         """Fetch and store dividend history for the given symbols.
 
         `symbols` is required (see `update_stock_prices` - the implicit
-        all-active-stocks fallback was a quota trap).
+        all-active-stocks fallback was a quota trap). Symbols whose
+        dividends were fetched within `freshness_days` are skipped -
+        declarations change at weekly cadence, not daily; pass 0 to force.
         """
+        fresh: set = set()
+        if freshness_days > 0 and symbols:
+            cutoff = utcnow_naive() - timedelta(days=freshness_days)
+            fresh = {
+                s for (s,) in self.db.query(Stock.symbol).filter(
+                    Stock.symbol.in_(symbols),
+                    Stock.last_dividend_fetch >= cutoff,
+                ).all()
+            }
+
         saved = 0
         for symbol in symbols:
+            if symbol in fresh:
+                continue
             try:
                 # Persist the previous symbol's rows before starting this one:
                 # the rollback in `except` must only discard THIS symbol's
@@ -803,134 +820,166 @@ class DataService:
                 # uncommitted rows for symbols 1..N-1 while `saved` still
                 # counted them.
                 self.db.commit()
-                td_dividends = self.twelve_data.get_dividends(symbol)
-
-                if td_dividends:
-                    stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
-                    if not stock:
-                        stock = Stock(symbol=symbol, name=get_company_name(symbol))
-                        self.db.add(stock)
-                        self.db.flush()
-
-                    existing_by_key = self._existing_dividends_by_key(symbol)
-                    td_ex_dates = [
-                        datetime.strptime(r["ex_date"], "%Y-%m-%d")
-                        for r in td_dividends if r.get("ex_date")
-                    ]
-                    closes = self._price_closes(
-                        symbol,
-                        since=min(td_ex_dates) - timedelta(days=730) if td_ex_dates else None,
-                        until=max(td_ex_dates) + timedelta(days=730) if td_ex_dates else None,
-                    )
-
-                    for record in td_dividends:
-                        ex_date_str = record.get("ex_date")
-                        amount = record.get("amount")
-                        if not ex_date_str or amount is None:
-                            continue
-
-                        def _parse_date(key: str) -> Optional[datetime]:
-                            value = record.get(key)
-                            return datetime.strptime(value, "%Y-%m-%d") if value else None
-
-                        ex_date = datetime.strptime(ex_date_str, "%Y-%m-%d")
-                        # Twelve Data can report ZAc where Rand was expected -
-                        # same rescale rule as the Yahoo path.
-                        amount_rand = self._dividend_amount_rand(
-                            symbol, float(amount), self._close_near(closes, ex_date)
-                        )
-                        key = (ex_date.date(), round(amount_rand, 6))
-
-                        existing = existing_by_key.get(key)
-                        if existing:
-                            if _parse_date("payment_date") and not existing.payment_date:
-                                existing.payment_date = _parse_date("payment_date")
-                            if _parse_date("record_date") and not existing.record_date:
-                                existing.record_date = _parse_date("record_date")
-                            if _parse_date("declaration_date") and not existing.declaration_date:
-                                existing.declaration_date = _parse_date("declaration_date")
-                            continue
-
-                        if any(day == ex_date.date() for day, _ in existing_by_key):
-                            logger.info(
-                                f"{symbol}: storing additional same-day dividend "
-                                f"{format_price(amount_rand)} on {ex_date:%Y-%m-%d} "
-                                "(special/other payment sharing an ex-date)"
-                            )
-
-                        dividend = Dividend(
-                            stock_id=stock.id,
-                            symbol=symbol,
-                            amount=amount_rand,
-                            currency="ZAR",
-                            ex_dividend_date=ex_date,
-                            payment_date=_parse_date("payment_date"),
-                            record_date=_parse_date("record_date"),
-                            declaration_date=_parse_date("declaration_date"),
-                        )
-                        self.db.add(dividend)
-                        existing_by_key[key] = dividend
-                        saved += 1
-
-                    continue
-
-                # Fallback: Yahoo Finance has ex-dividend dates but no payment dates.
-                dividends = self.yfinance.get_dividends(symbol)
-                if dividends is None or dividends.empty:
-                    continue
-
+                saved += self._update_dividends_for_symbol(symbol)
                 stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
-                if not stock:
-                    stock = Stock(symbol=symbol, name=get_company_name(symbol))
+                if stock is None:
+                    # A symbol that paid nothing gets no row from the fetch -
+                    # without one the stamp never sticks and it is refetched
+                    # every run.
+                    stock = Stock(symbol=symbol, name=symbol)
                     self.db.add(stock)
-                    self.db.flush()
-
-                existing_by_key = self._existing_dividends_by_key(symbol)
-                yf_ex_dates = []
-                for d in dividends.index:
-                    dt = d.to_pydatetime() if hasattr(d, "to_pydatetime") else d
-                    yf_ex_dates.append(datetime(dt.year, dt.month, dt.day))
-                closes = self._price_closes(
-                    symbol,
-                    since=min(yf_ex_dates) - timedelta(days=730) if yf_ex_dates else None,
-                    until=max(yf_ex_dates) + timedelta(days=730) if yf_ex_dates else None,
-                )
-
-                for date, amount in dividends.items():
-                    ex_date = date.to_pydatetime() if hasattr(date, "to_pydatetime") else date
-                    # yfinance returns tz-aware exchange-local timestamps; store the
-                    # ex-date as naive midnight so dedup matches the Twelve Data path.
-                    ex_date = datetime(ex_date.year, ex_date.month, ex_date.day)
-                    amount_rand = self._dividend_amount_rand(
-                        symbol, float(amount), self._close_near(closes, ex_date)
-                    )
-                    key = (ex_date.date(), round(amount_rand, 6))
-                    if key in existing_by_key:
-                        continue
-                    if any(day == ex_date.date() for day, _ in existing_by_key):
-                        logger.info(
-                            f"{symbol}: storing additional same-day dividend "
-                            f"{format_price(amount_rand)} on {ex_date:%Y-%m-%d} "
-                            "(special/other payment sharing an ex-date)"
-                        )
-
-                    dividend = Dividend(
-                        stock_id=stock.id,
-                        symbol=symbol,
-                        amount=amount_rand,
-                        currency="ZAR",
-                        ex_dividend_date=ex_date,
-                    )
-                    self.db.add(dividend)
-                    existing_by_key[key] = dividend
-                    saved += 1
-
+                stock.last_dividend_fetch = utcnow_naive()
             except Exception as e:
                 logger.error(f"Error updating dividends for {symbol}: {e}")
                 self.db.rollback()
 
         self.db.commit()
         logger.info(f"Saved {saved} new dividend records")
+        return saved
+
+    def _update_dividends_for_symbol(self, symbol: str) -> int:
+        """Fetch and store one symbol's dividends; returns rows added."""
+        saved = 0
+        td_dividends = self.twelve_data.get_dividends(symbol)
+
+        if td_dividends:
+            stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
+            if not stock:
+                stock = Stock(symbol=symbol, name=get_company_name(symbol))
+                self.db.add(stock)
+                self.db.flush()
+
+            existing_by_key = self._existing_dividends_by_key(symbol)
+            td_ex_dates = []
+            for r in td_dividends:
+                try:
+                    td_ex_dates.append(datetime.strptime(r["ex_date"], "%Y-%m-%d"))
+                except (TypeError, ValueError):
+                    continue
+            closes = self._price_closes(
+                symbol,
+                since=min(td_ex_dates) - timedelta(days=730) if td_ex_dates else None,
+                until=max(td_ex_dates) + timedelta(days=730) if td_ex_dates else None,
+            )
+
+            usable = 0
+            for record in td_dividends:
+                ex_date_str = record.get("ex_date")
+                amount = record.get("amount")
+                if not ex_date_str or amount is None:
+                    continue
+
+                def _parse_date(key: str) -> Optional[datetime]:
+                    value = record.get(key)
+                    if not value:
+                        return None
+                    try:
+                        return datetime.strptime(value, "%Y-%m-%d")
+                    except ValueError:
+                        return None
+
+                try:
+                    ex_date = datetime.strptime(ex_date_str, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                usable += 1
+                # Twelve Data can report ZAc where Rand was expected -
+                # same rescale rule as the Yahoo path.
+                amount_rand = self._dividend_amount_rand(
+                    symbol, float(amount), self._close_near(closes, ex_date)
+                )
+                key = (ex_date.date(), round(amount_rand, 6))
+
+                existing = existing_by_key.get(key)
+                if existing:
+                    if _parse_date("payment_date") and not existing.payment_date:
+                        existing.payment_date = _parse_date("payment_date")
+                    if _parse_date("record_date") and not existing.record_date:
+                        existing.record_date = _parse_date("record_date")
+                    if _parse_date("declaration_date") and not existing.declaration_date:
+                        existing.declaration_date = _parse_date("declaration_date")
+                    continue
+
+                if any(day == ex_date.date() for day, _ in existing_by_key):
+                    logger.info(
+                        f"{symbol}: storing additional same-day dividend "
+                        f"{format_price(amount_rand)} on {ex_date:%Y-%m-%d} "
+                        "(special/other payment sharing an ex-date)"
+                    )
+
+                dividend = Dividend(
+                    stock_id=stock.id,
+                    symbol=symbol,
+                    amount=amount_rand,
+                    currency="ZAR",
+                    ex_dividend_date=ex_date,
+                    payment_date=_parse_date("payment_date"),
+                    record_date=_parse_date("record_date"),
+                    declaration_date=_parse_date("declaration_date"),
+                )
+                self.db.add(dividend)
+                existing_by_key[key] = dividend
+                saved += 1
+
+            # A truthy-but-useless TD payload (rows with no parseable
+            # ex-date) must not suppress the Yahoo fallback.
+            if usable:
+                return saved
+            logger.warning(
+                f"{symbol}: Twelve Data dividends had no usable rows - trying Yahoo"
+            )
+
+        # Fallback: Yahoo Finance has ex-dividend dates but no payment dates.
+        dividends = self.yfinance.get_dividends(symbol)
+        if dividends is None or dividends.empty:
+            return saved
+
+        stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
+        if not stock:
+            stock = Stock(symbol=symbol, name=get_company_name(symbol))
+            self.db.add(stock)
+            self.db.flush()
+
+        existing_by_key = self._existing_dividends_by_key(symbol)
+        yf_ex_dates = []
+        for d in dividends.index:
+            dt = d.to_pydatetime() if hasattr(d, "to_pydatetime") else d
+            yf_ex_dates.append(datetime(dt.year, dt.month, dt.day))
+        closes = self._price_closes(
+            symbol,
+            since=min(yf_ex_dates) - timedelta(days=730) if yf_ex_dates else None,
+            until=max(yf_ex_dates) + timedelta(days=730) if yf_ex_dates else None,
+        )
+
+        for date, amount in dividends.items():
+            ex_date = date.to_pydatetime() if hasattr(date, "to_pydatetime") else date
+            # yfinance returns tz-aware exchange-local timestamps; store the
+            # ex-date as naive midnight so dedup matches the Twelve Data path.
+            ex_date = datetime(ex_date.year, ex_date.month, ex_date.day)
+            amount_rand = self._dividend_amount_rand(
+                symbol, float(amount), self._close_near(closes, ex_date)
+            )
+            key = (ex_date.date(), round(amount_rand, 6))
+            if key in existing_by_key:
+                continue
+            if any(day == ex_date.date() for day, _ in existing_by_key):
+                logger.info(
+                    f"{symbol}: storing additional same-day dividend "
+                    f"{format_price(amount_rand)} on {ex_date:%Y-%m-%d} "
+                    "(special/other payment sharing an ex-date)"
+                )
+
+            dividend = Dividend(
+                stock_id=stock.id,
+                symbol=symbol,
+                amount=amount_rand,
+                currency="ZAR",
+                ex_dividend_date=ex_date,
+            )
+            self.db.add(dividend)
+            existing_by_key[key] = dividend
+            saved += 1
+
         return saved
 
     def collect_news(self) -> int:
@@ -998,7 +1047,9 @@ class DataService:
         if historical:
             saved = self._save_historical_data(symbol, historical)
             logger.info(f"Saved {saved} historical data points for {symbol} from Twelve Data")
-            self._update_technical_indicators(symbol, full=backfill, tail=saved + 1)
+            # tail covers every TOUCHED bar (new + overwritten), not just
+            # inserted ones - saved+1 left older refreshed bars' indicators stale.
+            self._update_technical_indicators(symbol, full=backfill, tail=len(historical))
             self.db.commit()
             return saved
 
@@ -1030,7 +1081,7 @@ class DataService:
 
             saved = self._bulk_save_stock_prices(symbol, records)
             logger.info(f"Saved {saved} historical data points for {symbol} from Yahoo Finance")
-            self._update_technical_indicators(symbol, full=backfill, tail=saved + 1)
+            self._update_technical_indicators(symbol, full=backfill, tail=len(records))
             self.db.commit()
             return saved
 
@@ -1107,7 +1158,7 @@ class DataService:
             try:
                 saved = self._save_historical_data(symbol, historical)
                 logger.info(f"Saved {saved} historical data points for {symbol} from Twelve Data")
-                self._update_technical_indicators(symbol, full=backfill, tail=saved + 1)
+                self._update_technical_indicators(symbol, full=backfill, tail=len(historical))
                 self.db.commit()
                 results[symbol] = saved
             except Exception as e:
@@ -1150,7 +1201,7 @@ class DataService:
                         })
                     saved = self._bulk_save_stock_prices(symbol, records)
                     logger.info(f"Saved {saved} historical data points for {symbol} from Yahoo Finance")
-                    self._update_technical_indicators(symbol, full=backfill, tail=saved + 1)
+                    self._update_technical_indicators(symbol, full=backfill, tail=len(records))
                     self.db.commit()
                     results[symbol] = saved
                 except Exception as e:
@@ -1159,6 +1210,56 @@ class DataService:
                     self.db.rollback()
 
         return results, failed
+
+    def normalize_closes(self, symbols: List[str], years: int = 20) -> int:
+        """One-shot repair: rewrite every stored bar from Yahoo's adjusted series.
+
+        The price path historically stored raw closes while the historical
+        path stored dividend-adjusted closes - bars written before the
+        conventions were unified mix both. Re-fetching the full adjusted
+        history and updating rows in place puts the whole series on one
+        convention; indicators are recomputed since values shifted.
+
+        Returns the number of symbols re-written.
+        """
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=years * 365)
+        try:
+            frames = self.yfinance.get_history_batch(
+                symbols,
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d"),
+            )
+        except Exception as e:
+            logger.error(f"Close normalization download failed: {e}")
+            return 0
+
+        fixed = 0
+        for symbol in symbols:
+            frame = frames.get(symbol)
+            if frame is None or frame.empty:
+                continue
+            try:
+                records = []
+                for index, row in frame.iterrows():
+                    records.append({
+                        "timestamp": self._bar_date_timestamp(index.to_pydatetime()),
+                        "open": row.get("Open"),
+                        "high": row.get("High"),
+                        "low": row.get("Low"),
+                        "close": row.get("Close"),
+                        "adjusted_close": row.get("Adj Close"),
+                        "volume": row.get("Volume"),
+                    })
+                self._bulk_save_stock_prices(symbol, records)
+                self._update_technical_indicators(symbol, full=True)
+                self.db.commit()
+                fixed += 1
+            except Exception as e:
+                logger.error(f"Close normalization failed for {symbol}: {e}")
+                self.db.rollback()
+        logger.info(f"Normalized closes for {fixed}/{len(symbols)} symbols")
+        return fixed
 
     def _save_historical_data(self, symbol: str, data: List[Dict]) -> int:
         """Save historical data points from Twelve Data in bulk."""

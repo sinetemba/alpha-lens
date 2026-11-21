@@ -237,3 +237,53 @@ def test_macd_bullish_crossover_alert(db_session, monkeypatch):
     note = db_session.query(Notification).filter_by(stock_symbol="NPN").first()
     assert note is not None
     assert "MACD Bullish Crossover" in note.title
+
+
+def test_disabled_delivery_marks_notifications_in_app(db_session, monkeypatch):
+    """With NOTIFICATION_ENABLED=false alerts are in-app only: stamp them
+    sent at creation so they never queue for a later backlog flush."""
+    monkeypatch.setattr(
+        "app.notifications.notification_service.settings",
+        SimpleNamespace(notification_enabled=False),
+    )
+    service = NotificationService(db_session)
+    note = service.create_notification("system", "T", "body", "NPN")
+    assert note.is_sent is True
+    assert note.delivery_channel == "in-app"
+
+
+def test_enabled_delivery_leaves_notifications_pending(db_session, monkeypatch):
+    note = _service(db_session, monkeypatch).create_notification(
+        "system", "T", "body", "NPN"
+    )
+    assert note.is_sent is False
+
+
+def test_send_pending_skips_stale_backlog(db_session, monkeypatch):
+    """Rows older than 24h are never attempted - a stale backlog must not
+    flood delivery when it's enabled later."""
+    old = Notification(
+        type="system", title="old", message="m", is_sent=False,
+        created_at=datetime(2024, 1, 1),
+    )
+    db_session.add(old)
+    db_session.commit()
+
+    service = _service(db_session, monkeypatch)
+    service.send_pending_notifications()
+
+    db_session.refresh(old)
+    assert old.is_sent is False
+    assert (old.attempts or 0) == 0
+
+
+def test_send_pending_delivers_fresh_rows(db_session, monkeypatch):
+    note = Notification(type="system", title="fresh", message="m", is_sent=False)
+    db_session.add(note)
+    db_session.commit()
+
+    service = _service(db_session, monkeypatch)
+    service.send_pending_notifications()
+
+    db_session.refresh(note)
+    assert note.is_sent is True

@@ -97,6 +97,37 @@ def test_twelve_data_fills_missing_dates_on_existing_row(service, db_session):
     assert row.payment_date == datetime(2026, 3, 17)
 
 
+def test_freshness_gate_skips_recently_fetched_symbols(service, db_session):
+    """A symbol fetched within the window isn't re-fetched - the daily job
+    used to spend one Yahoo call per tracked symbol every run."""
+    from app.models.base import utcnow_naive
+
+    stock = _stock_with_close(db_session, "SBK", 40.0, datetime(2026, 3, 1))
+    stock.last_dividend_fetch = utcnow_naive()
+    db_session.commit()
+
+    assert service.update_dividends(["SBK"]) == 0
+    service.yfinance.get_dividends.assert_not_called()
+
+    # freshness_days=0 is the manual-fetch path - it must bypass the stamp.
+    service.yfinance.get_dividends.return_value = _yahoo_series([("2026-03-10", 1.42)])
+    assert service.update_dividends(["SBK"], freshness_days=0) == 1
+    service.yfinance.get_dividends.assert_called_once_with("SBK")
+
+
+def test_fetch_stamps_last_dividend_fetch(service, db_session):
+    """Even a symbol that pays nothing gets stamped (a Stock row is created)
+    so non-payers are not re-fetched every run."""
+    from app.models.base import utcnow_naive
+
+    service.yfinance.get_dividends.return_value = None
+    service.update_dividends(["NPN"])
+
+    stock = db_session.query(Stock).filter_by(symbol="NPN").one()
+    assert stock.last_dividend_fetch is not None
+    assert utcnow_naive() - stock.last_dividend_fetch < timedelta(minutes=5)
+
+
 def test_failure_on_one_symbol_keeps_earlier_symbols(service, db_session):
     _stock_with_close(db_session, "SBK", 40.0, datetime(2026, 3, 1))
     _stock_with_close(db_session, "NPN", 40.0, datetime(2026, 3, 1))

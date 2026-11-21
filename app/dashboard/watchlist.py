@@ -127,6 +127,10 @@ def show_watchlist(db: Session):
     ).filter(
         PortfolioHolding.symbol.in_([item.symbol for item in watchlist_items]),
         ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
+        # JSE-priced accounts only: a bare US ticker (USD account) can share a
+        # symbol with a JSE listing and would leak foreign prices/quantities
+        # into the Rand columns here.
+        ~func.upper(PortfolioHolding.account_type).like("%USD%"),
     ).group_by(PortfolioHolding.symbol).all()
     holdings_by_symbol = {h.symbol: h for h in holdings}
 
@@ -187,24 +191,28 @@ def show_watchlist(db: Session):
             "Change %": daily_change_pct,
             "Purchase Price": purchase_price if purchase_price else None,
             "Target Price": item.target_price,
+            # Distance to the target as a signed %: >= 0 means at/above
+            # target (the old _above_target flag), negative shows how much
+            # room is left - sortable, unlike the boolean it replaced.
+            "To Target %": (
+                ((current_price - item.target_price) / item.target_price) * 100
+                if item.target_price and current_price is not None else None
+            ),
             "Stop Loss": item.stop_loss,
             "Gain/Loss": gain_loss,
             "Gain/Loss %": gain_loss_pct,
-            "_gain_loss": gain_loss,
-            "_above_target": bool(
-                item.target_price and current_price is not None and current_price >= item.target_price
-            ),
         })
 
     # Filter categories match the row styling: "Above Target" rows render
     # darkgreen, gain rows green, loss rows red (None/zero = no data/break-even,
     # only visible under "All").
+    above_target = lambda r: r["To Target %"] is not None and r["To Target %"] >= 0
     if filter_choice == "Above Target":
-        data = [r for r in data if r["_above_target"]]
+        data = [r for r in data if above_target(r)]
     elif filter_choice == "Gain":
-        data = [r for r in data if not r["_above_target"] and (r["_gain_loss"] or 0) > 0]
+        data = [r for r in data if not above_target(r) and (r["Gain/Loss"] or 0) > 0]
     elif filter_choice == "Loss":
-        data = [r for r in data if (r["_gain_loss"] or 0) < 0]
+        data = [r for r in data if (r["Gain/Loss"] or 0) < 0]
 
     if data:
         watchlist_table = pd.DataFrame(data)
@@ -229,6 +237,7 @@ def show_watchlist(db: Session):
                 "Change %": st.column_config.NumberColumn("Change %", format="%+.2f%%", help="Percentage change since the previous close."),
                 "Purchase Price": st.column_config.NumberColumn("Purchase Price", help="Average price paid per share, if held."),
                 "Target Price": st.column_config.NumberColumn("Target Price", help="Price target for this stock."),
+                "To Target %": st.column_config.NumberColumn("To Target %", format="%+.2f%%", help="Distance from target price - >=0 means the target has been hit or exceeded."),
                 "Stop Loss": st.column_config.NumberColumn("Stop Loss", help="Stop loss price for this stock."),
                 "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", help="Current price less purchase price."),
                 "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", format="%+.2f%%", help="Gain or loss as a percentage of purchase price."),
@@ -304,7 +313,9 @@ def show_watchlist(db: Session):
                 db, item_to_edit.symbol, new_target, new_stop,
                 alert_move_edit, move_threshold_edit, new_notes,
             )
-            st.success(f"Updated {item_to_edit.symbol}.")
+            st.session_state["watchlist_add_flash"] = (
+                "success", f"Updated {item_to_edit.symbol}."
+            )
             st.rerun()
 
     st.markdown("---")
@@ -329,7 +340,9 @@ def show_watchlist(db: Session):
             if st.button("Yes, remove", key="watchlist_confirm_remove"):
                 _remove_from_watchlist(db, list(pending))
                 st.session_state[remove_key] = None
-                st.success(f"Removed {len(pending)} stocks from watchlist.")
+                st.session_state["watchlist_add_flash"] = (
+                    "success", f"Removed {len(pending)} stocks from watchlist."
+                )
                 st.rerun()
         with cancel_col:
             if st.button("Cancel", key="watchlist_cancel_remove"):
@@ -523,7 +536,8 @@ def _backfill_missing_prices(db: Session, watchlist_items: list, prices: dict) -
 
 def _style_watchlist_row(row: pd.Series) -> list[str]:
     """Colour a watchlist row darkgreen when the current price is at/above target."""
-    if row["_above_target"]:
+    to_target = row.get("To Target %")
+    if to_target is not None and to_target >= 0:
         return ["background-color: darkgreen; color: white"] * len(row)
     return style_gain_loss_row(row)
 

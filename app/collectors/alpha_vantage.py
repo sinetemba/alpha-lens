@@ -19,6 +19,10 @@ class AlphaVantageCollector:
             logger.warning("Alpha Vantage API key not configured. Set ALPHA_VANTAGE_API_KEY to enable.")
 
     def get_commodity_history(self, commodity: str) -> Optional[List[Dict]]:
+        """Daily history for a commodity, in Alpha Vantage's native units:
+        gold/silver USD per troy ounce, copper USD per metric tonne.
+        Callers storing alongside ZAR-per-gram Metals.dev snapshots must
+        convert first."""
         if not self.enabled:
             logger.error("Alpha Vantage is not configured")
             return None

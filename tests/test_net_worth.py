@@ -43,6 +43,13 @@ def test_bullion_value_by_fine_ounces():
     assert bullion_value([], None) == 0.0
 
 
+def test_bullion_value_missing_metal_is_none_not_partial():
+    """A held metal with no spot must not be silently excluded from the total."""
+    bars = [SimpleNamespace(metal="XAU", fine_oz_per_unit=1.0, quantity=1),
+            SimpleNamespace(metal="XAG", fine_oz_per_unit=1.0, quantity=5)]
+    assert bullion_value(bars, {"XAU": 64_000.0}) is None
+
+
 def test_net_worth_total_and_missing():
     worth = NetWorth(jse=179_545.45, crypto=None, bullion=0.0)
     assert worth.total == pytest.approx(179_545.45)

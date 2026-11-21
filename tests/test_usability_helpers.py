@@ -164,7 +164,7 @@ def test_send_test_when_disabled(monkeypatch, db_session):
 # --- per-row price formatting (watchlist) ----------------------------------
 
 import pandas as pd  # noqa: E402
-from app.dashboard.utils import format_price_cell, style_price_columns  # noqa: E402
+from app.dashboard.utils import format_price_cell, style_gain_loss_row, style_price_columns  # noqa: E402
 
 
 @pytest.mark.parametrize("value,reference,signed,expected", [
@@ -213,3 +213,29 @@ def test_style_price_columns_missing_reference_column_is_safe():
     df = pd.DataFrame({"Price": [0.5]})
     text = style_price_columns(df.style, df, "Nope", price_cols=("Price", "Absent")).to_string()
     assert "R 0.50" in text
+
+
+def test_style_gain_loss_row_reads_the_visible_column():
+    """No more _gain_loss helper column: green/red comes from "Gain/Loss",
+    with an explicit value for callers that let the user hide that column."""
+    green = style_gain_loss_row(pd.Series({"Gain/Loss": 5.0}))
+    red = style_gain_loss_row(pd.Series({"Gain/Loss": -5.0}))
+    explicit = style_gain_loss_row(pd.Series({"Symbol": "X"}), -2.0)
+    plain = style_gain_loss_row(pd.Series({"Gain/Loss": None}))
+    assert "background-color: #dcfce7" in green[0]
+    assert "background-color: #fee2e2" in red[0]
+    assert "background-color: #fee2e2" in explicit[0]
+    assert "background-color: #fef3c7" in plain[0]
+
+
+def test_style_watchlist_row_uses_to_target_pct():
+    """The hidden _above_target column is gone: darkgreen comes from the
+    visible To Target % (>= 0 = at/above target), NaN/None falls through."""
+    from app.dashboard.watchlist import _style_watchlist_row
+
+    hit = _style_watchlist_row(pd.Series({"To Target %": 0.0, "Gain/Loss": 1.0}))
+    above = _style_watchlist_row(pd.Series({"To Target %": 12.5, "Gain/Loss": -1.0}))
+    below = _style_watchlist_row(pd.Series({"To Target %": -5.0, "Gain/Loss": 1.0}))
+    none = _style_watchlist_row(pd.Series({"To Target %": float("nan"), "Gain/Loss": 1.0}))
+    assert "darkgreen" in hit[0] and "darkgreen" in above[0]
+    assert "#dcfce7" in below[0] and "#dcfce7" in none[0]

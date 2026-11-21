@@ -18,13 +18,22 @@ def show_upcoming_ipos(db: Session):
     if st.button("🔄 Scan SENS now"):
         with st.spinner("Scanning Moneyweb SENS..."):
             from app.services.ipo import update_ipo_listings
-            added = update_ipo_listings(db)
+            try:
+                added = update_ipo_listings(db)
+            except Exception as e:
+                from loguru import logger
+                logger.error(f"Manual SENS scan failed: {e}")
+                added = None
         if added:
-            st.session_state["ipo_flash"] = f"Found {added} new IPO announcement(s)."
+            st.session_state["ipo_flash"] = ("success", f"Found {added} new IPO announcement(s).")
+        elif added is None:
+            st.session_state["ipo_flash"] = ("error", "SENS scan failed - see logs for details.")
+        else:
+            st.session_state["ipo_flash"] = ("info", "Scan finished - no new IPO announcements found.")
         st.rerun()
     flash = st.session_state.pop("ipo_flash", None)
     if flash:
-        st.success(flash)
+        getattr(st, flash[0])(flash[1])
 
     rows = db.query(UpcomingListing).order_by(
         UpcomingListing.sens_published_at.desc().nullslast(),
