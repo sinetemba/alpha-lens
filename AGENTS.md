@@ -146,6 +146,34 @@ is announced so they can subscribe during the offer window (before listing day).
 - **Caveat:** early warning only — subscribing still goes through a broker
   during the offer window in the pre-listing statement.
 
+## SENS for held shares (suspensions, corporate actions)
+
+Added 2026-11-22 after SGP (Sail Mining) showed as a R0 holding with no
+explanation: suspended on the JSE since 2022-07-18, with a 7.2c repurchase
+offer + delisting proposed 2025-12-12 and its timetable still pending.
+
+- `services/holding_sens.refresh_holding_announcements` runs in the daily
+  historical job (+ `run_updater.py --sens`): one Moneyweb company page per
+  held JSE share (`MoneywebCollector.get_company_sens`, ~10 latest SENS each,
+  0.5s apart, ~45s for 42 holdings) into `sens_announcements` (dedup by
+  `source_url`). Not the all-company SENS page - it spans ~1 trading day, so
+  a slept-through day would lose announcements. `parse_sens_rows` is shared
+  by both pages.
+- New rows raise `type="sens"` (📢) notifications; a symbol's first fetch
+  backfills history but only alerts the last 3 days. Decision-type headlines
+  (`CORPORATE_ACTION_PHRASES`: offers, delisting, odd-lot, circular, business
+  rescue, liquidation...) get an "Action may be needed - " title. Routine
+  AGMs are deliberately NOT actions (they flagged 28/42 holdings), and a
+  later "Results of ..." announcement sharing the phrase concludes an action
+  (RMH's odd-lot offer).
+- `holding_statuses` -> Portfolio page: `_render_unpriced_notice` shows a
+  warning per suspended holding (latest suspension notice + pending action,
+  linked) and per held share with a decision-type SENS in the last 365 days;
+  the Action column says "— suspended" instead of "Sell — no prices" (a
+  suspended share can't be sold). Trading suspensions only: "suspension of
+  operations at <mine>" (WEZ) and "suspensive conditions" are not.
+- Source-health key `moneyweb_company_sens`.
+
 ## Penny stocks scan and near-52w-low alerts
 
 - The scan lives in Streamlit-free `app/services/penny_scan.py`

@@ -566,6 +566,15 @@ class UpdaterService:
             except Exception as e:
                 db.rollback()
                 logger.warning(f"Commodity futures refresh failed: {e}")
+            # SENS announcements for held shares (suspensions, offers,
+            # delistings...) - one Moneyweb company page per holding.
+            try:
+                from app.services.holding_sens import refresh_holding_announcements
+                if refresh_holding_announcements(db) is None:
+                    logger.warning("Holding SENS refresh failed (Moneyweb)")
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"Holding SENS refresh failed: {e}")
             # SAFEX maize/wheat (Grain SA page, published after the 12:00 close).
             try:
                 from app.services.safex_prices import refresh_safex
@@ -609,6 +618,20 @@ class UpdaterService:
                 if db is not None:
                     db.close()
                 self._historical_lock.release()
+
+    @_with_process_lock("Holding SENS refresh")
+    def _update_holding_sens(self) -> bool:
+        """One-shot: refresh SENS for held shares (`run_updater.py --sens`)."""
+        db = SessionLocal()
+        try:
+            from app.services.holding_sens import refresh_holding_announcements
+            return refresh_holding_announcements(db) is not None
+        except Exception as e:
+            logger.error(f"Holding SENS refresh failed: {e}")
+            db.rollback()
+            return False
+        finally:
+            db.close()
 
     @_with_process_lock("Close normalization")
     def _normalize_closes(self) -> bool:
@@ -918,6 +941,9 @@ class UpdaterService:
         if mode == "normalize_closes":
             sys.exit(0 if self._normalize_closes() else 1)
 
+        if mode == "sens":
+            sys.exit(0 if self._update_holding_sens() else 1)
+
         if mode == "full":
             logger.info("Running full update")
             ok = self._update_prices_and_news()
@@ -942,6 +968,7 @@ def main():
     group.add_argument("--logon", action="store_true", help="Run a lightweight logon update and exit")
     group.add_argument("--backup", action="store_true", help="Back up the database now and exit")
     group.add_argument("--ipo", action="store_true", help="Scan Moneyweb SENS for IPO announcements and exit")
+    group.add_argument("--sens", action="store_true", help="Fetch SENS announcements for held shares (alerts new ones) and exit")
     group.add_argument("--normalize-closes", action="store_true", help="Rewrite all stored bars on the adjusted-close convention and exit")
     args = parser.parse_args()
 
@@ -956,6 +983,8 @@ def main():
         mode = "backup"
     elif args.ipo:
         mode = "ipo"
+    elif args.sens:
+        mode = "sens"
     elif args.normalize_closes:
         mode = "normalize_closes"
 

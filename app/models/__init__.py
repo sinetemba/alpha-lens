@@ -6,6 +6,7 @@ from .portfolio import Portfolio, PortfolioHolding
 from .portfolio_snapshot import PortfolioSnapshot
 from .transaction import PortfolioTransaction
 from .upcoming_listing import UpcomingListing
+from .sens_announcement import SensAnnouncement
 from .dividend import Dividend, MoneywebDividendWatch
 from .notification import Notification
 from .updater_run import UpdaterRun
@@ -24,6 +25,7 @@ __all__ = [
     "PortfolioSnapshot",
     "PortfolioTransaction",
     "UpcomingListing",
+    "SensAnnouncement",
     "Dividend",
     "MoneywebDividendWatch",
     "Notification",

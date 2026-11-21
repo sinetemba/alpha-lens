@@ -36,6 +36,7 @@ SOURCES = {
     "metals_dev": "Metals.dev - metal spot prices",
     "moneyweb_login": "Moneyweb - login (Dividend Watch)",
     "moneyweb_sens": "Moneyweb - SENS announcements (IPO scan)",
+    "moneyweb_company_sens": "Moneyweb - SENS for shares you hold",
     "easyequities": "EasyEquities - holdings sync",
     "luno": "Luno - crypto balances",
 }

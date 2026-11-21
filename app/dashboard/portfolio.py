@@ -29,6 +29,7 @@ from app.dashboard.utils import (
     _to_display_tz,
 )
 from app.collectors.easyequities import EasyEquitiesCollector
+from app.services.holding_sens import holding_statuses
 from app.services.portfolio_valuation import update_holding_values, update_portfolio_totals
 from app.services.price_queries import get_latest_and_previous_prices
 # The sync itself is Streamlit-free in services.easyequities_sync so the
@@ -413,10 +414,38 @@ def _render_unpriced_notice(db: Session, holdings: list, portfolio: Portfolio) -
         db.query(StockPrice.symbol, func.max(StockPrice.timestamp))
         .filter(StockPrice.symbol.in_(symbols)).group_by(StockPrice.symbol).all()
     )
-    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=UNPRICED_AFTER_DAYS)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cutoff = now - timedelta(days=UNPRICED_AFTER_DAYS)
+    statuses = holding_statuses(db, symbols)
+    names = {h.symbol: (h.stock.name if h.stock else None) for h in holdings}
+
+    # Decision-type SENS (offers, delisting, business rescue) on ANY held
+    # share in the last CORPORATE_ACTION_DAYS - these are why suspended
+    # holdings still matter (e.g. a repurchase offer for frozen shares).
+    lines = []
+    for s in symbols:
+        status = statuses.get(s)
+        if status is None:
+            continue
+        label = f"**{format_stock_label(s, names.get(s))}**"
+        action = status.corporate_action
+        action_recent = action and action.published_at and now - action.published_at <= timedelta(days=CORPORATE_ACTION_DAYS)
+        if status.suspended:
+            notice = status.suspension
+            line = (f"{label} is **suspended** on the JSE - it can't be traded, so EasyEquities values it "
+                    f"at its last figure. Latest notice: {_sens_link(notice)}.")
+            if action_recent:
+                line += f" Pending: {_sens_link(action)}."
+            lines.append(line)
+        elif action_recent:
+            lines.append(f"{label}: {_sens_link(action)} - may need a decision from shareholders.")
+    if lines:
+        st.warning("\n\n".join(lines))
+
+    explained = {s for s in symbols if statuses.get(s) and statuses[s].suspended}
     stale = [
         f"{s} (last price {latest[s]:%Y-%m-%d})" if latest.get(s) else f"{s} (never priced)"
-        for s in symbols if not latest.get(s) or latest[s] < cutoff
+        for s in symbols if s not in explained and (not latest.get(s) or latest[s] < cutoff)
     ]
     if not stale:
         return
@@ -428,6 +457,17 @@ def _render_unpriced_notice(db: Session, holdings: list, portfolio: Portfolio) -
         f"⚠️ No live JSE price for {', '.join(stale)} - likely suspended or delisted. "
         f"Their values are EasyEquities' last figures (synced {synced} SAST)."
     )
+
+
+# Corporate-action SENS older than this no longer gets a Portfolio notice.
+CORPORATE_ACTION_DAYS = 365
+
+
+def _sens_link(ann) -> str:
+    """Markdown '[headline](url) (30 Sep 2026)' for a stored SENS announcement."""
+    when = f" ({_to_display_tz(ann.published_at):%d %b %Y})" if ann.published_at else ""
+    headline = ann.headline.replace("[", "(").replace("]", ")")
+    return f"[{headline}]({ann.source_url}){when}"
 
 
 def _render_value_history(db: Session, portfolio_id: int) -> None:
@@ -711,6 +751,7 @@ def _render_holdings_table(
     # query; watchlist stops/targets become the user's own exit rules.
     jse_symbols = [h.symbol for h in holdings if h.symbol and is_jse_tracked_account(h.account_type)]
     stats_map = _holding_price_stats(db, jse_symbols)
+    suspended = {s for s, status in holding_statuses(db, jse_symbols).items() if status.suspended}
     watched = {
         w.symbol: w
         for w in db.query(WatchlistItem).filter(
@@ -724,6 +765,10 @@ def _render_holdings_table(
         jse = is_jse_tracked_account(holding.account_type)
         if not jse:
             action = "—"
+        elif holding.symbol in suspended:
+            # A suspended share can't be sold - "Sell — no prices" was
+            # advice the user couldn't act on (SGP, suspended since 2022).
+            action = "— suspended"
         elif holding.symbol not in stats_map:
             action = "Sell — no prices"
         else:
@@ -798,7 +843,9 @@ def _render_holdings_table(
                         "Sell: stop-loss hit, still falling >15% below cost in a downtrend, or "
                         "no prices at all; Trim: watchlist target reached while in profit; "
                         "Buy: loser recovering above its 20-day average with positive momentum, "
-                        "or a winner in an uptrend; Hold: everything else. Not financial advice."
+                        "or a winner in an uptrend; Hold: everything else; — suspended: "
+                        "trading is suspended on the JSE (from SENS), so it can't be sold. "
+                        "Not financial advice."
                     ),
                 ),
                 "Dividends": st.column_config.NumberColumn("Dividends", format="R %.2f", help="Total dividends recorded for this holding."),

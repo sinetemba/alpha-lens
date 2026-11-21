@@ -13,6 +13,47 @@ class AuthError(Exception):
     """Login rejected - credentials/account problem. Never retried."""
 
 
+def parse_sens_rows(html: str, default_symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Parse Moneyweb `div.sens-row` announcements (SENS page and company pages).
+
+    Returns [{published_at, symbol, name, headline, source_url}]. Company
+    pages carry no per-row ticker link - `default_symbol` fills it in.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    for row in soup.select("div.sens-row"):
+        link_el = row.select_one('a[href*="mny_sens"]')
+        if not link_el:
+            continue
+        time_el = row.select_one("time")
+        published = None
+        if time_el and time_el.get("datetime"):
+            try:
+                published = datetime.fromisoformat(time_el["datetime"])
+            except ValueError:
+                pass
+        ticker_el = row.select_one('a[href*="click-a-company"]')
+        strong = link_el.find("strong")
+        name = strong.get_text(strip=True) if strong else None
+        full_text = link_el.get_text(" ", strip=True)
+        # Headline follows "NAME – headline"; when there is no
+        # company prefix (ticker-less announcements) it is the title.
+        headline = full_text
+        if name and full_text.startswith(name):
+            headline = full_text[len(name):].lstrip(" -–").strip()
+        if not headline:
+            headline = full_text
+            name = None
+        rows.append({
+            "published_at": published,
+            "symbol": ticker_el.get_text(strip=True) if ticker_el else default_symbol,
+            "name": name,
+            "headline": headline,
+            "source_url": link_el.get("href"),
+        })
+    return rows
+
+
 class MoneywebCollector:
     """Collector for scraping authenticated Moneyweb data pages.
 
@@ -213,41 +254,24 @@ class MoneywebCollector:
             s = self._get_session()
             resp = s.get(self.SENS_URL, timeout=15)
             resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            rows = []
-            for row in soup.select("div.sens-row"):
-                link_el = row.select_one('a[href*="mny_sens"]')
-                if not link_el:
-                    continue
-                time_el = row.select_one("time")
-                published = None
-                if time_el and time_el.get("datetime"):
-                    try:
-                        published = datetime.fromisoformat(time_el["datetime"])
-                    except ValueError:
-                        pass
-                ticker_el = row.select_one('a[href*="click-a-company"]')
-                strong = link_el.find("strong")
-                name = strong.get_text(strip=True) if strong else None
-                full_text = link_el.get_text(" ", strip=True)
-                # Headline follows "NAME – headline"; when there is no
-                # company prefix (ticker-less announcements) it is the title.
-                headline = full_text
-                if name and full_text.startswith(name):
-                    headline = full_text[len(name):].lstrip(" -–").strip()
-                if not headline:
-                    headline = full_text
-                    name = None
-                rows.append({
-                    "published_at": published,
-                    "symbol": ticker_el.get_text(strip=True) if ticker_el else None,
-                    "name": name,
-                    "headline": headline,
-                    "source_url": link_el.get("href"),
-                })
-            return rows
+            return parse_sens_rows(resp.text)
 
         return self._call_with_retry("Moneyweb SENS", _do_fetch)
+
+    COMPANY_URL = "https://www.moneyweb.co.za/tools-and-data/click-a-company/{symbol}/"
+
+    def get_company_sens(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
+        """One company's recent SENS announcements (~10, newest first) from
+        its public Moneyweb page - no login. The all-company SENS page only
+        spans about one trading day, so a missed run would lose announcements
+        for good; the company page keeps a history. None on failure."""
+        def _do_fetch():
+            s = self._get_session()
+            resp = s.get(self.COMPANY_URL.format(symbol=symbol), timeout=15)
+            resp.raise_for_status()
+            return parse_sens_rows(resp.text, default_symbol=symbol)
+
+        return self._call_with_retry(f"Moneyweb SENS for {symbol}", _do_fetch)
 
     @staticmethod
     def _parse_date(value: Optional[Any]) -> Optional[date]:

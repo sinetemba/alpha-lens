@@ -14,6 +14,7 @@ _TYPE_ICONS = {
     "dividend": "💰",
     "portfolio": "💼",
     "ipo": "🚀",
+    "sens": "📢",
     "system": "🔧",
 }
 
