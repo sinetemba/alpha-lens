@@ -37,6 +37,9 @@ SOURCES = {
     "moneyweb_login": "Moneyweb - login (Dividend Watch)",
     "moneyweb_sens": "Moneyweb - SENS announcements (IPO scan)",
     "moneyweb_company_sens": "Moneyweb - SENS for shares you hold",
+    "moneyweb_movers": "Moneyweb - daily winners & losers (Home)",
+    "yahoo_metals": "Yahoo Finance - gold & silver spot",
+    "goldapi": "GoldAPI - gold & silver spot (fallback)",
     "easyequities": "EasyEquities - holdings sync",
     "luno": "Luno - crypto balances",
 }

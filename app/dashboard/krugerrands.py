@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from app.models.krugerrand import KrugerrandHolding
 from app.models.stock import Stock, StockPrice
 from app.collectors.alpha_vantage import AlphaVantageCollector
-from app.collectors.gold_api import GoldAPICollector
 from app.dashboard.utils import (
     get_latest_market_data_timestamp,
     holding_totals,
@@ -81,29 +80,24 @@ def show_krugerrands(db: Session):
         level, message = flash
         getattr(st, level)(message)
 
-    gold_api = GoldAPICollector()
-    if not gold_api.enabled:
-        st.warning(
-            "GoldAPI key is not configured. Set GOLD_API_KEY in .env "
-            "to enable live gold prices."
-        )
-
     if st.button("🔄 Refresh Gold & FX Prices"):
+        _get_live_spots.clear()
         with st.spinner("Fetching gold and USD/ZAR data..."):
-            refreshed = _refresh_gold_prices(db, gold_api)
+            refreshed = _refresh_gold_prices(db)
         if refreshed:
             st.session_state["krug_flash"] = ("success", "Prices refreshed.")
         else:
             st.session_state["krug_flash"] = (
-                "warning", "Could not refresh prices - check your GoldAPI key/configuration."
+                "warning", "Could not refresh live prices - showing the last stored prices."
             )
         st.rerun()
 
     show_silver = st.toggle("Show Silver Spot", value=False)
 
     with st.spinner("Fetching latest gold prices..."):
-        gold_usd, gold_zar = _get_or_refresh_gold_prices(db, gold_api)
+        gold_usd, gold_zar = _get_or_refresh_gold_prices(db)
     usd_zar = (gold_zar / gold_usd) if gold_usd and gold_usd > 0 else 0.0
+    _render_price_source(db)
 
     st.metric("USD/ZAR", f"R {usd_zar:,.2f}" if usd_zar else "N/A")
 
@@ -121,9 +115,8 @@ def show_krugerrands(db: Session):
     # Silver spot is fetched unconditionally (cached 5 min) so silver
     # products in the calculator and holdings price correctly even when the
     # display toggle is off - the toggle only controls the metric section.
-    silver_usd_data, silver_zar_data = _get_silver_spot()
-    silver_zar = float(silver_zar_data["price"]) if silver_zar_data and "price" in silver_zar_data else 0.0
-    silver_usd = float(silver_usd_data["price"]) if silver_usd_data and "price" in silver_usd_data else 0.0
+    silver = _get_live_spots().get("XAG") or {}
+    silver_usd, silver_zar = silver.get("usd", 0.0), silver.get("zar", 0.0)
     if silver_usd and silver_zar:
         _save_spot_prices(db, [
             (SILVER_USD_LIVE_SYMBOL, silver_usd),
@@ -133,14 +126,14 @@ def show_krugerrands(db: Session):
         # Same stored-bar fallback gold has - a failed fetch shouldn't leave
         # silver holdings silently unpriced.
         silver_zar = _get_latest_price(db, SILVER_LIVE_SYMBOL)[0]
-    if gold_api.enabled and not (silver_usd_data and silver_zar_data):
+    if not silver:
         st.caption(
             "Silver spot fetch failed"
             + (" - showing the last stored price." if silver_zar else " - silver prices unavailable.")
         )
 
     if show_silver:
-        if silver_usd_data and silver_zar_data:
+        if silver_zar:
             st.markdown("---")
             st.subheader("Silver Spot")
 
@@ -150,7 +143,7 @@ def show_krugerrands(db: Session):
             with sc2:
                 st.metric("Silver Spot (ZAR/oz)", f"R {silver_zar:,.2f}" if silver_zar else "N/A")
         else:
-            st.info("Unable to fetch silver prices. Ensure GoldAPI key is configured and valid.")
+            st.info("Silver prices are unavailable right now (Yahoo Finance, with GoldAPI as fallback).")
 
     st.markdown("---")
     _render_krugerrand_calculator(gold_zar, silver_zar)
@@ -170,15 +163,16 @@ def show_krugerrands(db: Session):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _get_silver_spot() -> tuple:
-    """Live silver spot in USD and ZAR, cached 5 min so reruns don't re-fetch."""
-    gold_api = GoldAPICollector()
-    if not gold_api.enabled:
-        return None, None
-    return (
-        gold_api.get_live_price(metal="XAG", currency="USD"),
-        gold_api.get_live_price(metal="XAG", currency="ZAR"),
-    )
+def _get_live_spots() -> dict:
+    """{"XAU"/"XAG": {"usd", "zar", "source"}} - cached 5 min, FAILURES TOO.
+
+    Yahoo (COMEX futures x USD/ZAR) first: free, no quota. GoldAPI only fills
+    a metal Yahoo didn't return, and is itself skipped for hours after a
+    401/403/429 (collectors/gold_api.py). Caching a failed result is what
+    stops a dead source being retried on every rerun.
+    """
+    from app.services.metal_prices import live_metal_spots
+    return live_metal_spots()
 
 
 def _ensure_spot_symbols(db: Session) -> None:
@@ -201,27 +195,22 @@ def _ensure_spot_symbols(db: Session) -> None:
         db.rollback()
 
 
-def _get_api_gold_prices(gold_api: GoldAPICollector) -> tuple[float, float]:
-    """Return the latest gold spot prices (USD, ZAR) per troy oz from GoldAPI."""
-    if not gold_api.enabled:
-        return 0.0, 0.0
-
-    usd_data = gold_api.get_live_price(metal="XAU", currency="USD")
-    zar_data = gold_api.get_live_price(metal="XAU", currency="ZAR")
-
-    gold_usd = float(usd_data["price"]) if usd_data and "price" in usd_data else 0.0
-    gold_zar = float(zar_data["price"]) if zar_data and "price" in zar_data else 0.0
-
-    if not gold_usd or not gold_zar:
-        logger.warning("Failed to fetch gold prices from GoldAPI")
-
-    return gold_usd, gold_zar
+def _render_price_source(db: Session) -> None:
+    """Say where the spot came from - or that it's a stored, older price."""
+    gold = _get_live_spots().get("XAU")
+    if gold:
+        st.caption(f"Spot: {gold['source']} - refreshed every 5 minutes while the page is open.")
+        return
+    _, as_of = _get_latest_price(db, GOLD_LIVE_SYMBOL)
+    st.warning(
+        "Live gold prices are unavailable (Yahoo Finance and GoldAPI both failed) - "
+        + (f"showing the last stored price from {as_of:%d %b %Y}." if as_of else "no stored price yet.")
+    )
 
 
 def _save_spot_prices(db: Session, prices: list) -> None:
     """Persist today's live metal spot snapshots so they can be reused
-    without refetching (including by net worth, which prefers these
-    GoldAPI-sourced bars over its Yahoo fallback)."""
+    without refetching (net worth reads these bars too)."""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -252,24 +241,20 @@ def _save_spot_prices(db: Session, prices: list) -> None:
         db.rollback()
 
 
-def _get_or_refresh_gold_prices(
-    db: Session, gold_api: GoldAPICollector, force: bool = False
-) -> tuple[float, float]:
-    """Return live gold prices in USD and ZAR per troy oz, hitting GoldAPI only when stale/forced."""
+def _get_or_refresh_gold_prices(db: Session, force: bool = False) -> tuple[float, float]:
+    """Gold USD and ZAR per troy oz: the cached live spot, else the stored bar."""
     def _stored() -> tuple[float, float]:
         return (
             _get_latest_price(db, GOLD_USD_LIVE_SYMBOL)[0],
             _get_latest_price(db, GOLD_LIVE_SYMBOL)[0],
         )
 
-    if not gold_api.enabled:
-        return _stored()
-
     latest_timestamp = get_latest_market_data_timestamp(db, [GOLD_LIVE_SYMBOL])
     if not force and not is_market_data_stale(latest_timestamp):
         return _stored()
 
-    gold_usd, gold_zar = _get_api_gold_prices(gold_api)
+    gold = _get_live_spots().get("XAU") or {}
+    gold_usd, gold_zar = gold.get("usd", 0.0), gold.get("zar", 0.0)
     if gold_usd and gold_zar:
         _save_spot_prices(db, [
             (GOLD_USD_LIVE_SYMBOL, gold_usd),
@@ -280,15 +265,13 @@ def _get_or_refresh_gold_prices(
     return _stored()
 
 
-def _refresh_gold_prices(db: Session, gold_api: GoldAPICollector) -> bool:
-    """Force a live refresh of gold spot from GoldAPI. Returns True on success."""
-    if not gold_api.enabled:
-        return False
+def _refresh_gold_prices(db: Session) -> bool:
+    """Force a live refresh of gold spot. Returns True on success."""
     try:
-        gold_usd, gold_zar = _get_or_refresh_gold_prices(db, gold_api, force=True)
+        gold_usd, gold_zar = _get_or_refresh_gold_prices(db, force=True)
         return bool(gold_usd and gold_zar)
     except Exception as e:
-        logger.error(f"Failed to refresh gold prices from GoldAPI: {e}")
+        logger.error(f"Failed to refresh gold prices: {e}")
         return False
 
 
@@ -495,54 +478,20 @@ def _render_holdings(db: Session, gold_zar: float, silver_zar: float):
                         st.rerun()
 
 
-@st.cache_data(ttl=2592000, show_spinner=False)
-def _get_cached_goldapi_year_price(metal: str, year: int) -> float | None:
-    """One year's end ZAR price from GoldAPI (30-day cache per year).
-
-    Raises on fetch failure (exceptions aren't cached - a transient outage
-    can't poison the month-long entry); returns None only when the API
-    responded but had no price for that year.
-    """
-    gold_api = GoldAPICollector()
-    if not gold_api.enabled:
-        return None
-    data = gold_api.get_historical_price(metal, "ZAR", f"{year}1231")
-    if data is None:
-        raise RuntimeError(f"GoldAPI year-end fetch failed for {metal} {year}")
-    return float(data["price"]) if "price" in data else None
-
-
-def _get_goldapi_year_end(metal: str = "XAU") -> dict[int, float]:
-    """Year-end ZAR prices for the last 10 years from GoldAPI.
-
-    Years are fetched and cached individually so a failed year doesn't lose
-    the others or get retried as one 10-call block. Raises when every year
-    fails - a total failure is an outage, not "no data".
-    """
-    if not GoldAPICollector().enabled:
-        return {}
-    current_year = datetime.now(timezone.utc).year
-    prices: dict[int, float] = {}
-    failures = 0
-    years = list(range(current_year - 10, current_year))
-    for year in years:
-        try:
-            price = _get_cached_goldapi_year_price(metal, year)
-        except Exception:
-            failures += 1
-            continue
-        if price is not None:
-            prices[year] = price
-    if failures == len(years):
-        raise RuntimeError(f"GoldAPI returned no year-end {metal} prices - likely an outage or bad key")
-    return prices
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _get_yahoo_year_ends(metal: str) -> dict[int, float]:
+    """Year-end ZAR prices for the last 10 years from Yahoo - ONE request
+    (replaced 10 GoldAPI calls per view). Cached 6h, an empty (failed)
+    result included, so an outage isn't retried on every rerun."""
+    from app.collectors.yfinance import YFinanceCollector
+    return YFinanceCollector().get_metal_year_ends_zar(metal) or {}
 
 
 @st.cache_data(ttl=2592000, show_spinner=False)
 def _get_cached_av_year_end(metal: str = "XAU") -> dict[int, float]:
     """Year-end USD prices for the last 10 years from Alpha Vantage (fallback).
 
-    Raises on fetch failure - see _get_cached_goldapi_year_end.
+    Raises on fetch failure (exceptions are not cached, so an outage retries).
     """
     av = AlphaVantageCollector()
     if not av.enabled:
@@ -564,12 +513,8 @@ def _get_cached_av_year_end(metal: str = "XAU") -> dict[int, float]:
 
 
 def _get_year_end_prices_zar(metal: str, usd_zar: float) -> dict[int, float]:
-    """Year-end ZAR price per year: GoldAPI direct, else Alpha Vantage USD converted."""
-    try:
-        prices = _get_goldapi_year_end(metal)
-    except Exception as e:
-        logger.warning(f"GoldAPI year-end fetch failed for {metal}: {e}")
-        prices = {}
+    """Year-end ZAR price per year: Yahoo history, else Alpha Vantage USD converted."""
+    prices = _get_yahoo_year_ends(metal)
     if prices:
         return prices
     if usd_zar <= 0:
@@ -618,7 +563,7 @@ def _render_historical_grid(
         rows = _build_year_end_rows(_get_year_end_prices_zar(metal, usd_zar), sizes)
 
     if not rows:
-        st.info("No historical data available. Check your GoldAPI or Alpha Vantage configuration.")
+        st.info("No historical data available right now (Yahoo Finance, with Alpha Vantage as fallback).")
         return
 
     st.dataframe(rows, width="stretch", hide_index=True)

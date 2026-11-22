@@ -97,12 +97,14 @@ class YFinanceCollector:
         self.__class__._usd_zar_cache = (rate, datetime.now(timezone.utc))
         return rate
 
-    def get_metal_spots_zar(self) -> Optional[Dict[str, float]]:
-        """Gold/silver ZAR per troy oz: COMEX futures x USDZAR; None on failure.
+    _METAL_TICKERS = {"XAU": "GC=F", "XAG": "SI=F"}   # COMEX front-month futures
 
-        Free and quota-less, so the headless updater can value bullion
-        without spending GoldAPI's 100 requests/month (the Krugerrands page
-        keeps using GoldAPI; the two agree to ~0.01% for gold).
+    def get_metal_spots(self) -> Optional[Dict[str, Dict[str, float]]]:
+        """Gold/silver per troy oz in USD and ZAR: {"XAU": {"usd", "zar"}, ...}.
+
+        COMEX futures x USDZAR - free and quota-less (GoldAPI allows 100
+        requests/month); matches GoldAPI's spot to ~0.01% for gold. None on
+        failure; a metal is omitted when its close is missing.
         """
         if not self.enabled:
             return None
@@ -110,16 +112,55 @@ class YFinanceCollector:
             closes = self._call_with_retry(
                 "Yahoo metal spots",
                 lambda: yf.download(
-                    ["GC=F", "SI=F", "ZAR=X"], period="5d", progress=False, auto_adjust=False
+                    list(self._METAL_TICKERS.values()) + ["ZAR=X"], period="5d",
+                    progress=False, auto_adjust=False,
                 )["Close"],
             )
             latest = closes.ffill().iloc[-1]
             usd_zar = float(latest["ZAR=X"])
-            spots = {"XAU": float(latest["GC=F"]) * usd_zar, "XAG": float(latest["SI=F"]) * usd_zar}
         except Exception as e:
             logger.error(f"Yahoo metal spot fetch failed: {e}")
             return None
-        return {k: v for k, v in spots.items() if v and v == v and v > 0} or None
+        if not usd_zar or usd_zar != usd_zar or usd_zar <= 0:
+            return None
+        spots = {}
+        for metal, ticker in self._METAL_TICKERS.items():
+            usd = float(latest.get(ticker, float("nan")))
+            if usd and usd == usd and usd > 0:
+                spots[metal] = {"usd": usd, "zar": usd * usd_zar}
+        return spots or None
+
+    def get_metal_spots_zar(self) -> Optional[Dict[str, float]]:
+        """Gold/silver ZAR per troy oz (see get_metal_spots); None on failure."""
+        spots = self.get_metal_spots()
+        return {metal: s["zar"] for metal, s in spots.items()} if spots else None
+
+    def get_metal_year_ends_zar(self, metal: str, years: int = 10) -> Optional[Dict[int, float]]:
+        """{year: ZAR/oz at the last session of that year} for the previous
+        `years` full years - the futures close converted at that day's
+        USD/ZAR. Replaces 10 GoldAPI history calls per page view. None on failure."""
+        ticker = self._METAL_TICKERS.get(metal)
+        if not self.enabled or ticker is None:
+            return None
+        try:
+            closes = self._call_with_retry(
+                f"Yahoo {metal} year-end history",
+                lambda: yf.download(
+                    [ticker, "ZAR=X"], period=f"{years + 2}y", interval="1d",
+                    progress=False, auto_adjust=False,
+                )["Close"],
+            ).ffill().dropna()
+        except Exception as e:
+            logger.error(f"Yahoo {metal} history fetch failed: {e}")
+            return None
+        current_year = datetime.now(timezone.utc).year
+        result = {}
+        for year in range(current_year - years, current_year):
+            rows = closes[closes.index.year == year]
+            if not rows.empty:
+                last = rows.iloc[-1]
+                result[year] = float(last[ticker]) * float(last["ZAR=X"])
+        return result or None
 
     def get_futures_closes(self, tickers: List[str], period: str = "1y"):
         """Daily closes for Yahoo futures tickers (e.g. "CL=F") plus "ZAR=X".
