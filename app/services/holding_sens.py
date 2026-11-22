@@ -31,6 +31,9 @@ REQUEST_SPACING_SECONDS = 0.5
 # this recent (JSE requires quarterly suspension updates) and nothing later
 # says trading resumed.
 SUSPENSION_FRESH = timedelta(days=200)
+# Decision-type SENS older than this is no longer surfaced (unless the share
+# is suspended - then the action stays open until trading resumes).
+CORPORATE_ACTION_DAYS = 365
 
 # Trading suspensions only - "temporary suspension of operations at <mine>"
 # (WEZ) and "suspensive conditions" (ENX) are not.
@@ -133,31 +136,100 @@ def refresh_holding_announcements(db: Session, collector=None, symbols=None,
         alerts, stored = [], 0
 
     for ann in alerts:
-        action = is_corporate_action(ann.headline)
-        when = f"{ann.published_at:%d %b %Y %H:%M} UTC" if ann.published_at else "recently"
-        try:
-            notifier.create_notification(
-                notification_type="sens",
-                title=(f"Action may be needed - {ann.symbol}: {ann.headline}" if action
-                       else f"SENS {ann.symbol}: {ann.headline}")[:450],
-                message=(
-                    f"{ann.name or ann.symbol} published \"{ann.headline}\" on SENS ({when}). "
-                    + ("This kind of announcement can need a decision from shareholders "
-                       "(e.g. accepting an offer) - read it: " if action else "Read it: ")
-                    + ann.source_url
-                ),
-                stock_symbol=ann.symbol,
-                metadata={"url": ann.source_url, "corporate_action": action},
-            )
-        except Exception as e:
-            logger.warning(f"Could not create SENS notification for {ann.symbol}: {e}")
+        _notify(db, notifier, collector, ann)
+
+    # Open corporate actions never alerted (a first-fetch backfill skips
+    # anything older than BACKFILL_ALERT_WINDOW - APF's 13 Nov circular for
+    # 14-15 Dec meetings, SGP's pending offer) are caught up once.
+    caught_up = 0
+    for status in holding_statuses(db, symbols, now=now).values():
+        for ann in pending_actions(status, now):
+            if ann.alerted_at is None:
+                _notify(db, notifier, collector, ann, catch_up=True, status=status)
+                caught_up += 1
 
     ok = len(failed) < len(symbols)
     record_source(db, "moneyweb_company_sens", ok,
                   f"failed for {len(failed)}/{len(symbols)}: {', '.join(failed[:10])}" if failed else None)
     logger.info(f"Holding SENS: {stored} new announcement(s), {len(alerts)} alerted, "
-                f"{len(failed)}/{len(symbols)} fetches failed")
+                f"{caught_up} open action(s) caught up, {len(failed)}/{len(symbols)} fetches failed")
     return stored if ok else None
+
+
+def is_pending(status: "HoldingStatus", now, ann: Optional[SensAnnouncement] = None) -> bool:
+    """A decision-type announcement still worth surfacing: from the last
+    CORPORATE_ACTION_DAYS, or any age while the share is suspended (SGP's
+    offer was announced 2025-12 and its timetable is still outstanding)."""
+    ann = ann or status.corporate_action
+    if ann is None:
+        return False
+    if status.suspended:
+        return True
+    return bool(ann.published_at and now - ann.published_at <= timedelta(days=CORPORATE_ACTION_DAYS))
+
+
+def pending_actions(status: "HoldingStatus", now) -> list:
+    return [a for a in status.corporate_actions if is_pending(status, now, a)]
+
+
+def ensure_facts(db: Session, collector, ann: SensAnnouncement, status: "HoldingStatus" = None) -> str:
+    """Fetch and store the key facts of a decision-type announcement (once).
+
+    An update with no figures of its own ("revised timetable to follow")
+    borrows the PRICE facts of the earlier announcement of the same action -
+    never its dates, which that update may have withdrawn.
+    """
+    if ann.facts is None:
+        from app.services.sens_facts import extract_facts, format_facts, price_facts
+        text = collector.get_announcement_text(ann.source_url) if hasattr(collector, "get_announcement_text") else None
+        facts = extract_facts(text)
+        if not facts and status is not None:
+            phrases = _phrases(ann.headline)
+            earlier = next((a for a in status.recent
+                            if a is not ann and _phrases(a.headline) & phrases
+                            and (a.published_at or ann.published_at) <= (ann.published_at or a.published_at)), None)
+            if earlier is not None:
+                earlier_text = collector.get_announcement_text(earlier.source_url)
+                borrowed = price_facts(extract_facts(earlier_text))
+                if borrowed:
+                    when = f"{earlier.published_at:%d %b %Y}" if earlier.published_at else "earlier"
+                    facts = [f"{f} (per {when} announcement)" for f in borrowed]
+        ann.facts = format_facts(facts)[:500] if text is not None else None   # None = retry next run
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+    return ann.facts or ""
+
+
+def _notify(db: Session, notifier, collector, ann: SensAnnouncement,
+            catch_up: bool = False, status: "HoldingStatus" = None) -> None:
+    action = is_corporate_action(ann.headline)
+    when = f"{ann.published_at:%d %b %Y %H:%M} UTC" if ann.published_at else "recently"
+    facts = ensure_facts(db, collector, ann, status) if action else ""
+    if action:
+        title = f"Action may be needed - {ann.symbol}: {ann.headline}"
+        lead = ("Still open - not alerted when first published. " if catch_up else "")
+        body = (f"{lead}{ann.name or ann.symbol} published \"{ann.headline}\" on SENS ({when}). "
+                + (f"Key facts: {facts}. " if facts else "")
+                + "This kind of announcement can need a decision from shareholders "
+                  "(e.g. accepting an offer or voting) - read it: ")
+    else:
+        title = f"SENS {ann.symbol}: {ann.headline}"
+        body = f"{ann.name or ann.symbol} published \"{ann.headline}\" on SENS ({when}). Read it: "
+    try:
+        notifier.create_notification(
+            notification_type="sens",
+            title=title[:450],
+            message=body + ann.source_url,
+            stock_symbol=ann.symbol,
+            metadata={"url": ann.source_url, "corporate_action": action, "facts": facts or None},
+        )
+        ann.alerted_at = utcnow_naive()
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning(f"Could not create SENS notification for {ann.symbol}: {e}")
 
 
 @dataclass
@@ -166,6 +238,9 @@ class HoldingStatus:
     suspended: bool = False
     suspension: Optional[SensAnnouncement] = None        # latest suspension notice
     corporate_action: Optional[SensAnnouncement] = None  # latest decision-type notice
+    # Every distinct open action, newest first (APF had two circulars on one
+    # day: Fourways Mall vote 14 Dec, Cedar Square sale 15 Dec).
+    corporate_actions: list = field(default_factory=list)
     latest: Optional[SensAnnouncement] = None
     recent: list = field(default_factory=list)
 
@@ -191,9 +266,15 @@ def holding_statuses(db: Session, symbols, now=None) -> dict[str, HoldingStatus]
             # Newest-first: an outcome ("Results of the Odd-lot Offer") closes
             # the earlier announcements of the same action (RMH's offer price).
             concluded.setdefault(ann.symbol, set()).update(phrases)
-        elif (st.corporate_action is None and phrases
-              and not phrases & concluded.get(ann.symbol, set())):
-            st.corporate_action = ann
+        elif phrases and not phrases & concluded.get(ann.symbol, set()):
+            # Later notices of the same action supersede earlier ones (SGP's
+            # Jan update over its Dec launch). "circular" alone says nothing
+            # about WHICH action, so distinct circulars all stay.
+            key = phrases - {"circular"}
+            if not key or not any(key & (_phrases(a.headline) - {"circular"}) for a in st.corporate_actions):
+                st.corporate_actions.append(ann)
+                if st.corporate_action is None:
+                    st.corporate_action = ann
         if st.suspension is None and not _has(ann.headline, RESUMPTION_PHRASES) \
                 and _has(ann.headline, SUSPENSION_PHRASES):
             st.suspension = ann

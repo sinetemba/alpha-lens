@@ -172,6 +172,26 @@ offer + delisting proposed 2025-12-12 and its timetable still pending.
   the Action column says "— suspended" instead of "Sell — no prices" (a
   suspended share can't be sold). Trading suspensions only: "suspension of
   operations at <mine>" (WEZ) and "suspensive conditions" are not.
+- **Key facts** (`services/sens_facts.py`, rule-based): for decision-type
+  announcements the page text (`MoneywebCollector.get_announcement_text`,
+  trimmed by `sens_body_text`) is parsed for the salient-dates table
+  (general meeting, last day to trade, voting record date, proxy deadline,
+  offer opens/closes, payment), deal-sized Rand amounts (>= R1m), cents-per-
+  share offer prices and irrevocable-undertaking %, max 5 by priority, stored
+  " · "-joined in `sens_announcements.facts` and shown in the notification
+  and Portfolio notice. Dates are matched line by line (a year from the next
+  table row was once borrowed) and the circular-receipt record date is
+  skipped via a next-line look-ahead. A figureless update borrows only PRICE
+  facts from the earlier notice of the same action, never its dates (SGP's
+  Jan update: "timetable will be revised").
+- **Catch-up:** `alerted_at` marks notified rows; every open action
+  (`pending_actions`: <365d, any age while suspended) not yet alerted is
+  notified once with a "Still open" lead. Several open actions per holding
+  are kept (APF had two circulars on 13 Nov); later notices of the same
+  action supersede earlier ones, but distinct circulars all stay.
+- Bond/noteholder notices put a truncated title in the `<strong>` "company"
+  slot; when that text has lower-case letters, the headline is the longer of
+  it and the URL slug (`_headline_from_slug`) - either can be the cut one.
 - Source-health key `moneyweb_company_sens`.
 
 ## Penny stocks scan and near-52w-low alerts

@@ -55,9 +55,18 @@ def test_first_fetch_backfills_history_but_alerts_only_recent(db_session):
     ]}
     assert refresh_holding_announcements(db_session, _collector(pages), symbols=["SGP"], spacing=0) == 2
     assert db_session.query(SensAnnouncement).count() == 2
-    notes = db_session.query(Notification).all()
-    assert [n.title for n in notes] == ["SENS SGP: Quarterly suspension update"]
-    assert notes[0].type == "sens"
+    notes = db_session.query(Notification).order_by(Notification.id).all()
+    # The 340-day-old update isn't alerted as new - but the offer is still
+    # open (<365d), so it is caught up once, flagged as such.
+    assert [n.title for n in notes] == [
+        "SENS SGP: Quarterly suspension update",
+        "Action may be needed - SGP: Proposed Repurchase Offer and Delisting of Sail",
+    ]
+    assert notes[1].message.startswith("Still open")
+    assert all(n.type == "sens" for n in notes)
+    # ...and only once.
+    refresh_holding_announcements(db_session, _collector(pages), symbols=["SGP"], spacing=0)
+    assert db_session.query(Notification).count() == 2
 
 
 def test_later_runs_alert_every_new_announcement_and_flag_actions(db_session):
@@ -131,3 +140,71 @@ def test_suspension_lifted_or_stale_is_not_suspended(db_session):
 def test_held_symbols_skip_pseudo_symbols(db_session, monkeypatch):
     monkeypatch.setattr("app.services.penny_scan.held_jse_symbols", lambda db: {"SGP", "^J203.JO", "AV_GOLD", "ISO"})
     assert holding_sens.held_sens_symbols(db_session) == ["ISO", "SGP"]
+
+
+# --- headline repair, key facts, multiple open actions --------------------
+
+def test_truncated_bond_notice_title_is_rebuilt_from_the_url():
+    html = """<div class="sens-row"><time datetime="2026-11-20T14:00:00+02:00"></time>
+    <a href="https://www.moneyweb.co.za/mny_sens/interest-payment-notification-727/">
+    <strong>Interest payment notificatio</strong> – st payment notification</a></div>"""
+    row = parse_sens_rows(html, default_symbol="APF")[0]
+    assert row["headline"] == "Interest payment notification" and row["name"] is None
+
+
+# Salient-dates table as it appears in APF's 13 Nov 2026 circular announcement.
+_APF_CIRCULAR = """JSE Share code: APF
+DISTRIBUTION OF CIRCULAR AND NOTICE OF GENERAL MEETING
+notice is hereby given that the General Meeting will be held in person at 10:00 on Monday, 14 December 2026
+Record date to determine which Shareholders are entitled                    Friday, 6 November
+to receive the Circular
+Last day to trade Shares in order to be eligible to vote at                Tuesday, 1 December
+the General Meeting
+Record date to be eligible to attend, participate and vote                   Friday, 4 December
+at the General Meeting
+For administrative purposes only, Forms of Proxy (grey)                     Friday, 11 December
+General Meeting of Shareholders to be held in person at                     Monday, 14 December
+Results of the General Meeting to be published on SENS                      Monday, 14 December
+"""
+
+
+def test_salient_dates_are_extracted_and_the_circular_record_date_skipped():
+    from app.services.sens_facts import extract_facts
+    facts = extract_facts(_APF_CIRCULAR)
+    assert facts[:3] == ["General meeting Mon 14 Dec 2026 10:00", "Last day to trade Tue 1 Dec",
+                         "Record date Fri 4 Dec"]     # not Fri 6 Nov (to receive the circular)
+
+
+def test_prices_and_undertakings_are_extracted():
+    from app.services.sens_facts import extract_facts
+    assert "Consideration R630m" in extract_facts(
+        "for an aggregate purchase consideration of R 630 000 000 (exclusive of VAT)")
+    assert "Offer price 7.2c per share" in extract_facts(
+        "Cash consideration of 7.2 South African cents per Offer Share, representing a premium")
+    assert "Irrevocable support 50.7%" in extract_facts(
+        "has received an irrevocable undertaking to vote in favour of the Shareholders Resolution "
+        "from a Shareholder holding 1,036,747,462 Accelerate shares, representing 50.7% of the shares")
+
+
+def test_two_circulars_on_one_day_are_both_open(db_session):
+    """APF: Fourways Mall vote (14 Dec) and Cedar Square sale (15 Dec)."""
+    from app.services.holding_sens import pending_actions
+    _store(db_session, "APF", "Distribution of circular and notice of general meeting", 9, "u/c1")
+    _store(db_session, "APF", "Posting of circular regarding Cedar Square disposal", 9, "u/c2")
+    status = holding_statuses(db_session, ["APF"])["APF"]
+    assert {a.source_url for a in pending_actions(status, utcnow_naive())} == {"u/c1", "u/c2"}
+
+
+def test_a_figureless_update_borrows_only_prices_from_the_launch(db_session):
+    """SGP's Jan update has no figures; the Dec launch's 7.2c is borrowed but
+    its withdrawn timetable is not."""
+    from app.services.holding_sens import ensure_facts
+    _store(db_session, "SGP", "Proposed Repurchase Offer and Delisting of Sail", 345, "u/launch")
+    _store(db_session, "SGP", "Update regarding the proposed repurchase offer and delisting of Sail", 296, "u/update")
+    status = holding_statuses(db_session, ["SGP"])["SGP"]
+    texts = {"u/update": "As certain regulatory approvals remain outstanding, the timetable will have to be revised.",
+             "u/launch": "7.2 South African cents per Offer Share. Last day to trade Tuesday, 17 February"}
+    collector = SimpleNamespace(get_announcement_text=lambda url: texts[url])
+    facts = ensure_facts(db_session, collector, status.corporate_action, status)
+    assert facts.startswith("Offer price 7.2c per share (per ")
+    assert "Last day to trade" not in facts

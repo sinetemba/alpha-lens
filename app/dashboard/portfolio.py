@@ -29,7 +29,7 @@ from app.dashboard.utils import (
     _to_display_tz,
 )
 from app.collectors.easyequities import EasyEquitiesCollector
-from app.services.holding_sens import holding_statuses
+from app.services.holding_sens import holding_statuses, pending_actions
 from app.services.portfolio_valuation import update_holding_values, update_portfolio_totals
 from app.services.price_queries import get_latest_and_previous_prices
 # The sync itself is Streamlit-free in services.easyequities_sync so the
@@ -428,17 +428,16 @@ def _render_unpriced_notice(db: Session, holdings: list, portfolio: Portfolio) -
         if status is None:
             continue
         label = f"**{format_stock_label(s, names.get(s))}**"
-        action = status.corporate_action
-        action_recent = action and action.published_at and now - action.published_at <= timedelta(days=CORPORATE_ACTION_DAYS)
+        actions = "; ".join(_sens_link(a, with_facts=True) for a in pending_actions(status, now)[:3])
         if status.suspended:
             notice = status.suspension
             line = (f"{label} is **suspended** on the JSE - it can't be traded, so EasyEquities values it "
                     f"at its last figure. Latest notice: {_sens_link(notice)}.")
-            if action_recent:
-                line += f" Pending: {_sens_link(action)}."
+            if actions:
+                line += f" Pending: {actions}."
             lines.append(line)
-        elif action_recent:
-            lines.append(f"{label}: {_sens_link(action)} - may need a decision from shareholders.")
+        elif actions:
+            lines.append(f"{label}: {actions} - may need a decision from shareholders.")
     if lines:
         st.warning("\n\n".join(lines))
 
@@ -459,15 +458,13 @@ def _render_unpriced_notice(db: Session, holdings: list, portfolio: Portfolio) -
     )
 
 
-# Corporate-action SENS older than this no longer gets a Portfolio notice.
-CORPORATE_ACTION_DAYS = 365
-
-
-def _sens_link(ann) -> str:
-    """Markdown '[headline](url) (30 Sep 2026)' for a stored SENS announcement."""
+def _sens_link(ann, with_facts: bool = False) -> str:
+    """Markdown '[headline](url) (30 Sep 2026)' for a stored SENS announcement,
+    optionally followed by its extracted key facts."""
     when = f" ({_to_display_tz(ann.published_at):%d %b %Y})" if ann.published_at else ""
     headline = ann.headline.replace("[", "(").replace("]", ")")
-    return f"[{headline}]({ann.source_url}){when}"
+    facts = f" - {ann.facts}" if with_facts and ann.facts else ""
+    return f"[{headline}]({ann.source_url}){when}{facts}"
 
 
 def _render_value_history(db: Session, portfolio_id: int) -> None:

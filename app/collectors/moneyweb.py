@@ -13,6 +13,30 @@ class AuthError(Exception):
     """Login rejected - credentials/account problem. Never retried."""
 
 
+def sens_body_text(html: str) -> str:
+    """The announcement text of a Moneyweb SENS page, without site chrome."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "header", "footer"]):
+        tag.decompose()
+    text = "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())
+    start = min((i for i in (text.find("Share code"), text.find("Share Code"),
+                             text.find("JSE Share code"), text.find("ISIN")) if i >= 0), default=0)
+    end = text.find("Produced by the JSE SENS Department", start)
+    return text[start:end if end > 0 else None]
+
+
+def _headline_from_slug(url: Optional[str]) -> Optional[str]:
+    """'.../mny_sens/interest-payment-notification-727/' -> 'Interest payment notification'."""
+    if not url:
+        return None
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    words = slug.split("-")
+    while words and words[-1].isdigit():   # Moneyweb's de-dup suffix
+        words.pop()
+    text = " ".join(words).strip()
+    return text[:1].upper() + text[1:] if text else None
+
+
 def parse_sens_rows(html: str, default_symbol: Optional[str] = None) -> List[Dict[str, Any]]:
     """Parse Moneyweb `div.sens-row` announcements (SENS page and company pages).
 
@@ -39,7 +63,17 @@ def parse_sens_rows(html: str, default_symbol: Optional[str] = None) -> List[Dic
         # Headline follows "NAME – headline"; when there is no
         # company prefix (ticker-less announcements) it is the title.
         headline = full_text
-        if name and full_text.startswith(name):
+        if name and any(c.islower() for c in name):
+            # Not a company name (those are upper-case): Moneyweb's markup for
+            # bond/noteholder notices puts a TRUNCATED title in <strong> and a
+            # mangled tail after it ("Interest payment notificatio – st payment
+            # notification"). The URL slug carries the real title.
+            # Either can be the truncated one (the slug is cut on long titles
+            # too), so keep the longer.
+            slug = _headline_from_slug(link_el.get("href")) or ""
+            headline = slug if len(slug) > len(name) else name
+            name = None
+        elif name and full_text.startswith(name):
             headline = full_text[len(name):].lstrip(" -–").strip()
         if not headline:
             headline = full_text
@@ -257,6 +291,18 @@ class MoneywebCollector:
             return parse_sens_rows(resp.text)
 
         return self._call_with_retry("Moneyweb SENS", _do_fetch)
+
+    def get_announcement_text(self, url: str) -> Optional[str]:
+        """Plain text of one SENS announcement page (public), trimmed to the
+        announcement itself - from its 'Share code'/'ISIN' header to the JSE
+        disclaimer. None on failure."""
+        def _do_fetch():
+            s = self._get_session()
+            resp = s.get(url, timeout=20)
+            resp.raise_for_status()
+            return sens_body_text(resp.text)
+
+        return self._call_with_retry("Moneyweb SENS announcement", _do_fetch)
 
     COMPANY_URL = "https://www.moneyweb.co.za/tools-and-data/click-a-company/{symbol}/"
 
