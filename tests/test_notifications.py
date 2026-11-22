@@ -287,3 +287,70 @@ def test_send_pending_delivers_fresh_rows(db_session, monkeypatch):
 
     db_session.refresh(note)
     assert note.is_sent is True
+
+
+# --- edge-triggered target / stop / RSI ------------------------------------
+
+def _bar(db_session, symbol, day, close, rsi=None):
+    stock = db_session.query(Stock).filter_by(symbol=symbol).first()
+    db_session.add(StockPrice(stock_id=stock.id, symbol=symbol, timestamp=datetime(2026, 11, day),
+                              close_price=close, rsi=rsi))
+    db_session.commit()
+
+
+def _titles(db_session):
+    return [n.title for n in db_session.query(Notification).order_by(Notification.id)]
+
+
+def _new_service(db_session, monkeypatch):
+    # A fresh service per "run" - each updater run builds its own, so the
+    # in-memory 20h dedup cache can't hide a repeat.
+    return _service(db_session, monkeypatch)
+
+
+def test_target_alerts_once_while_it_stays_above(db_session, monkeypatch):
+    """SOL/NPK/DRD alerted 4 days running while above target."""
+    _seed_stock_and_watchlist(db_session, symbol="SOL", target_price=200.0,
+                              updated_at=datetime(2026, 11, 1))   # level set before the run
+    _bar(db_session, "SOL", 17, 195.0)
+    _bar(db_session, "SOL", 18, 203.0)            # crosses
+    _new_service(db_session, monkeypatch).check_price_alerts()
+    db_session.query(Notification).update({"created_at": datetime(2026, 11, 18)})
+    db_session.commit()
+    _bar(db_session, "SOL", 19, 205.0)            # still above - next day
+    _new_service(db_session, monkeypatch).check_price_alerts()
+    assert _titles(db_session) == ["Target Price Reached: SOL"]
+
+
+def test_target_realerts_after_a_new_crossing(db_session, monkeypatch):
+    _seed_stock_and_watchlist(db_session, symbol="SOL", target_price=200.0)
+    _bar(db_session, "SOL", 17, 195.0)
+    _bar(db_session, "SOL", 18, 203.0)
+    _new_service(db_session, monkeypatch).check_price_alerts()
+    db_session.query(Notification).update({"created_at": datetime(2026, 11, 1)})
+    db_session.commit()
+    _bar(db_session, "SOL", 19, 198.0)            # back below
+    _bar(db_session, "SOL", 20, 201.0)            # crosses again
+    _new_service(db_session, monkeypatch).check_price_alerts()
+    assert _titles(db_session) == ["Target Price Reached: SOL"] * 2
+
+
+def test_level_set_while_already_crossed_alerts_once(db_session, monkeypatch):
+    _seed_stock_and_watchlist(db_session, symbol="DRD", stop_loss=40.0)
+    _bar(db_session, "DRD", 17, 37.0)
+    _bar(db_session, "DRD", 18, 36.5)             # never crossed - always below
+    _new_service(db_session, monkeypatch).check_price_alerts()
+    _new_service(db_session, monkeypatch).check_price_alerts()
+    assert _titles(db_session) == ["Stop Loss Triggered: DRD"]
+
+
+def test_rsi_alerts_on_entering_the_zone_only(db_session, monkeypatch):
+    _seed_stock_and_watchlist(db_session, symbol="SKA")
+    _bar(db_session, "SKA", 17, 0.85, rsi=28.0)
+    _bar(db_session, "SKA", 18, 0.84, rsi=25.0)   # already oversold yesterday
+    _new_service(db_session, monkeypatch).check_technical_alerts()
+    assert _titles(db_session) == []
+    _bar(db_session, "SKA", 19, 0.90, rsi=40.0)
+    _bar(db_session, "SKA", 20, 0.80, rsi=29.0)   # enters the zone
+    _new_service(db_session, monkeypatch).check_technical_alerts()
+    assert _titles(db_session) == ["RSI Oversold: SKA"]

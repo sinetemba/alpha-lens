@@ -47,7 +47,7 @@ class NotificationService:
         if self.enabled:
             self.appr = apprise.Apprise()
             self._setup_notification_channels()
-    
+
     def _setup_notification_channels(self):
         """Setup notification channels based on configuration."""
         # Email
@@ -62,19 +62,19 @@ class NotificationService:
             )
             self.appr.add(email_url, tag="email")
             logger.info("Email notification channel configured")
-        
+
         # ntfy
         if settings.notification_ntfy_topic:
             ntfy_url = f"ntfy://{settings.notification_ntfy_topic}"
             self.appr.add(ntfy_url, tag="ntfy")
             logger.info("ntfy notification channel configured")
-        
+
         # Discord
         if settings.notification_discord_webhook_url:
             discord_url = f"discord://{settings.notification_discord_webhook_url}"
             self.appr.add(discord_url, tag="discord")
             logger.info("Discord notification channel configured")
-        
+
         # Telegram
         if settings.notification_telegram_bot_token and settings.notification_telegram_chat_id:
             telegram_url = (
@@ -83,7 +83,7 @@ class NotificationService:
             )
             self.appr.add(telegram_url, tag="telegram")
             logger.info("Telegram notification channel configured")
-    
+
     @staticmethod
     def channel_status() -> dict[str, bool]:
         """Which delivery channels have their required settings filled in."""
@@ -160,19 +160,19 @@ class NotificationService:
         self._recent_by_key[key] = notification
 
         return notification
-    
+
     def send_notification(self, notification: Notification, channel: Optional[str] = None) -> bool:
         """Send a notification through configured channels."""
         if not self.enabled:
             logger.info("Notifications are disabled")
             return False
-        
+
         try:
             # Prepare notification body
             body = notification.message
             if notification.stock_symbol:
                 body = f"[{notification.stock_symbol}] {body}"
-            
+
             # Send notification
             if channel:
                 # Send to specific channel
@@ -187,7 +187,7 @@ class NotificationService:
                     title=notification.title,
                     body=body
                 )
-            
+
             if success:
                 notification.is_sent = True
                 notification.sent_at = _utcnow_naive()
@@ -209,7 +209,7 @@ class NotificationService:
         except Exception:
             self.db.rollback()
         return False
-    
+
     def _alertable_watchlist_items(self) -> List:
         """Active watchlist items whose stock is still active.
 
@@ -245,9 +245,16 @@ class NotificationService:
                 continue
 
             current_price = latest.close_price
-            
-            # Check target price
-            if item.target_price and current_price >= item.target_price:
+            prev_close = prev.close_price if prev and prev.close_price else None
+
+            # Target / stop are edge-triggered: alert when the price CROSSES
+            # the level, not every run while it stays beyond it (SOL, NPK and
+            # DRD each alerted 4 days running). A level set while already
+            # crossed alerts once (no prior alert since the item was edited).
+            if item.target_price and current_price >= item.target_price and (
+                (prev_close is not None and prev_close < item.target_price)
+                or not self._alerted_since(f"Target Price Reached: {item.symbol}", item.updated_at)
+            ):
                 self.create_notification(
                     notification_type="price",
                     title=f"Target Price Reached: {item.symbol}",
@@ -255,9 +262,12 @@ class NotificationService:
                     stock_symbol=item.symbol,
                     metadata={"target_price": item.target_price, "current_price": current_price}
                 )
-            
-            # Check stop loss
-            if item.stop_loss and current_price <= item.stop_loss:
+
+            # Check stop loss (edge-triggered, as above)
+            if item.stop_loss and current_price <= item.stop_loss and (
+                (prev_close is not None and prev_close > item.stop_loss)
+                or not self._alerted_since(f"Stop Loss Triggered: {item.symbol}", item.updated_at)
+            ):
                 self.create_notification(
                     notification_type="price",
                     title=f"Stop Loss Triggered: {item.symbol}",
@@ -265,11 +275,11 @@ class NotificationService:
                     stock_symbol=item.symbol,
                     metadata={"stop_loss": item.stop_loss, "current_price": current_price}
                 )
-            
+
             # Check price change threshold
             if (item.notify_price_increase or item.notify_price_decrease) and prev and prev.close_price:
                 change_pct = ((current_price - prev.close_price) / prev.close_price) * 100
-                
+
                 if item.notify_price_increase and change_pct >= item.price_change_threshold:
                     self.create_notification(
                         notification_type="price",
@@ -278,7 +288,7 @@ class NotificationService:
                         stock_symbol=item.symbol,
                         metadata={"change_percentage": change_pct}
                     )
-                
+
                 if item.notify_price_decrease and change_pct <= -item.price_change_threshold:
                     self.create_notification(
                         notification_type="price",
@@ -287,7 +297,14 @@ class NotificationService:
                         stock_symbol=item.symbol,
                         metadata={"change_percentage": change_pct}
                     )
-    
+
+    def _alerted_since(self, title: str, since: Optional[datetime]) -> bool:
+        """Whether an alert with this title exists since `since` (any time if None)."""
+        query = self.db.query(Notification.id).filter(Notification.title == title)
+        if since is not None:
+            query = query.filter(Notification.created_at >= since)
+        return query.first() is not None
+
     def check_technical_alerts(self):
         """Check for technical indicator alerts (see check_price_alerts re: enabled)."""
         watchlist_items = self._alertable_watchlist_items()
@@ -302,10 +319,12 @@ class NotificationService:
             latest, prev = prices.get(item.symbol, (None, None))
             if not latest:
                 continue
-            
-            # RSI overbought/oversold
+
+            # RSI overbought/oversold - on ENTERING the zone, not every run
+            # spent inside it (SKA "RSI Oversold" repeated daily).
+            prev_rsi = prev.rsi if prev is not None else None
             if latest.rsi is not None:
-                if latest.rsi > 70:
+                if latest.rsi > 70 and (prev_rsi is None or prev_rsi <= 70):
                     self.create_notification(
                         notification_type="technical",
                         title=f"RSI Overbought: {item.symbol}",
@@ -313,7 +332,7 @@ class NotificationService:
                         stock_symbol=item.symbol,
                         metadata={"indicator": "RSI", "value": latest.rsi}
                     )
-                elif latest.rsi < 30:
+                elif latest.rsi < 30 and (prev_rsi is None or prev_rsi >= 30):
                     self.create_notification(
                         notification_type="technical",
                         title=f"RSI Oversold: {item.symbol}",
@@ -321,7 +340,7 @@ class NotificationService:
                         stock_symbol=item.symbol,
                         metadata={"indicator": "RSI", "value": latest.rsi}
                     )
-            
+
             # MACD crossover (0.0 is a legitimate value - check for None, not truthiness)
             if (
                 latest.macd is not None and latest.macd_signal is not None
@@ -345,7 +364,7 @@ class NotificationService:
                         stock_symbol=item.symbol,
                         metadata={"indicator": "MACD", "signal": "bearish_crossover"}
                     )
-    
+
     def check_news_alerts(self):
         """Raise type="news" alerts for fresh articles about watchlisted symbols.
 
@@ -395,24 +414,24 @@ class NotificationService:
 
         for notification in pending:
             self.send_notification(notification)
-    
+
     def get_unread_notifications(self, limit: int = 50) -> List[Notification]:
         """Get unread notifications."""
         return self.db.query(Notification).filter(
             Notification.is_read == False
         ).order_by(Notification.created_at.desc()).limit(limit).all()
-    
+
     def mark_as_read(self, notification_id: int):
         """Mark a notification as read."""
         notification = self.db.query(Notification).filter(
             Notification.id == notification_id
         ).first()
-        
+
         if notification:
             notification.is_read = True
             notification.read_at = _utcnow_naive()
             self.db.commit()
-    
+
     def mark_all_as_read(self):
         """Mark all notifications as read."""
         self.db.query(Notification).filter(
