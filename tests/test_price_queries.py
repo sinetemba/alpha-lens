@@ -60,9 +60,12 @@ class FakeSession:
         self.bind = FakeBind(dialect_name)
 
 
-def test_day_of_sqlite_uses_strftime(db_session):
-    expr = day_of(db_session, StockPrice.timestamp)
-    assert "strftime" in str(expr).lower()
+def test_day_of_matches_the_session_dialect(db_session):
+    """strftime on SQLite, date_trunc on PostgreSQL (db_session runs on
+    either - see TEST_DATABASE_URL in conftest)."""
+    expr = str(day_of(db_session, StockPrice.timestamp)).lower()
+    expected = "strftime" if db_session.bind.dialect.name == "sqlite" else "date_trunc"
+    assert expected in expr
 
 
 def test_day_of_postgresql_uses_date_trunc():

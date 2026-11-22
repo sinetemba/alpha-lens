@@ -29,16 +29,34 @@ st.set_page_config(
 # script re-executes on every widget interaction (Streamlit's rerun model), so
 # logger.add / create_all at module level would add a duplicate log sink and
 # fire ~a dozen table-existence checks on every single rerun.
-@st.cache_resource(show_spinner="Initializing database...")
-def _init_database_once():
+@st.cache_resource(show_spinner=False)
+def _configure_logging_once():
     configure_logging(settings.log_file)
+    return True
+
+
+def _schema_fingerprint() -> str:
+    """Hash of every model table/column. Streamlit reloads edited model
+    modules into the running dashboard, but cache_resource keeps the old
+    init result - so a new column (sens_announcements.facts) crashed pages
+    with "column does not exist" until a restart. Keying the init on this
+    re-runs the migrations exactly when the schema changes."""
+    import hashlib
+    from app.models import Base
+    spec = sorted(f"{t.name}.{c.name}:{c.type}" for t in Base.metadata.tables.values() for c in t.columns)
+    return hashlib.sha1("|".join(spec).encode()).hexdigest()
+
+
+@st.cache_resource(show_spinner="Initializing database...")
+def _init_database_once(schema_fingerprint: str):
     # init_database() runs create_all plus the lightweight schema migrations.
     init_database()
     return True
 
 
 try:
-    _init_database_once()
+    _configure_logging_once()
+    _init_database_once(_schema_fingerprint())
     logger.info("Database initialized successfully")
 except Exception as e:
     # Stop before any page renders: every page would otherwise crash later on

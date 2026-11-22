@@ -290,6 +290,17 @@ python scripts\run_updater.py --backup     # back up now
 & "C:\Program Files\PostgreSQL\18\bin\pg_restore.exe" --clean --if-exists -h localhost -U <user> -d <db> data\backups\alphalens_<stamp>.dump
 ```
 
+**Test that a backup really restores** (the automatic check only proves the
+archive is readable). Restore it into a separate scratch database and compare
+every table with the live one - the target's name must contain `test`, it is
+overwritten:
+
+```powershell
+python scripts\test_restore.py --target-url postgresql://<user>:<pass>@localhost:5432/alphalens_restore_test
+```
+
+Do this every few months and before relying on a backup for a repair.
+
 `python scripts\check_stored_prices.py [--all]` is a read-only check of stored
 closes against Yahoo (unit mismatches, wrong instruments, stale feeds).
 
@@ -394,7 +405,21 @@ Run with coverage:
 pytest tests/ --cov=app --cov-report=html
 ```
 
-A GitHub Actions workflow in `.github/workflows/ci.yml` runs the test suite on pushes and pull requests.
+Tests use in-memory SQLite by default. The app runs on PostgreSQL, which
+enforces things SQLite doesn't (column lengths), so run them there too by
+pointing `TEST_DATABASE_URL` at a scratch database whose name contains `test`
+(its tables are emptied between tests - never point it at real data):
+
+```powershell
+$env:TEST_DATABASE_URL = "postgresql://<user>:<pass>@localhost:5432/alphalens_test"
+pytest tests/ --deselect tests/test_page_smoke.py
+```
+
+`tests/test_page_smoke.py` renders every dashboard page with all network access
+refused, so a page that crashes when a provider is down fails the build.
+
+A GitHub Actions workflow in `.github/workflows/ci.yml` runs the suite on
+SQLite and on a PostgreSQL service container for every push and pull request.
 
 ## Troubleshooting
 
