@@ -1,3 +1,4 @@
+import re
 import pandas as pd
 import streamlit as st
 from datetime import datetime, timezone
@@ -371,13 +372,23 @@ def _get_latest_and_previous_prices(
     return get_latest_and_previous_prices(db, symbols)
 
 
+_MOVERS_ERROR: dict = {}
+
+
 @st.cache_data(ttl=60, show_spinner=False, hash_funcs={Session: lambda db: id(db.bind)})
 def _get_daily_movers(db: Session, limit: int = 10) -> Optional[tuple[list, list]]:
-    """Return the top daily winners and losers from Moneyweb, or None on failure."""
+    """Return the top daily winners and losers from Moneyweb, or None on failure.
+
+    A failure is cached for the same 60s, and the reason is kept in
+    _MOVERS_ERROR for the warning.
+    """
+    from app.services.source_health import record_source
     collector = MoneywebCollector()
     result = collector.get_winners_and_losers()
+    record_source(db, "moneyweb_movers", result is not None, collector.last_error)
 
     if result is None:
+        _MOVERS_ERROR["detail"] = collector.last_error
         return None
 
     winners, losers = result
@@ -401,16 +412,61 @@ def _get_daily_movers(db: Session, limit: int = 10) -> Optional[tuple[list, list
     return _mover_rows(winners), _mover_rows(losers)
 
 
+def _movers_failure_text(detail: Optional[str]) -> str:
+    """Name the failure honestly - a 5xx is Moneyweb's server, not the user's network."""
+    m = re.search(r"\b(5\d\d)\b", detail or "")
+    if m:
+        return (f"Moneyweb's movers feed is down on their side (HTTP {m.group(1)} from "
+                "Moneyweb's server) - nothing to fix here; it usually recovers on its own.")
+    m = re.search(r"\b(4\d\d)\b", detail or "")
+    if m:
+        return f"Moneyweb rejected the movers request (HTTP {m.group(1)})."
+    return "Couldn't reach Moneyweb's movers feed - check your internet connection or try again later."
+
+
+def _tracked_movers(db: Session, limit: int = 10) -> tuple[list, list]:
+    """Biggest last-session moves among YOUR tracked JSE shares, from stored
+    closes - the fallback when Moneyweb's market-wide feed is down."""
+    from app.services.penny_scan import held_jse_symbols
+    symbols = {
+        s for (s,) in db.query(WatchlistItem.symbol).filter(WatchlistItem.is_active == True).all()
+    } | held_jse_symbols(db)
+    symbols = {s for s in symbols if s and not any(c in s for c in ".^_=")}
+    snapshots = get_latest_and_previous_prices(db, list(symbols))
+    names = dict(db.query(Stock.symbol, Stock.name).filter(Stock.symbol.in_(symbols)).all())
+    rows = []
+    for symbol, (latest, prev) in snapshots.items():
+        if not latest or not prev or not prev.close_price or not latest.close_price:
+            continue
+        move = latest.close_price - prev.close_price
+        if move == 0:
+            continue
+        rows.append({
+            "Symbol": format_stock_label(symbol, names.get(symbol)),
+            "Price": latest.close_price, "Move": move,
+            "Change": move / prev.close_price * 100,
+        })
+    rows.sort(key=lambda r: r["Change"], reverse=True)
+    winners = [r for r in rows if r["Change"] > 0][:limit]
+    losers = sorted((r for r in rows if r["Change"] < 0), key=lambda r: r["Change"])[:limit]
+    return winners, losers
+
+
 def _render_top_movers(db: Session):
     """Render the top 10 winners and losers of the day side by side."""
     movers = _get_daily_movers(db)
+    fallback = movers is None
 
-    if movers is None:
+    if fallback:
+        movers = _tracked_movers(db)
         st.warning(
-            "Couldn't fetch today's movers from Moneyweb (public feed - no "
-            "login needed). Check connectivity or try again later."
+            _movers_failure_text(_MOVERS_ERROR.get("detail"))
+            + " Showing the biggest moves among **your tracked shares** (watchlist + "
+              "holdings) from stored prices instead - not the whole JSE."
         )
-        return
+        if not any(movers):
+            st.info("No price moves stored for your tracked shares yet.")
+            return
 
     winners, losers = movers
 
@@ -433,7 +489,7 @@ def _render_top_movers(db: Session):
         )
 
     with col_winners:
-        st.markdown("**🟢 Top 10 Winners**")
+        st.markdown("**🟢 Top Winners (your shares)**" if fallback else "**🟢 Top 10 Winners**")
         if winners:
             st.dataframe(
                 _movers_table(winners),
@@ -442,10 +498,10 @@ def _render_top_movers(db: Session):
                 column_config=column_config,
             )
         else:
-            st.info("No winners reported by Moneyweb today.")
+            st.info("No winners among your shares." if fallback else "No winners reported by Moneyweb today.")
 
     with col_losers:
-        st.markdown("**🔴 Top 10 Losers**")
+        st.markdown("**🔴 Top Losers (your shares)**" if fallback else "**🔴 Top 10 Losers**")
         if losers:
             st.dataframe(
                 _movers_table(losers),
@@ -454,7 +510,7 @@ def _render_top_movers(db: Session):
                 column_config=column_config,
             )
         else:
-            st.info("No losers reported by Moneyweb today.")
+            st.info("No losers among your shares." if fallback else "No losers reported by Moneyweb today.")
 
 
 def _render_news_feed(db: Session):

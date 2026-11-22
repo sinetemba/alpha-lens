@@ -146,6 +146,60 @@ is announced so they can subscribe during the offer window (before listing day).
 - **Caveat:** early warning only — subscribing still goes through a broker
   during the offer window in the pre-listing statement.
 
+## Review fixes 2026-11-22 (gold prices, alerts, tests, restore)
+
+- **Gold/silver spot** (`services/metal_prices.live_metal_spots`): Yahoo
+  COMEX futures x USD/ZAR first (`YFinanceCollector.get_metal_spots`), GoldAPI
+  only fills a metal Yahoo missed. GoldAPI returned 403 on everything
+  (2026-11-22: bad key or the 100/month quota) and the Krugerrands page, which
+  never cached failures, fired ~14 sequential GoldAPI requests per rerun
+  (18.8s open, 13.8s per click). Now: the page caches `_get_live_spots` 5 min
+  INCLUDING failures; `GoldAPICollector` skips itself 6h after 401/403/429 and
+  10 min after other errors (class-level, shared by every instance); year-end
+  prices come from ONE Yahoo history download (`get_metal_year_ends_zar`,
+  cached 6h) instead of 10 GoldAPI calls, Alpha Vantage as fallback. The page
+  names its price source and warns when it is showing a stored price. Source
+  health keys `yahoo_metals`, `goldapi`.
+- **Alerts are edge-triggered** (`NotificationService.check_price_alerts` /
+  `check_technical_alerts`): target/stop alert when the previous bar was on
+  the other side of the level, or once when the level is already crossed and
+  nothing was alerted since the watchlist item was last edited
+  (`_alerted_since(title, item.updated_at)`); RSI alerts on entering the
+  70/30 zone. Before, every run inside the condition re-alerted after the 20h
+  dedup (SOL/NPK/DRD target alerts 4 days running). The 10 SKA alerts raised
+  on the corrupted R0.0085 bars were annotated as false.
+- **Tests:** `tests/test_page_smoke.py` renders all 12 pages in AppTest
+  against a seeded SQLite file with non-loopback sockets refused and
+  `yfinance.download/Ticker/Search` raising (yfinance uses curl_cffi, below
+  Python's socket module). It stubs `streamlit.env_util.is_repl` - bare-mode
+  AppTest calls inspect.stack() on every element, minutes on Windows. Don't
+  monkeypatch `time.sleep` there: `module.time.sleep` IS the global one and
+  Streamlit's wait loops then spin. `TEST_DATABASE_URL` (conftest) runs every
+  `db_session` test on PostgreSQL, truncating tables between tests; it refuses
+  a database name without "test" or equal to DATABASE_URL. CI runs both. Two
+  updater tests used to call the real Luno API - mock `LunoCollector` in any
+  test that runs `_update_prices_and_news`.
+- **Restore drill:** `scripts/test_restore.py --target-url <scratch db>`
+  restores a `.dump` (`--no-owner --no-privileges`: the dump GRANTs to the live
+  `alphalens` role) and compares every table's row count with live. Verified
+  2026-11-22: all 18 tables restored. Locally, a throwaway server works
+  without admin rights: `initdb -D <dir> -U testuser --auth=trust` then
+  `pg_ctl -D <dir> -o "-p 54329" start` (the app's role can't CREATEDB).
+- **Schema changes no longer break the running dashboard:** `main.py` keys
+  `_init_database_once` on a fingerprint of every model column, so a model
+  edit Streamlit hot-reloads re-runs the migrations ("column ... does not
+  exist" until restart, seen 2026-11-22).
+- **Home movers fallback:** when Moneyweb's movers feed
+  (`cache.moneyweb.co.za/mny-mover-tables.php`) fails - it returned HTTP 502
+  for a few minutes on 2026-11-22 while the rest of the site was up - the
+  Home page says so honestly (`_movers_failure_text`: a 5xx is Moneyweb's
+  server, not the user's network) and shows the biggest last-session moves
+  among the user's tracked shares from stored closes (`_tracked_movers`),
+  labelled "(your shares)". Source-health key `moneyweb_movers`.
+- **Company View news** uses the stored RSS articles when the store is fresh
+  (<12h, `CompanyNewsService._store_is_fresh`) even if none match - the live
+  5-feed scrape ran on nearly every company selection (10.9s -> 6.8s).
+
 ## SENS for held shares (suspensions, corporate actions)
 
 Added 2026-11-22 after SGP (Sail Mining) showed as a R0 holding with no
