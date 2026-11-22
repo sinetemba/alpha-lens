@@ -1,6 +1,7 @@
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
 import requests
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.collectors.yfinance import YFinanceCollector
 from app.scrapers.rss import RSSScraper
@@ -121,6 +122,18 @@ class CompanyNewsService:
             logger.error(f"Error reading stored news articles: {e}")
             return []
 
+    STORE_FRESH_FOR = timedelta(hours=12)   # updater scrapes 3x daily + on logon
+
+    def _store_is_fresh(self) -> bool:
+        """Whether the updater stored articles recently (else live-scrape)."""
+        if self.db is None:
+            return False
+        try:
+            newest = self.db.query(func.max(NewsArticle.created_at)).scalar()
+        except Exception:
+            return False
+        return bool(newest and datetime.now(timezone.utc).replace(tzinfo=None) - newest <= self.STORE_FRESH_FOR)
+
     def _fetch_rss(self, search_terms: List[str]) -> List[Dict]:
         try:
             # The scheduled updater already scrapes these feeds into
@@ -128,7 +141,10 @@ class CompanyNewsService:
             # hit the live feeds when it has nothing recent to match. A live
             # scrape costs one HTTP fetch per feed per lookup.
             stored = self._fetch_from_db(search_terms)
-            if stored:
+            if stored or self._store_is_fresh():
+                # A fresh store with no match means no RSS news for this
+                # company - the live scrape (5 feeds, ~5s) used to run on
+                # nearly every Company View selection for exactly that case.
                 return stored
             raw = self.rss.fetch_all_feeds()
             articles = []
