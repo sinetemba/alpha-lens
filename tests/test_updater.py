@@ -327,6 +327,8 @@ def test_job_releases_lock_afterwards(isolated_job_lock, session_factory, monkey
     monkeypatch.setattr(updater, "NewsScraper", MagicMock())
     monkeypatch.setattr(updater, "EasyEquitiesCollector",
                         lambda: SimpleNamespace(enabled=False))
+    # Unmocked, this called the real Luno API with the .env credentials.
+    monkeypatch.setattr(updater, "LunoCollector", lambda: SimpleNamespace(enabled=False))
 
     UpdaterService()._update_prices_and_news()
 
@@ -346,6 +348,7 @@ def test_price_job_with_zero_updates_fails_and_records_heartbeat(session_factory
     # _snapshot_portfolio's broker syncs must not hit the network in tests.
     monkeypatch.setattr(updater, "EasyEquitiesCollector",
                         lambda: SimpleNamespace(enabled=False))
+    monkeypatch.setattr(updater, "LunoCollector", lambda: SimpleNamespace(enabled=False))
 
     assert UpdaterService()._update_prices_and_news() is False
 
