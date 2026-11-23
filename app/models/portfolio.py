@@ -27,7 +27,7 @@ class Portfolio(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(200), default="My Portfolio")
     description = Column(Text)
-    initial_investment = Column(Float, default=0.0)
+    initial_investment = Column(Float, default=0.0)  # unused and never maintained (0 in practice) - cost basis is the holdings' quantity x purchase_price
     
     # Calculated fields
     current_value = Column(Float, default=0.0)

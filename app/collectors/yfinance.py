@@ -313,33 +313,6 @@ class YFinanceCollector:
             logger.error(f"Error getting news for {symbol}: {e}")
             return None
     
-    def get_history(
-        self, 
-        symbol: str, 
-        period: str = "1y",
-        interval: str = "1d"
-    ) -> Optional[Dict]:
-        """Get historical price data for a symbol.
-        
-        Args:
-            symbol: Stock symbol
-            period: Time period (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)
-            interval: Data interval (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)
-        """
-        ticker = self.get_ticker(symbol)
-        if not ticker:
-            return None
-        
-        try:
-            hist = self._call_with_retry(
-                f"Yahoo history for {symbol}",
-                lambda: ticker.history(period=period, interval=interval),
-            )
-            return self._to_rand(hist, symbol)
-        except Exception as e:
-            logger.error(f"Error getting history for {symbol}: {e}")
-            return None
-
     def get_latest_bars(
         self,
         symbols: List[str],
@@ -510,66 +483,3 @@ class YFinanceCollector:
             logger.error(f"Error getting splits for {symbol}: {e}")
             return None
     
-    def get_actions(self, symbol: str) -> Optional[List]:
-        """Get all corporate actions (dividends, splits) for a symbol."""
-        ticker = self.get_ticker(symbol)
-        if not ticker:
-            return None
-        
-        try:
-            return self._call_with_retry(
-                f"Yahoo actions for {symbol}",
-                lambda: ticker.actions,
-            )
-        except Exception as e:
-            logger.error(f"Error getting actions for {symbol}: {e}")
-            return None
-    
-    def get_major_holders(self, symbol: str) -> Optional[Dict]:
-        """Get major holders information for a symbol."""
-        ticker = self.get_ticker(symbol)
-        if not ticker:
-            return None
-        
-        try:
-            return {
-                "major_holders": self._call_with_retry(
-                    f"Yahoo major holders for {symbol}", lambda: ticker.major_holders
-                ),
-                "institutional_holders": self._call_with_retry(
-                    f"Yahoo institutional holders for {symbol}", lambda: ticker.institutional_holders
-                ),
-            }
-        except Exception as e:
-            logger.error(f"Error getting holders for {symbol}: {e}")
-            return None
-    
-    def get_recommendations(self, symbol: str) -> Optional[Dict]:
-        """Get analyst recommendations for a symbol."""
-        ticker = self.get_ticker(symbol)
-        if not ticker:
-            return None
-        
-        try:
-            return self._call_with_retry(
-                f"Yahoo recommendations for {symbol}",
-                lambda: ticker.recommendations,
-            )
-        except Exception as e:
-            logger.error(f"Error getting recommendations for {symbol}: {e}")
-            return None
-    
-    def get_calendar(self, symbol: str) -> Optional[Dict]:
-        """Get calendar events for a symbol."""
-        ticker = self.get_ticker(symbol)
-        if not ticker:
-            return None
-        
-        try:
-            return self._call_with_retry(
-                f"Yahoo calendar for {symbol}",
-                lambda: ticker.calendar,
-            )
-        except Exception as e:
-            logger.error(f"Error getting calendar for {symbol}: {e}")
-            return None

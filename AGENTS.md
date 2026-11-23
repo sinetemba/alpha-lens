@@ -200,6 +200,52 @@ is announced so they can subscribe during the offer window (before listing day).
   (<12h, `CompanyNewsService._store_is_fresh`) even if none match - the live
   5-feed scrape ran on nearly every company selection (10.9s -> 6.8s).
 
+## Review round 3 fixes (2026-11-23)
+
+- **CI had never run the tests:** `pip-audit` ran first and failed for 30+
+  runs (lxml 5.3.0, apprise 1.9.0, python-dotenv 1.0.1, pytest 8.3.3 had
+  advisories), skipping every test step. Pins bumped (pytest-asyncio 1.5.0
+  for pytest 9); the audit now runs LAST with `if: always()` - an advisory
+  still fails the build but can't hide test results. Check a clean env, not
+  `.venv`: a fresh `pip install -r requirements.txt` + `pip-audit` is what CI
+  sees (the local venv had stale tornado/aiohttp/gitpython/diskcache, which
+  nothing required and were removed). Streamlit 1.66 runs without tornado.
+- **Secrets are redacted from every log line** (`logging_setup.secret_values`
+  / `redact_secrets`, a loguru patcher): any setting whose name contains
+  key/secret/password/token (>= 8 chars). The Twelve Data apikey had been
+  logged 583x (Aug-Sep 2026, a requests error echoing the URL); that log was
+  scrubbed in place.
+- **Dividend repair** `scripts/fix_dividend_cents.py [--apply]` (dry run by
+  default, back up first; idempotent). Applied 2026-11-23 in three rounds -
+  1,535 -> 956 rows, 687 changes: 537 same-date 100x twins deleted; 42 same
+  payout stored under two dates <=20 days apart (ex-date + another source's
+  date - double-counted income) deduplicated; 108 rows /100 - lone cents
+  rows (30x median, iterated), pre-2005 cents eras (a row before the
+  symbol's first stored price >= 8x its first 6 validated payouts: SUR/NTC/
+  EXX/SOL/RMH/PPC/AEG 2000-04 clusters) and implausible yields (>12% of that
+  day's price AND >= 15x median: STX40 2016 R9.20 on R46). Floor 0.1c, NOT
+  1c: the 1c JSE minimum is a PRICE tick and dividends can be fractions of a
+  cent (PMV 0.5c). Left as-is: BAT (Brait - rights issues/capital
+  distributions, no pre-2017 prices to check against, no payout since 2017)
+  and NPK pre-2016 (consolidation-adjusted, internally consistent). Neither
+  reaches the UI: the Dividends page shows the 200 newest rows (2023+) and
+  income counts only payouts while held. Holdings' dividend totals were
+  unchanged (R2,532.68).
+- **Root cause of the twins, fixed:** every dividend refresh walks Yahoo's
+  WHOLE history; a raw cents value the guard didn't rescale missed the
+  stored (correct) key and was inserted as an "additional same-day
+  dividend". `DataService._same_payout_other_unit` now skips an incoming
+  payout when a ~100x / ~1/100 amount is stored for that day (Yahoo and
+  Twelve Data paths). The median guard uses only the last
+  `DIVIDEND_GUARD_YEARS` (6) of payouts - pre-2005 cents clusters would
+  skew a whole-history median.
+- **Notifications page:** type filter; unread "Action may be needed" SENS
+  alerts pinned on top and expanded.
+- Removed unused YFinanceCollector get_actions/get_major_holders/
+  get_recommendations/get_calendar/get_history (get_splits is used by
+  services/corporate_actions.py). `portfolios.initial_investment` is unused
+  and never maintained - don't read it.
+
 ## SENS for held shares (suspensions, corporate actions)
 
 Added 2026-11-22 after SGP (Sail Mining) showed as a R0 holding with no
