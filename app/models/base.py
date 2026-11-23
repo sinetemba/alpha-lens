@@ -12,6 +12,19 @@ def utcnow_naive() -> datetime:
     """
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
+def _ensure_sqlite_dir(url: str) -> None:
+    """Create the folder of a file-based SQLite URL. On a fresh checkout the
+    default ./data/stock_analyzer.db has no data/ folder yet, and SQLite
+    fails with "unable to open database file" (first seen in CI)."""
+    from pathlib import Path
+    from sqlalchemy.engine import make_url
+    parsed = make_url(url)
+    if parsed.get_backend_name() == "sqlite" and parsed.database and parsed.database != ":memory:":
+        Path(parsed.database).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
+
+_ensure_sqlite_dir(settings.database_url)
+
 # Create SQLAlchemy engine. For Postgres, pin the session timezone to UTC:
 # the DateTime columns are naive, and a non-UTC session timezone silently
 # converts aware values to local wall-clock on write.
