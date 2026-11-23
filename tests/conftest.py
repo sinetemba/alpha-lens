@@ -26,6 +26,59 @@ def isolated_job_lock(tmp_path, monkeypatch):
     return lock
 
 
+@pytest.fixture(scope="session")
+def _throwaway_global_db(tmp_path_factory):
+    """A per-run SQLite database standing in for the app's DATABASE_URL."""
+    import importlib
+    import pkgutil
+
+    import app
+
+    # Import every app module once so the per-test patch below reaches
+    # modules that are otherwise imported lazily mid-test (dashboard pages).
+    for info in pkgutil.walk_packages(app.__path__, "app."):
+        try:
+            importlib.import_module(info.name)
+        except Exception:
+            pass
+    engine = create_engine(f"sqlite:///{tmp_path_factory.mktemp('global_db') / 'app.db'}")
+    Base.metadata.create_all(engine)
+    yield engine, sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    engine.dispose()
+
+
+def patch_global_sessions(monkeypatch, engine, factory) -> None:
+    """Point every app module's SessionLocal / engine (imported from
+    app.models.base) at `engine` / `factory`."""
+    import sys
+
+    from app.models import base
+    real_engine, real_factory = base.engine, base.SessionLocal
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("app") or module is None:
+            continue
+        if getattr(module, "SessionLocal", None) is real_factory:
+            monkeypatch.setattr(module, "SessionLocal", factory)
+        if getattr(module, "engine", None) is real_engine:
+            monkeypatch.setattr(module, "engine", engine)
+
+
+@pytest.fixture(autouse=True)
+def isolated_global_db(_throwaway_global_db, monkeypatch):
+    """No test may reach the real database through app.models.base.
+
+    Code that opens its own session (cached Home/Company helpers, source-
+    health recording) used the global SessionLocal - bound to the live
+    DATABASE_URL. Locally that was the real PostgreSQL: page smoke tests
+    wrote 26 fake "Yahoo metals / GoldAPI failed" heartbeats into it (found
+    and removed 2026-11-23). In CI (no .env) it was ./data/stock_analyzer.db,
+    whose folder doesn't exist - "unable to open database file".
+    """
+    engine, factory = _throwaway_global_db
+    patch_global_sessions(monkeypatch, engine, factory)
+    return factory
+
+
 def _guard_test_database(url: str) -> None:
     """Never point the table-truncating fixture at a real database."""
     from app.config.settings import settings

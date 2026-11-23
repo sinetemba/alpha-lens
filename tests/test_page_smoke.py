@@ -102,6 +102,11 @@ def no_network(monkeypatch):
 def test_page_renders_without_exception(page, smoke_db, monkeypatch):
     monkeypatch.setenv("PAGE", page)
     monkeypatch.setenv("SMOKE_DB", smoke_db)
+    # Helpers that open their own session (cached Home/Company queries,
+    # source-health recording) must see the same seeded database.
+    from conftest import patch_global_sessions
+    engine = create_engine(smoke_db)
+    patch_global_sessions(monkeypatch, engine, sessionmaker(bind=engine))
     at = AppTest.from_file(SCRIPT, default_timeout=120).run()
     assert not at.exception, [e.value for e in at.exception]
     # A rerun (any widget interaction) must not crash either.
