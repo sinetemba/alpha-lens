@@ -25,6 +25,53 @@ def _get_active_stocks():
         db.close()
 
 
+# An untracked share older than this is refreshed when opened. Tracked ones
+# (watchlist / holdings) are kept current by the updater.
+UNTRACKED_STALE_AFTER = timedelta(days=2)
+STALE_WARNING_AFTER = timedelta(days=7)
+
+
+def _is_tracked(db: Session, symbol: str) -> bool:
+    from app.models.portfolio import PortfolioHolding
+    from app.models.watchlist import WatchlistItem
+    return bool(
+        db.query(WatchlistItem.id).filter(WatchlistItem.symbol == symbol, WatchlistItem.is_active == True).first()
+        or db.query(PortfolioHolding.id).filter(PortfolioHolding.symbol == symbol).first()
+    )
+
+
+def _refresh_if_untracked_and_stale(db: Session, symbol: str) -> None:
+    """Fetch the latest bars for a share the updater doesn't track.
+
+    Company View lists every active stock, but only watchlist/held ones are
+    refreshed - Naspers showed its 11 Sep price on 23 Nov with just a grey
+    "73 days ago" caption. One incremental Yahoo request, at most once per
+    session per symbol; a warning says so when the price is still old.
+    """
+    latest = db.query(func.max(StockPrice.timestamp)).filter(StockPrice.symbol == symbol).scalar()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    stale = latest is None or now - latest > UNTRACKED_STALE_AFTER
+    tried_key = f"company_refreshed_{symbol}"
+    if stale and not _is_tracked(db, symbol) and not st.session_state.get(tried_key):
+        st.session_state[tried_key] = True
+        from app.services.data_service import DataService
+        with st.spinner(f"{symbol} isn't on your watchlist or held, so it isn't updated automatically - fetching its latest prices..."):
+            try:
+                DataService(db).update_historical_data(symbol)
+                _get_active_stocks.clear()
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"Company View refresh failed for {symbol}: {e}")
+        latest = db.query(func.max(StockPrice.timestamp)).filter(StockPrice.symbol == symbol).scalar()
+    if latest is None:
+        st.warning(f"No price data for {symbol} - Yahoo Finance returned nothing for it.")
+    elif now - latest > STALE_WARNING_AFTER:
+        st.warning(
+            f"{symbol}'s latest price is from {latest:%d %b %Y} ({(now - latest).days} days ago) - "
+            "it may be suspended or delisted. Add it to your watchlist to keep it updated."
+        )
+
+
 def show_company(db: Session):
     """Display the company view page."""
     st.header("🏢 Company View")
@@ -54,47 +101,48 @@ def show_company(db: Session):
         stock_symbols,
         format_func=lambda s: format_stock_label(s, stock_names.get(s))
     )
-    
+
     if not selected_symbol:
         return
 
+    _refresh_if_untracked_and_stale(db, selected_symbol)
     render_last_fetch_caption(db, [selected_symbol])
 
     # Get stock information
     stock = db.query(Stock).filter(Stock.symbol == selected_symbol).first()
-    
+
     if not stock:
         st.error(f"Stock {selected_symbol} not found.")
         return
-    
+
     # Display company overview
     col1, col2, col3 = st.columns(3)
-    
+
     with col1:
         st.subheader(f"**{format_stock_label(stock.symbol, stock.name)}**")
         if stock.sector:
             st.write(f"Sector: {stock.sector}")
         if stock.industry:
             st.write(f"Industry: {stock.industry}")
-    
+
     with col2:
         latest_price = db.query(StockPrice).filter(
             StockPrice.symbol == selected_symbol
         ).order_by(StockPrice.timestamp.desc()).first()
-        
+
         if latest_price:
             st.metric("Current Price", format_price(latest_price.close_price))
             if latest_price.volume:
                 st.metric("Volume", f"{latest_price.volume:,}")
-    
+
     with col3:
         if stock.market_cap:
             st.metric("Market Cap", f"R {stock.market_cap:,.0f}")
         if stock.shares_outstanding:
             st.metric("Shares Outstanding", f"{stock.shares_outstanding:,.0f}")
-    
+
     st.markdown("---")
-    
+
     # Tabs for different views
     tab1, tab2, tab3, tab4 = st.tabs(["Price Chart", "Historical Data", "News", "Financials"])
 
@@ -291,9 +339,9 @@ def _render_price_chart(db: Session, symbol: str):
 
     # Add moving averages if available
     st.subheader("Moving Averages")
-    
+
     ma_col1, ma_col2, ma_col3 = st.columns(3)
-    
+
     with ma_col1:
         if prices and prices[-1]["sma_20"]:
             st.metric("SMA 20", format_price(prices[-1]["sma_20"]))
@@ -410,17 +458,17 @@ def _render_company_news(db: Session, symbol: str):
     """Render news related to a company."""
     stock = db.query(Stock).filter(Stock.symbol == symbol).first()
     company_name = stock.name if stock else None
-    
+
     st.subheader(f"News for {format_stock_label(symbol, company_name)}")
-    
+
     with st.spinner("Loading company news..."):
         news = _get_company_news(db, symbol, company_name)
-    
+
     if not news:
         archived = db.query(NewsArticle).filter(
             NewsArticle.stock_symbol == symbol
         ).order_by(NewsArticle.published_at.desc()).limit(10).all()
-        
+
         if archived:
             st.caption("No live news found — showing archived articles from the database.")
             news = [
@@ -436,7 +484,7 @@ def _render_company_news(db: Session, symbol: str):
         else:
             st.info(f"No recent news available for {symbol}.")
             return
-    
+
     for article in news:
         published = article.get("published_at")
         published_str = _to_display_tz(published).strftime("%Y-%m-%d %H:%M") if published else "Unknown"
