@@ -22,7 +22,7 @@ apscheduler==3.10.4
 # Web Scraping
 beautifulsoup4==4.12.3
 requests==2.34.2
-lxml==5.3.0
+lxml==6.1.0  # 5.3.0 had a known advisory (pip-audit, 2026-11-23)
 feedparser==6.0.11
 
 # Finance APIs
@@ -30,18 +30,18 @@ yfinance==1.5.1
 easy-equities-client==1.2.0
 
 # Notifications
-apprise==1.9.0
+apprise==1.11.0  # 1.9.0 had a known advisory
 
 # Environment Variables
-python-dotenv==1.0.1
+python-dotenv==1.2.2  # 1.0.1 had known advisories
 
 # Date/Time
 python-dateutil==2.9.0.post0
 tzdata==2026.2  # zoneinfo has no IANA db of its own on Windows
 
 # Testing
-pytest==8.3.3
-pytest-asyncio==0.24.0
+pytest==9.0.3  # 8.3.3 had known advisories
+pytest-asyncio==1.5.0  # 0.24 predates pytest 9
 pytest-cov==6.0.0
 
 # Logging
