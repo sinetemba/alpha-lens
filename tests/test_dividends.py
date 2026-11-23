@@ -128,6 +128,29 @@ def test_fetch_stamps_last_dividend_fetch(service, db_session):
     assert utcnow_naive() - stock.last_dividend_fetch < timedelta(minutes=5)
 
 
+def test_median_history_rescales_cents_and_keeps_specials(service, db_session):
+    """A cent-quoted amount ~100x the stored median is rescaled; a genuine
+    larger dividend (under 50x median) is kept."""
+    _stock_with_close(db_session, "EXP", 2500.0, datetime(2026, 3, 1))
+    stock = db_session.query(Stock).filter_by(symbol="EXP").one()
+    # Established Rand-scale dividend history (~R12).
+    for i in range(1, 6):
+        db_session.add(Dividend(
+            stock_id=stock.id, symbol="EXP", amount=12.0, currency="ZAR",
+            ex_dividend_date=datetime(2025, i, 20),
+        ))
+    db_session.commit()
+    service.yfinance.get_dividends.return_value = _yahoo_series([
+        ("2026-03-10", 1200.0),  # cents: ~100x median -> R12
+        ("2026-03-15", 300.0),   # 25x median special -> kept
+    ])
+
+    assert service.update_dividends(["EXP"]) == 2
+    amounts = _amounts(db_session, "EXP")
+    assert amounts[-2][1] == pytest.approx(12.0)
+    assert amounts[-1][1] == pytest.approx(300.0)
+
+
 def test_failure_on_one_symbol_keeps_earlier_symbols(service, db_session):
     _stock_with_close(db_session, "SBK", 40.0, datetime(2026, 3, 1))
     _stock_with_close(db_session, "NPN", 40.0, datetime(2026, 3, 1))

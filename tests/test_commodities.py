@@ -54,7 +54,7 @@ def test_alpha_vantage_history_is_converted_to_zar_per_gram(db_session):
         db_session,
         "gold",
         [{"timestamp": datetime(2026, 1, 5), "close": 2000.0}],
-        usd_zar=18.5,
+        fallback_rate=18.5,
     )
 
     assert saved == 1
@@ -66,7 +66,7 @@ def test_alpha_vantage_copper_is_converted_from_usd_per_tonne(db_session):
         db_session,
         "copper",
         [{"timestamp": datetime(2026, 1, 5), "close": 9_000.0}],
-        usd_zar=18.5,
+        fallback_rate=18.5,
     )
 
     assert saved == 1
@@ -84,8 +84,54 @@ def test_alpha_vantage_history_does_not_overwrite_existing_bars(db_session):
     saved = _save_historical_prices(
         db_session, "gold",
         [{"timestamp": today, "close": 5000.0}],
-        usd_zar=18.5,
+        fallback_rate=18.5,
     )
 
     assert saved == 0
     assert _close(db_session, "AV_GOLD") == pytest.approx(1999.0)
+
+
+def test_alpha_vantage_history_uses_each_days_fx_rate(db_session):
+    """A year of bars converted at today's rate embeds the year's FX move
+    as price error - each bar must convert at its own day's USD/ZAR."""
+    saved = _save_historical_prices(
+        db_session,
+        "gold",
+        [
+            {"timestamp": datetime(2026, 1, 5), "close": 2000.0},  # rate 15
+            {"timestamp": datetime(2026, 1, 8), "close": 2000.0},  # rate 18
+        ],
+        zar_by_day={datetime(2026, 1, 5): 15.0, datetime(2026, 1, 8): 18.0},
+        fallback_rate=99.0,  # must be ignored while a map exists
+    )
+
+    assert saved == 2
+    closes = {
+        row.timestamp: row.close_price
+        for row in db_session.query(StockPrice).filter(StockPrice.symbol == "AV_GOLD")
+    }
+    assert closes[datetime(2026, 1, 5)] == pytest.approx(2000.0 * 15.0 / 31.1034768)
+    assert closes[datetime(2026, 1, 8)] == pytest.approx(2000.0 * 18.0 / 31.1034768)
+
+
+def test_alpha_vantage_fx_gap_takes_nearest_earlier_rate(db_session):
+    """Bars on FX-holiday days use the latest earlier rate; days before the
+    map use the earliest one (no bar silently dropped)."""
+    saved = _save_historical_prices(
+        db_session,
+        "gold",
+        [
+            {"timestamp": datetime(2026, 1, 3), "close": 1000.0},  # before map
+            {"timestamp": datetime(2026, 1, 6), "close": 1000.0},  # gap day
+        ],
+        zar_by_day={datetime(2026, 1, 5): 17.0, datetime(2026, 1, 7): 19.0},
+    )
+
+    assert saved == 2
+    closes = {
+        row.timestamp: row.close_price
+        for row in db_session.query(StockPrice).filter(StockPrice.symbol == "AV_GOLD")
+    }
+    # Jan 3 precedes the map -> earliest rate (Jan 5); Jan 6 fills forward.
+    assert closes[datetime(2026, 1, 3)] == pytest.approx(1000.0 * 17.0 / 31.1034768)
+    assert closes[datetime(2026, 1, 6)] == pytest.approx(1000.0 * 17.0 / 31.1034768)

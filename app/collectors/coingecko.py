@@ -1,5 +1,4 @@
 import time
-from typing import Optional
 
 import requests
 from loguru import logger

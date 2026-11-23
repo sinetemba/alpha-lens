@@ -61,15 +61,21 @@ def crypto_price(holding, markets: dict, luno_prices: dict) -> Optional[float]:
 
 
 def crypto_value(holdings: list, markets: dict, luno_prices: dict) -> Optional[float]:
-    """Combined ZAR value; 0.0 with no holdings, None if none could be priced."""
+    """Combined ZAR value; 0.0 with no holdings, None if any can't be priced.
+
+    None (not a partial sum) when any held coin lacks a price - reporting
+    the priced subset would understate net worth with no "excludes crypto"
+    caption. Matches bullion_value's rule.
+    """
     if not holdings:
         return 0.0
-    values = [
-        h.quantity * price
-        for h in holdings
-        if (price := crypto_price(h, markets, luno_prices))
-    ]
-    return sum(values) if values else None
+    values = []
+    for h in holdings:
+        price = crypto_price(h, markets, luno_prices)
+        if not price:
+            return None
+        values.append(h.quantity * price)
+    return sum(values)
 
 
 def bullion_value(holdings: list, spots: Optional[dict]) -> Optional[float]:

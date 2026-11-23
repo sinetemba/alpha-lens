@@ -267,15 +267,26 @@ def _render_penny_detail(db: Session, row: dict):
         from app.dashboard.watchlist import _add_to_watchlist
         # target/stop 0 = off, and notify_move defaults to False - without
         # these the stock was watched with no price alert of any kind.
-        _add_to_watchlist(
+        # None = nothing was added (already watched / lost an insert race);
+        # claiming success anyway would stack phantom "watched" states.
+        added = _add_to_watchlist(
             db, symbol, 0.0, 0.0, 0.0, "Added from Penny Stocks screen",
             notify_move=True, move_threshold=WATCHLIST_MOVE_THRESHOLD,
         )
-        st.session_state["penny_flash"] = (
-            "success",
-            f"Added {symbol} to watchlist - alerts on a ±{WATCHLIST_MOVE_THRESHOLD:.0f}% daily move "
-            "(change it in Watchlist → Edit).",
-        )
+        if added is None:
+            st.session_state["penny_flash"] = (
+                "warning", f"{symbol} could not be added - it may already be on the watchlist."
+            )
+        elif added == 0:
+            st.session_state["penny_flash"] = (
+                "warning", f"Added {symbol}, but no price history could be fetched - check the ticker."
+            )
+        else:
+            st.session_state["penny_flash"] = (
+                "success",
+                f"Added {symbol} to watchlist - alerts on a ±{WATCHLIST_MOVE_THRESHOLD:.0f}% daily move "
+                "(change it in Watchlist → Edit).",
+            )
         st.rerun()
 
     tab_projection, tab_chart, tab_news = st.tabs(["Outlook & Influences", "Price Chart", "News"])

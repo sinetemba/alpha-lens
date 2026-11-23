@@ -1,4 +1,4 @@
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
@@ -43,6 +43,10 @@ class NotificationService:
         # (type, title, symbol) -> row for the dedup window, loaded lazily so
         # a burst of alert checks costs one query instead of one per alert.
         self._recent_by_key: Optional[dict] = None
+        # title -> latest created_at for _alerted_since: one grouped query
+        # lazily instead of a SELECT per watchlist item per alert check
+        # (Notification.title is unindexed, so each lookup was a full scan).
+        self._alert_latest_by_title: Optional[dict] = None
 
         if self.enabled:
             self.appr = apprise.Apprise()
@@ -158,6 +162,10 @@ class NotificationService:
         self.db.add(notification)
         self.db.commit()
         self._recent_by_key[key] = notification
+        if self._alert_latest_by_title is not None:
+            # A freshly-raised alert must count for later same-title checks
+            # in this run, or the crossing edge-fires twice.
+            self._alert_latest_by_title[title] = notification.created_at
 
         return notification
 
@@ -300,10 +308,14 @@ class NotificationService:
 
     def _alerted_since(self, title: str, since: Optional[datetime]) -> bool:
         """Whether an alert with this title exists since `since` (any time if None)."""
-        query = self.db.query(Notification.id).filter(Notification.title == title)
-        if since is not None:
-            query = query.filter(Notification.created_at >= since)
-        return query.first() is not None
+        if self._alert_latest_by_title is None:
+            self._alert_latest_by_title = dict(
+                self.db.query(
+                    Notification.title, func.max(Notification.created_at)
+                ).group_by(Notification.title).all()
+            )
+        latest = self._alert_latest_by_title.get(title)
+        return latest is not None and (since is None or latest >= since)
 
     def check_technical_alerts(self):
         """Check for technical indicator alerts (see check_price_alerts re: enabled)."""

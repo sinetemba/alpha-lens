@@ -368,6 +368,8 @@ class UpdaterService:
         self._last_catch_up_attempt: Optional[datetime] = None
         self._last_historical_attempt: Optional[datetime] = None
         self._last_backup_attempt: Optional[datetime] = None
+        # pg_dump runs on a worker thread so the minute loop keeps ticking.
+        self._backup_running = False
         self.process_lock_timeout: float = PROCESS_LOCK_TIMEOUT_DAEMON
 
     def _on_job_error(self, event):
@@ -485,9 +487,15 @@ class UpdaterService:
             if symbols:
                 record_source(db, "yahoo_prices", prices_ok, detail)
 
-            news_scraper = NewsScraper(db)
-            articles = news_scraper.scrape_all_sources()
-            logger.info(f"Collected {len(articles)} news articles")
+            # News doesn't depend on this run's prices - a scraper bug must
+            # not fail an otherwise-successful price update.
+            try:
+                news_scraper = NewsScraper(db)
+                articles = news_scraper.scrape_all_sources()
+                logger.info(f"Collected {len(articles)} news articles")
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"News scrape failed - price results kept: {e}")
 
             _run_notification_checks(db)
             _snapshot_portfolio(db)
@@ -542,6 +550,10 @@ class UpdaterService:
                     _maybe_deactivate_dead_symbol(db, symbol)
 
             data_service.update_dividends(symbols)
+            # Per-symbol dividend failures are swallowed inside
+            # update_dividends - surface them in the run detail rather than
+            # logging a clean historical run.
+            dividend_failed = data_service.last_failed_dividend_symbols
 
             # The Moneyweb Dividend Watch calendar was previously only
             # refreshed by a manual button on the Dividends page - refresh it
@@ -600,6 +612,9 @@ class UpdaterService:
                 logger.error("Historical update failed for every symbol - treating the run as failed")
                 return False
             detail = f"{failed}/{len(symbols)} failed" if failed else None
+            if dividend_failed:
+                note = f"dividends failed: {','.join(dividend_failed[:8])}"
+                detail = f"{detail}; {note}" if detail else note
             ok = True
             return True
         except Exception as e:
@@ -712,6 +727,25 @@ class UpdaterService:
                 f"Cleaned up {deleted} old news articles, "
                 f"{deleted_notifications} old notifications"
             )
+            # Stock splits rescale holdings (~a few per year); the weekly
+            # cadence bounds the check window to ~10 days instead of a Yahoo
+            # call per symbol on every daily run.
+            try:
+                from app.services.corporate_actions import apply_recent_splits
+                from app.models.portfolio import PortfolioHolding
+                held_symbols = [
+                    s for (s,) in db.query(PortfolioHolding.symbol).distinct().all()
+                ]
+                if held_symbols:
+                    split_symbols = apply_recent_splits(
+                        db, held_symbols,
+                        (utcnow_naive() - timedelta(days=10)).date(),
+                    )
+                    if split_symbols:
+                        logger.info(f"Applied stock splits for {split_symbols}")
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"Stock split check failed: {e}")
             ok = True
             return True
         except Exception as e:
@@ -724,6 +758,27 @@ class UpdaterService:
                 _record_run(db, "weekly_cleanup", ok, detail)
             finally:
                 db.close()
+
+    @_with_process_lock("Stock split check")
+    def _apply_splits(self) -> bool:
+        """One-shot: apply Yahoo stock splits to held symbols (`--splits`)."""
+        db = SessionLocal()
+        try:
+            from app.services.corporate_actions import apply_recent_splits
+            from app.models.portfolio import PortfolioHolding
+            held = [
+                s for (s,) in db.query(PortfolioHolding.symbol).distinct().all()
+            ]
+            # A wide window is safe: the logged split transaction dedupes
+            # events already applied by the weekly check.
+            apply_recent_splits(db, held, (utcnow_naive() - timedelta(days=365)).date())
+            return True
+        except Exception as e:
+            logger.error(f"Stock split check failed: {e}")
+            db.rollback()
+            return False
+        finally:
+            db.close()
 
     @_with_process_lock("SENS IPO scan")
     def _update_ipo_listings(self) -> bool:
@@ -749,6 +804,7 @@ class UpdaterService:
             finally:
                 db.close()
 
+    @_with_process_lock("Database backup")
     def _run_backup(self) -> bool:
         """Back up the database and record the run."""
         logger.info("Running database backup")
@@ -785,7 +841,19 @@ class UpdaterService:
             logger.warning(f"Backup due check failed: {e}")
             return
         self._last_backup_attempt = now
-        self._run_backup()
+        if self._backup_running:
+            return
+        # Off the minute loop: pg_dump can take the whole subprocess timeout
+        # and would freeze every catch-up check while it ran.
+        self._backup_running = True
+
+        def _run():
+            try:
+                self._run_backup()
+            finally:
+                self._backup_running = False
+
+        threading.Thread(target=_run, daemon=True, name="backup").start()
 
     def configure(self):
         """Register the default 3x/day + logon schedule."""
@@ -858,11 +926,13 @@ class UpdaterService:
 
     def run_forever(self, stop_event=None):
         """Start the scheduler and keep running until a stop event is set."""
-        self.configure()
-        self.scheduler.start()
-        logger.info("AlphaLens updater service started")
-
         try:
+            # configure()/start() inside the try: a start() failure would
+            # otherwise leak a half-started scheduler when the service's
+            # retry loop builds the next instance.
+            self.configure()
+            self.scheduler.start()
+            logger.info("AlphaLens updater service started")
             while True:
                 if stop_event and stop_event.wait(60):
                     logger.info("Stop event received")
@@ -944,6 +1014,9 @@ class UpdaterService:
         if mode == "sens":
             sys.exit(0 if self._update_holding_sens() else 1)
 
+        if mode == "splits":
+            sys.exit(0 if self._apply_splits() else 1)
+
         if mode == "full":
             logger.info("Running full update")
             ok = self._update_prices_and_news()
@@ -952,9 +1025,12 @@ class UpdaterService:
 
         self.run_forever(stop_event=stop_event)
 
-    def stop(self):
+    def stop(self, wait: bool = True):
+        # wait=False on the SCM stop path: shutdown(wait=True) blocks until
+        # in-flight jobs finish, which can run minutes past the SCM timeout -
+        # Windows then declares the service hung and kills it mid-job.
         if self.scheduler.running:
-            self.scheduler.shutdown(wait=True)
+            self.scheduler.shutdown(wait=wait)
             logger.info("Updater service stopped")
         else:
             logger.info("Updater scheduler already stopped")
@@ -969,6 +1045,7 @@ def main():
     group.add_argument("--backup", action="store_true", help="Back up the database now and exit")
     group.add_argument("--ipo", action="store_true", help="Scan Moneyweb SENS for IPO announcements and exit")
     group.add_argument("--sens", action="store_true", help="Fetch SENS announcements for held shares (alerts new ones) and exit")
+    group.add_argument("--splits", action="store_true", help="Apply Yahoo stock splits to held symbols and exit")
     group.add_argument("--normalize-closes", action="store_true", help="Rewrite all stored bars on the adjusted-close convention and exit")
     args = parser.parse_args()
 
@@ -985,6 +1062,8 @@ def main():
         mode = "ipo"
     elif args.sens:
         mode = "sens"
+    elif args.splits:
+        mode = "splits"
     elif args.normalize_closes:
         mode = "normalize_closes"
 

@@ -11,6 +11,7 @@ so EE events are dated at sync time and priced from EE's reported values.
 transaction_type values (String(10)):
   buy / sell              - position opened/increased, closed/reduced
   xfer_in / xfer_out      - same position moved between accounts (no P&L)
+  split                   - shares added/removed by a stock split (no P&L)
 """
 from datetime import datetime
 
@@ -19,7 +20,7 @@ from sqlalchemy.orm import Session
 from app.models.base import utcnow_naive
 from app.models.transaction import PortfolioTransaction
 
-BUY, SELL, XFER_IN, XFER_OUT = "buy", "sell", "xfer_in", "xfer_out"
+BUY, SELL, XFER_IN, XFER_OUT, SPLIT = "buy", "sell", "xfer_in", "xfer_out", "split"
 
 
 def record_transaction(

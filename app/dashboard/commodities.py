@@ -130,9 +130,20 @@ def show_commodities(db: Session):
         if st.button("🔄 Refresh Prices"):
             with st.spinner("Fetching commodity data..."):
                 saved, failures = _refresh_commodity_prices(db)
-            if failures:
+            # The rerun would otherwise serve cached 5-minute-old chart bars
+            # under a "refreshed" message.
+            _get_commodity_bars.clear()
+            if saved and failures:
+                # Say both: fresh data was stored AND some sources failed -
+                # "N source(s) failed" alone read like a total failure.
                 st.session_state["commodities_refresh_flash"] = (
-                    "warning", f"Refresh finished with {failures} failed source(s) - see logs for details."
+                    "warning",
+                    f"Refreshed {saved} new data points, but {failures} "
+                    "source(s) failed - see logs for details.",
+                )
+            elif failures:
+                st.session_state["commodities_refresh_flash"] = (
+                    "warning", f"Refresh failed for {failures} source(s) - see logs for details."
                 )
             elif saved:
                 st.session_state["commodities_refresh_flash"] = (
@@ -252,9 +263,15 @@ def _refresh_commodity_prices(db: Session) -> tuple[int, int]:
 
     historical_collector = AlphaVantageCollector()
     if historical_collector.enabled:
-        # AV returns USD values - one rate converts every metal's backfill.
-        usd_zar = YFinanceCollector().get_usd_zar()
-        if not usd_zar:
+        # AV returns USD values - convert each bar at that day's USD/ZAR: a
+        # single current rate would embed the year's FX move (~10%+) into the
+        # history. Today's rate is only the fallback when the FX series
+        # itself can't be fetched.
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=365)
+        yf_collector = YFinanceCollector()
+        zar_by_day = yf_collector.get_usd_zar_daily(period="1y")
+        fallback_rate = None if zar_by_day else yf_collector.get_usd_zar()
+        if not zar_by_day and not fallback_rate:
             failures += 1
             logger.error("Alpha Vantage backfill skipped - USD/ZAR rate unavailable")
         else:
@@ -262,14 +279,12 @@ def _refresh_commodity_prices(db: Session) -> tuple[int, int]:
                 try:
                     historical_prices = historical_collector.get_commodity_history(api_symbol)
                     if historical_prices:
-                        # point["timestamp"] is naive; comparing it with an aware
-                        # cutoff raises TypeError and silently failed every run.
-                        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=365)
                         saved += _save_historical_prices(
                             db,
                             api_symbol,
                             [point for point in historical_prices if point["timestamp"] >= cutoff],
-                            usd_zar,
+                            zar_by_day=zar_by_day,
+                            fallback_rate=fallback_rate,
                         )
                 except Exception as e:
                     failures += 1
@@ -278,12 +293,23 @@ def _refresh_commodity_prices(db: Session) -> tuple[int, int]:
     return saved, failures
 
 
-def _save_historical_prices(db: Session, api_symbol: str, historical_prices: list[dict], usd_zar: float) -> int:
+def _save_historical_prices(
+    db: Session,
+    api_symbol: str,
+    historical_prices: list[dict],
+    zar_by_day: dict | None = None,
+    fallback_rate: float | None = None,
+) -> int:
     """Save AV history converted into the stored unit (ZAR/gram).
 
     AV's USD-per-oz / USD-per-tonne closes share this series with Metals.dev
-    ZAR-per-gram snapshots; storing them raw mixed units ~57x apart.
+    ZAR-per-gram snapshots; storing them raw mixed units ~57x apart. Each
+    bar converts at that day's USD/ZAR rate from `zar_by_day` (with
+    fill-forward semantics over FX gaps); `fallback_rate` covers the case
+    where the FX series itself could not be fetched.
     """
+    import bisect
+
     _, database_symbol, _unit = COMMODITY_SYMBOLS[api_symbol]
     stock = db.query(Stock).filter(Stock.symbol == database_symbol).first()
     if not stock:
@@ -293,6 +319,22 @@ def _save_historical_prices(db: Session, api_symbol: str, historical_prices: lis
 
     def _norm(ts):
         return ts.astimezone(timezone.utc).replace(tzinfo=None) if ts.tzinfo else ts
+
+    # Date-keyed: the rate map's midnight-datetime keys can't be bisected
+    # against a bare date.
+    rates = {
+        (k.date() if hasattr(k, "date") else k): v
+        for k, v in (zar_by_day or {}).items()
+    }
+    rate_days = sorted(rates)
+
+    def _rate_on(day):
+        if not rate_days:
+            return fallback_rate
+        i = bisect.bisect_right(rate_days, day) - 1
+        # Pre-window days take the earliest known rate (bfill) rather than
+        # silently dropping the bar.
+        return rates[rate_days[max(i, 0)]]
 
     # One set-membership check against the DB replaces a SELECT per data point.
     timestamps = [_norm(p["timestamp"]) for p in historical_prices if p.get("timestamp")]
@@ -314,13 +356,14 @@ def _save_historical_prices(db: Session, api_symbol: str, historical_prices: lis
         if timestamp in existing:
             continue
         close = point.get("close")
-        if close is None or close <= 0:
+        rate = _rate_on(timestamp.date())
+        if close is None or close <= 0 or not rate:
             continue
         db.add(StockPrice(
             stock_id=stock.id,
             symbol=database_symbol,
             timestamp=timestamp,
-            close_price=close * usd_zar / _AV_GRAMS_PER_UNIT[api_symbol],
+            close_price=close * rate / _AV_GRAMS_PER_UNIT[api_symbol],
         ))
         saved += 1
 
@@ -477,6 +520,25 @@ def build_price_rows(latest_rates: dict[str, float], snapshots: dict) -> dict[st
     return rows
 
 
+@st.cache_data(
+    ttl=300, show_spinner=False,
+    hash_funcs={Session: lambda db: id(db.bind), tuple: lambda t: hash(t)},
+)
+def _get_commodity_bars(db: Session, symbols: tuple, start_date: datetime) -> dict:
+    """{db_symbol: [(timestamp, close), ...]} in one IN() query - the chart
+    tabs used to run a separate SELECT per selected commodity."""
+    rows = db.query(
+        StockPrice.symbol, StockPrice.timestamp, StockPrice.close_price
+    ).filter(
+        StockPrice.symbol.in_(symbols),
+        StockPrice.timestamp >= start_date,
+    ).order_by(StockPrice.symbol, StockPrice.timestamp.asc()).all()
+    grouped: dict[str, list] = {}
+    for symbol, ts, close in rows:
+        grouped.setdefault(symbol, []).append((ts, close))
+    return grouped
+
+
 def _render_commodity_charts(db: Session):
     """Render 90-day % change charts, one tab per category."""
     st.subheader("Price Charts")
@@ -486,6 +548,9 @@ def _render_commodity_charts(db: Session):
     catalog = commodity_catalog()
     # StockPrice.timestamp is naive UTC - keep the filter naive to match.
     start_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=90)
+    bars = _get_commodity_bars(
+        db, tuple(m["db_symbol"] for m in catalog.values()), start_date
+    )
 
     tabs = st.tabs([f"{CATEGORY_ICONS[c]} {c}" for c in CATEGORY_ORDER])
     for tab, category in zip(tabs, CATEGORY_ORDER):
@@ -506,18 +571,15 @@ def _render_commodity_charts(db: Session):
 
             fig = go.Figure()
             for key in selected:
-                prices = db.query(StockPrice.timestamp, StockPrice.close_price).filter(
-                    StockPrice.symbol == members[key]["db_symbol"],
-                    StockPrice.timestamp >= start_date,
-                ).order_by(StockPrice.timestamp.asc()).all()
+                prices = bars.get(members[key]["db_symbol"], [])
                 # Rebase each series to % change from its first visible point -
                 # units differ (R/g, R/bbl, R/bushel) so raw closes on one
                 # axis are not comparable.
-                if prices and prices[0].close_price:
-                    base = prices[0].close_price
+                if prices and prices[0][1]:
+                    base = prices[0][1]
                     fig.add_trace(go.Scatter(
-                        x=[p.timestamp for p in prices],
-                        y=[(p.close_price / base - 1) * 100 for p in prices],
+                        x=[ts for ts, _c in prices],
+                        y=[(close / base - 1) * 100 for _ts, close in prices],
                         name=members[key]["name"],
                         mode="lines",
                     ))

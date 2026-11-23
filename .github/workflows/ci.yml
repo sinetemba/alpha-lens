@@ -48,6 +48,13 @@ jobs:
           pip install pip-audit
           pip-audit
 
+      - name: Static analysis (ruff, error-class rules only)
+        # Syntax errors and true bugs only - no style opinion; the codebase
+        # predates a linter and a full ruleset would fail on cosmetic noise.
+        run: |
+          pip install ruff
+          ruff check --select=E9,F app scripts main.py
+
       - name: Run tests (SQLite)
         run: python -m pytest -q
 

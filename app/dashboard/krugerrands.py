@@ -309,7 +309,10 @@ def _render_krugerrand_calculator(gold_zar: float, silver_zar: float):
     spot = gold_zar if product["metal"] == "XAU" else silver_zar
 
     if spot <= 0:
-        st.info(f"No live {product['metal']} spot price - refresh prices above to enable the calculator.")
+        # product['metal'] is the ISO code (XAU/XAG) - show the metal's
+        # name, not the ticker, in user-facing text.
+        metal_name = "gold" if product["metal"] == "XAU" else "silver"
+        st.info(f"No live {metal_name} spot price - refresh prices above to enable the calculator.")
         return
 
     sizes = product["sizes"]
@@ -338,7 +341,7 @@ def _render_krugerrand_calculator(gold_zar: float, silver_zar: float):
     with c1:
         st.metric("Spot value per item", f"R {per_unit_spot:,.2f}")
     with c2:
-        st.metric(f"Est. retail per item", f"R {per_unit_retail:,.2f}")
+        st.metric("Est. retail per item", f"R {per_unit_retail:,.2f}")
     with c3:
         st.metric(f"Total ({quantity:g} × {size_label})", f"R {per_unit_retail * quantity:,.2f}")
 

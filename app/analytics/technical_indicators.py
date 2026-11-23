@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-from typing import List, Optional
 from loguru import logger
 
 
@@ -86,7 +85,13 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_vwap(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series) -> pd.Series:
-        """Calculate Volume Weighted Average Price."""
+        """Cumulative VWAP anchored at the loaded frame's first bar.
+
+        Not a session VWAP (bars are daily) and not rolling - the anchor is
+        the first bar of whatever range was fed in, so the value only moves
+        when the window does. Renamed here but stored as `vwap` for
+        compatibility.
+        """
         typical_price = (high + low + close) / 3
         vwap = (typical_price * volume).cumsum() / volume.cumsum()
         return vwap
@@ -120,15 +125,22 @@ class TechnicalIndicators:
             np.abs(low - close.shift())
         ], axis=1).max(axis=1)
         
-        plus_dm = pd.Series(plus_dm).rolling(window=period).mean()
-        minus_dm = pd.Series(minus_dm).rolling(window=period).mean()
-        atr = tr.rolling(window=period).mean()
-        
+        # Wilder smoothing (ewm alpha=1/n), the ADX definition's own moving
+        # average - a plain SMA underreacts and disagrees with the RSI/ATR
+        # paths, which are already Wilder. Keep the frame's index on the
+        # +DM/-DM series so they can't misalign against tr.
+        def _wilder(s: pd.Series) -> pd.Series:
+            return s.ewm(alpha=1.0 / period, adjust=False).mean()
+
+        plus_dm = _wilder(pd.Series(plus_dm, index=high.index))
+        minus_dm = _wilder(pd.Series(minus_dm, index=high.index))
+        atr = _wilder(tr)
+
         plus_di = 100 * (plus_dm / atr)
         minus_di = 100 * (minus_dm / atr)
-        
+
         dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
-        adx = dx.rolling(window=period).mean()
+        adx = _wilder(dx)
         
         return {
             "adx": adx,

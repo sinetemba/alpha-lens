@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from loguru import logger
+
 ROOT = Path(__file__).resolve().parents[2]
 JOB_LOCK_FILE = ROOT / "data" / ".updater.lock"
 
@@ -51,12 +53,15 @@ def release_instance_lock(fh) -> None:
     try:
         if os.name == "nt":
             import msvcrt
-            fh.seek(0)
+            fh.seek(0)  # ValueError (not OSError) on an already-closed handle
             msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-    except OSError:
+    except Exception:
         pass
     finally:
-        fh.close()
+        try:
+            fh.close()
+        except Exception:
+            pass
 
 
 class InterProcessJobLock:
@@ -88,19 +93,25 @@ class InterProcessJobLock:
         # turn within the timeout budget, then take the OS lock.
         if not self._gate.acquire(timeout=max(0.0, timeout)):
             return False
-        while True:
-            with self._mutex:
-                fh = acquire_instance_lock(self.path)
-                if fh is not None:
-                    self._fh = fh
-                    self._owner = ident
-                    self._depth = 1
-                    return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+        try:
+            while True:
+                with self._mutex:
+                    fh = acquire_instance_lock(self.path)
+                    if fh is not None:
+                        self._fh = fh
+                        self._owner = ident
+                        self._depth = 1
+                        return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(self.poll_seconds, remaining))
+        finally:
+            # Never strand the gate: an exception in acquire_instance_lock
+            # (mkdir/open raises outside its own try) would otherwise leave
+            # it held forever and livelock every future job in this process.
+            if not self.held:
                 self._gate.release()
-                return False
-            time.sleep(min(self.poll_seconds, remaining))
 
     def release(self) -> None:
         with self._mutex:
@@ -109,9 +120,17 @@ class InterProcessJobLock:
             self._depth -= 1
             if self._depth == 0:
                 self._owner = None
-                release_instance_lock(self._fh)
-                self._fh = None
-                self._gate.release()
+                try:
+                    release_instance_lock(self._fh)
+                except Exception as e:
+                    # Swallow: release() runs in callers' finally blocks - a
+                    # raise here would mask the job's own exception.
+                    logger.warning(f"Failed to release job lock file: {e}")
+                finally:
+                    # Gate must be freed even if the unlock raised - same
+                    # starvation risk as acquire.
+                    self._fh = None
+                    self._gate.release()
 
     @property
     def held(self) -> bool:

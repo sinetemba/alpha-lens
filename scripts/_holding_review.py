@@ -4,7 +4,6 @@ from app.models.portfolio import (
     PortfolioHolding, EXCLUDED_ACCOUNT_TYPES, EXCLUDED_PORTFOLIO_SYMBOLS,
     is_jse_tracked_account,
 )
-from app.models.stock import Stock, StockPrice
 from sqlalchemy import func
 
 db = SessionLocal()

@@ -16,7 +16,6 @@ schedule as the scheduled-task install.
 import os
 import sys
 import threading
-import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -33,7 +32,7 @@ try:
     import win32service
     import win32event
     import servicemanager
-except ImportError as exc:
+except ImportError:
     print("pywin32 is required for the Windows service. Install it with: pip install pywin32")
     raise
 
@@ -59,7 +58,10 @@ class AlphaLensUpdaterService(win32serviceutil.ServiceFramework):
         win32event.SetEvent(self.hWaitStop)
         if self.service_thread and self.service_thread.is_alive():
             self.service_thread.join(timeout=30)
-        self.updater.stop()
+        # wait=False: shutdown(wait=True) can block minutes past the SCM
+        # timeout on an in-flight job - Windows then kills the service as
+        # hung. Jobs' own finally blocks still run on a graceful shutdown.
+        self.updater.stop(wait=False)
         self.ReportServiceStatus(win32service.SERVICE_STOPPED)
 
     def SvcDoRun(self):

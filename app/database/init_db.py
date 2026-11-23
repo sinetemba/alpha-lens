@@ -1,5 +1,5 @@
 from app.models.base import Base, engine, SessionLocal
-from app.models import Stock, StockPrice, NewsArticle, WatchlistItem, Portfolio, PortfolioHolding, PortfolioSnapshot, Dividend, Notification, UpdaterRun, KrugerrandHolding, CryptoHolding, CryptoBundle, SchemaMeta
+from app.models import Stock, StockPrice, PortfolioHolding, SchemaMeta
 from app.config.settings import settings
 import os
 
@@ -52,9 +52,20 @@ def _migrate_schema():
             # hand-written migrations produced).
             if column.server_default is None:
                 spec = spec.replace(" NOT NULL", "")
-            with engine.begin() as conn:
-                conn.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {spec}"))
-            print(f"Migration: added '{column.name}' column to {table.name}.")
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {spec}"))
+                print(f"Migration: added '{column.name}' column to {table.name}.")
+            except Exception as e:
+                # A concurrent process applied the same migration between our
+                # inspect() and this statement (dashboard + daemon + one-shot
+                # all call init_database on startup; JOB_LOCK only serialises
+                # same-machine writers). A genuinely failed ALTER surfaces
+                # loudly as missing-column errors on the first real query.
+                print(
+                    f"Migration: could not add '{column.name}' to {table.name} "
+                    f"(probably applied by a concurrent process): {e}"
+                )
 
     # Data backfills the column diff can't express: fetched_at predates the
     # generic migrator and rows written before it exist have NULL.
@@ -133,46 +144,52 @@ def _enforce_unique_indexes(inspector):
         ):
             continue
 
-        with engine.begin() as conn:
-            if soft_flag:
-                # Deactivate all but the newest active row per key; the
-                # partial index then enforces one active row per symbol.
+        try:
+            with engine.begin() as conn:
+                if soft_flag:
+                    # Deactivate all but the newest active row per key; the
+                    # partial index then enforces one active row per symbol.
+                    conn.execute(text(
+                        f"UPDATE {table} SET {soft_flag} = FALSE WHERE {soft_flag} AND id NOT IN ("
+                        f"SELECT MAX(id) FROM {table} WHERE {soft_flag} GROUP BY {columns})"
+                    ))
+                else:
+                    # Keep the most COMPLETE row per key group (most non-null
+                    # fields, newest id on ties) - MAX(id) alone could keep an
+                    # adjusted_close=0 placeholder over a full bar. Rows with
+                    # NULL key columns are left alone: they can't collide under
+                    # a unique index (NULLs compare distinct).
+                    all_columns = [c["name"] for c in inspector.get_columns(table)]
+                    score = " + ".join(
+                        f"CASE WHEN {c} IS NOT NULL THEN 1 ELSE 0 END"
+                        for c in all_columns if c != "id"
+                    )
+                    # Only plain columns get a NULL check - expressions like
+                    # COALESCE(bundle, '') are never NULL and can't be split at
+                    # their inner comma.
+                    non_null_keys = " AND ".join(
+                        f"{c} IS NOT NULL" for c in wanted if "(" not in c
+                    ) or "TRUE"
+                    conn.execute(text(
+                        f"DELETE FROM {table} WHERE {non_null_keys} AND id NOT IN ("
+                        f"SELECT id FROM ("
+                        f"  SELECT id, ROW_NUMBER() OVER ("
+                        f"    PARTITION BY {columns} ORDER BY ({score}) DESC, id DESC"
+                        f"  ) AS rn FROM {table} WHERE {non_null_keys}"
+                        f") ranked WHERE rn = 1)"
+                    ))
+                if existing:
+                    conn.execute(text(f"DROP INDEX {index_name}"))
                 conn.execute(text(
-                    f"UPDATE {table} SET {soft_flag} = FALSE WHERE {soft_flag} AND id NOT IN ("
-                    f"SELECT MAX(id) FROM {table} WHERE {soft_flag} GROUP BY {columns})"
+                    f"CREATE UNIQUE INDEX {index_name} ON {table} ({columns})"
+                    + (f" WHERE {soft_flag}" if soft_flag else "")
                 ))
-            else:
-                # Keep the most COMPLETE row per key group (most non-null
-                # fields, newest id on ties) - MAX(id) alone could keep an
-                # adjusted_close=0 placeholder over a full bar. Rows with
-                # NULL key columns are left alone: they can't collide under
-                # a unique index (NULLs compare distinct).
-                all_columns = [c["name"] for c in inspector.get_columns(table)]
-                score = " + ".join(
-                    f"CASE WHEN {c} IS NOT NULL THEN 1 ELSE 0 END"
-                    for c in all_columns if c != "id"
-                )
-                # Only plain columns get a NULL check - expressions like
-                # COALESCE(bundle, '') are never NULL and can't be split at
-                # their inner comma.
-                non_null_keys = " AND ".join(
-                    f"{c} IS NOT NULL" for c in wanted if "(" not in c
-                ) or "TRUE"
-                conn.execute(text(
-                    f"DELETE FROM {table} WHERE {non_null_keys} AND id NOT IN ("
-                    f"SELECT id FROM ("
-                    f"  SELECT id, ROW_NUMBER() OVER ("
-                    f"    PARTITION BY {columns} ORDER BY ({score}) DESC, id DESC"
-                    f"  ) AS rn FROM {table} WHERE {non_null_keys}"
-                    f") ranked WHERE rn = 1)"
-                ))
-            if existing:
-                conn.execute(text(f"DROP INDEX {index_name}"))
-            conn.execute(text(
-                f"CREATE UNIQUE INDEX {index_name} ON {table} ({columns})"
-                + (f" WHERE {soft_flag}" if soft_flag else "")
-            ))
-        print(f"Migration: deduplicated {table} and made ({columns}) unique.")
+            print(f"Migration: deduplicated {table} and made ({columns}) unique.")
+        except Exception as e:
+            print(
+                f"Migration: could not enforce unique index {index_name} on "
+                f"{table} (concurrent migration?): {e}"
+            )
 
 
 def _ensure_plain_indexes(inspector):
@@ -198,11 +215,17 @@ def _ensure_plain_indexes(inspector):
             continue
         if index_name in {ix["name"] for ix in inspector.get_indexes(table)}:
             continue
-        with engine.begin() as conn:
-            conn.execute(text(
-                f"CREATE INDEX {index_name} ON {table} ({columns})"
-            ))
-        print(f"Migration: added index {index_name} on {table}({columns}).")
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"CREATE INDEX {index_name} ON {table} ({columns})"
+                ))
+            print(f"Migration: added index {index_name} on {table}({columns}).")
+        except Exception as e:
+            print(
+                f"Migration: could not add index {index_name} on {table} "
+                f"(concurrent migration?): {e}"
+            )
 
 
 _NORMALIZE_BARS_KEY = "normalize_bar_timestamps_v1"
@@ -375,13 +398,23 @@ def _repair_commodity_units():
 def init_database():
     """Initialize the database with tables and seed data."""
     print("Initializing database...")
-    create_tables()
-    _migrate_schema()
-    _normalize_bar_timestamps()
-    _cleanup_excluded_holdings()
-    _backfill_stock_names()
-    _backfill_opening_buys()
-    _repair_commodity_units()
+    # Serialise the schema migration + one-time repairs under the job lock:
+    # the dashboard, daemon and one-shot scripts can all start at once, and
+    # raced ALTERs/CREATE INDEXes used to fail startup outright (each DDL
+    # statement also tolerates a cross-machine race on shared Postgres).
+    from app.services.process_lock import JOB_LOCK
+    locked = JOB_LOCK.acquire(timeout=30) if JOB_LOCK else False
+    try:
+        create_tables()
+        _migrate_schema()
+        _normalize_bar_timestamps()
+        _cleanup_excluded_holdings()
+        _backfill_stock_names()
+        _backfill_opening_buys()
+        _repair_commodity_units()
+    finally:
+        if locked:
+            JOB_LOCK.release()
     
     # Add seed data if needed
     # For example, add default JSE stocks

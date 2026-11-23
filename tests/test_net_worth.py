@@ -35,6 +35,17 @@ def test_crypto_value_unpriced_is_none_and_empty_is_zero():
     assert crypto_value([], markets={}, luno_prices={}) == 0.0
 
 
+def test_crypto_value_partial_pricing_is_none_not_subset():
+    """An unpriced held coin must not be silently excluded from the total."""
+    holdings = [_coin("manual", "bitcoin", 1.0), _coin("manual", "solana", 2.0)]
+    value = crypto_value(
+        holdings,
+        markets={"bitcoin": {"current_price": 1_000_000.0}},  # no solana price
+        luno_prices={},
+    )
+    assert value is None
+
+
 def test_bullion_value_by_fine_ounces():
     bars = [SimpleNamespace(metal="XAU", fine_oz_per_unit=0.1, quantity=2),
             SimpleNamespace(metal="XAG", fine_oz_per_unit=1.0, quantity=10)]

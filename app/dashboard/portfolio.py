@@ -35,10 +35,11 @@ from app.services.price_queries import get_latest_and_previous_prices
 # The sync itself is Streamlit-free in services.easyequities_sync so the
 # headless updater can run it too; these names are re-exported for tests.
 from app.services.easyequities_sync import (
-    _normalize_account_type,
-    _ee_reconcile_units,
-    _sync_holding_from_easyequities,
+    _normalize_account_type,  # noqa: F401 - re-exported for tests
+    _ee_reconcile_units,  # noqa: F401 - re-exported for tests
+    _sync_holding_from_easyequities,  # noqa: F401 - re-exported for tests
     sync_portfolio_from_easyequities,
+    sync_account_holdings,
 )
 from datetime import datetime, timedelta, timezone
 from loguru import logger
@@ -77,9 +78,10 @@ def show_portfolio(db: Session):
         ~PortfolioHolding.account_type.in_(EXCLUDED_ACCOUNT_TYPES),
     ).order_by(PortfolioHolding.purchase_date.asc()).all()
     refresh_requested, sync_caption = _render_easyequities_refresh_control(collector, portfolio)
-    sync_flash = st.session_state.pop("portfolio_sync_flash", None)
-    if sync_flash:
-        getattr(st, sync_flash[0])(sync_flash[1])
+    for flash_key in ("portfolio_sync_flash", "portfolio_add_flash"):
+        flash = st.session_state.pop(flash_key, None)
+        if flash:
+            getattr(st, flash[0])(flash[1])
 
     # Track EasyEquities sync recency via a persistent DB column (rather than
     # holdings.updated_at, which is also bumped by unrelated writes like
@@ -134,8 +136,19 @@ def show_portfolio(db: Session):
     account_funds: dict[str, float] = {}
     if collector.enabled:
         if (should_sync and synced_holdings is not None) or "ee_account_funds" not in st.session_state:
-            account_funds = collector.get_funds_to_invest_by_account() or {}
-            st.session_state["ee_account_funds"] = account_funds
+            # None = fetch failed - caching it as {} would hide the Funds to
+            # Invest metric for the rest of the session with no error shown.
+            funds = collector.get_funds_to_invest_by_account()
+            if funds is not None:
+                account_funds = funds
+                st.session_state["ee_account_funds"] = funds
+            elif "ee_account_funds" in st.session_state:
+                account_funds = st.session_state["ee_account_funds"]
+            else:
+                st.caption(
+                    "Could not fetch Funds to Invest from EasyEquities "
+                    "(see the debug expander for details)."
+                )
             st.session_state["ee_last_funds_raw"] = getattr(collector, "_last_funds_raw", {})
         else:
             account_funds = st.session_state["ee_account_funds"]
@@ -183,30 +196,60 @@ def show_portfolio(db: Session):
                 "Purchase Date", value=_to_display_tz(datetime.now(timezone.utc)).date()
             )
         
-        flash = st.session_state.pop("portfolio_add_flash", None)
-        if flash:
-            level, message = flash
-            getattr(st, level)(message)
-
         if st.button("Add Holding"):
             if symbol and quantity > 0 and purchase_price > 0:
-                saved = _add_holding(db, portfolio.id, symbol, quantity, purchase_price, purchase_date)
-                if saved is None:
-                    st.warning(f"{symbol} is excluded from portfolio tracking - not added.")
+                # Duplicate guard: a repeated add would stack a phantom
+                # position on the existing Manual-account holding.
+                already = db.query(PortfolioHolding).filter(
+                    PortfolioHolding.portfolio_id == portfolio.id,
+                    PortfolioHolding.symbol == symbol,
+                    PortfolioHolding.account_type == "Manual",
+                ).first()
+                if already:
+                    st.warning(
+                        f"{symbol} is already in your portfolio "
+                        f"({already.quantity:g} shares, Manual account) - "
+                        "remove it first, or note the existing holding."
+                    )
                 else:
-                    # Flash the result post-rerun: st.rerun() discards messages
-                    # rendered in this run.
-                    if saved == 0:
-                        st.session_state["portfolio_add_flash"] = (
-                            "warning",
-                            f"Added {symbol}, but no price history could be fetched - "
-                            "double-check that the ticker is correct.",
-                        )
+                    # Cents-vs-Rand guard, same convention as the dividend
+                    # path: >20x the close near the purchase date is almost
+                    # certainly cents (entered R5,400 for SOL instead of R54).
+                    from app.services.data_service import DataService
+                    purchase_dt = datetime.combine(purchase_date, datetime.min.time())
+                    closes = db.query(
+                        StockPrice.timestamp, StockPrice.close_price
+                    ).filter(
+                        StockPrice.symbol == symbol,
+                        StockPrice.close_price.isnot(None),
+                        StockPrice.timestamp >= purchase_dt - timedelta(days=730),
+                        StockPrice.timestamp <= purchase_dt + timedelta(days=730),
+                    ).all()
+                    near = DataService._close_near(closes, purchase_dt)
+                    cents_converted = bool(near and purchase_price > near * 20)
+                    if cents_converted:
+                        purchase_price = purchase_price / 100
+                    saved = _add_holding(db, portfolio.id, symbol, quantity, purchase_price, purchase_date)
+                    if saved is None:
+                        st.warning(f"{symbol} is excluded from portfolio tracking - not added.")
                     else:
-                        st.session_state["portfolio_add_flash"] = (
-                            "success", f"Added {quantity} shares of {symbol} to portfolio!"
-                        )
-                    st.rerun()
+                        # Flash the result post-rerun: st.rerun() discards messages
+                        # rendered in this run.
+                        if saved == 0:
+                            st.session_state["portfolio_add_flash"] = (
+                                "warning",
+                                f"Added {symbol}, but no price history could be fetched - "
+                                "double-check that the ticker is correct.",
+                            )
+                        else:
+                            message = f"Added {quantity} shares of {symbol} to portfolio!"
+                            if cents_converted:
+                                message += (
+                                    f" Entered price looked like cents - "
+                                    f"stored as R {purchase_price:,.2f}."
+                                )
+                            st.session_state["portfolio_add_flash"] = ("success", message)
+                        st.rerun()
             else:
                 st.error("Please fill in all required fields.")
     
@@ -250,25 +293,32 @@ def show_portfolio(db: Session):
                 )
 
                 if st.button("Sync Holdings"):
+                    selected_name = next(
+                        (a["name"] for a in accounts if a["id"] == account_id), None
+                    )
                     with st.spinner("Fetching holdings from EasyEquities..."):
                         try:
-                            ee_holdings = collector.get_holdings(account_id)
+                            synced, skipped = sync_account_holdings(
+                                db, portfolio.id, collector, account_id, selected_name
+                            )
                         except Exception as e:
                             logger.error(f"EasyEquities holdings fetch failed: {e}")
-                            ee_holdings = None
+                            synced, skipped = None, 0
 
-                    if ee_holdings is None:
+                    if synced is None:
                         st.error("Could not fetch holdings from EasyEquities.")
-                    elif not ee_holdings:
+                    elif synced == 0 and not skipped:
                         st.info("No holdings found in this EasyEquities account.")
                     else:
-                        for ee_holding in ee_holdings:
-                            _sync_holding_from_easyequities(db, portfolio.id, ee_holding)
-                        db.commit()
-                        st.session_state["portfolio_sync_flash"] = (
-                            "success",
-                            f"Synced {len(ee_holdings)} holdings from EasyEquities.",
-                        )
+                        message = f"Synced {synced} holding{'s' if synced != 1 else ''} from EasyEquities."
+                        if skipped:
+                            st.session_state["portfolio_sync_flash"] = (
+                                "warning",
+                                message + f" {skipped} USD-account holding{'s' if skipped != 1 else ''} "
+                                "kept their last values - the USD/ZAR rate was unavailable.",
+                            )
+                        else:
+                            st.session_state["portfolio_sync_flash"] = ("success", message)
                         st.rerun()
 
     st.markdown("---")
@@ -315,9 +365,21 @@ def show_portfolio(db: Session):
     for h in display_holdings:
         account_groups.setdefault(h.account_type or "ZAR", []).append(h)
 
+    # Price stats and SENS statuses once over the union of JSE symbols -
+    # per-group queries would pay the 370-day history pull once per account.
+    all_jse_symbols = {
+        h.symbol for h in display_holdings
+        if h.symbol and is_jse_tracked_account(h.account_type)
+    }
+    stats_map = _holding_price_stats(db, sorted(all_jse_symbols))
+    statuses = holding_statuses(db, sorted(all_jse_symbols))
+
     # Render a table for each account type
     for account_type, group_holdings in account_groups.items():
-        _render_holdings_table(db, account_type, group_holdings, account_funds.get(account_type))
+        _render_holdings_table(
+            db, account_type, group_holdings, account_funds.get(account_type),
+            stats_map=stats_map, statuses=statuses,
+        )
     
     st.markdown("---")
     _render_easyequities_debug(collector, portfolio, holdings, account_funds)
@@ -711,7 +773,9 @@ def _holding_action(gain_loss_pct, stats: dict, watch: Optional[WatchlistItem] =
 
 
 def _render_holdings_table(
-    db: Session, account_type: str, holdings: list, funds_to_invest: float | None = None
+    db: Session, account_type: str, holdings: list,
+    funds_to_invest: float | None = None,
+    stats_map: dict | None = None, statuses: dict | None = None,
 ) -> None:
     """Render a single holdings table section for the given account type."""
     st.subheader(f"{account_type} Holdings")
@@ -745,10 +809,15 @@ def _render_holdings_table(
         )
 
     # Action column inputs: JSE-held symbols get 52w/trend stats in one
-    # query; watchlist stops/targets become the user's own exit rules.
+    # query; watchlist stops/targets become the user's own exit rules. When
+    # the caller pre-computed them over every group's symbols (a user with
+    # 3 accounts pays the 370d query once, not 3x), reuse those.
     jse_symbols = [h.symbol for h in holdings if h.symbol and is_jse_tracked_account(h.account_type)]
-    stats_map = _holding_price_stats(db, jse_symbols)
-    suspended = {s for s, status in holding_statuses(db, jse_symbols).items() if status.suspended}
+    if stats_map is None:
+        stats_map = _holding_price_stats(db, jse_symbols)
+    if statuses is None:
+        statuses = holding_statuses(db, jse_symbols)
+    suspended = {s for s, status in statuses.items() if status.suspended}
     watched = {
         w.symbol: w
         for w in db.query(WatchlistItem).filter(
@@ -850,10 +919,12 @@ def _render_holdings_table(
         )
     else:
         st.info("Select at least one column to display the holdings table.")
-    # Export every column, not just the displayed selection.
+    # Export every column, not just the displayed selection - but only the
+    # rows that passed the page's filters.
     render_csv_download(
         holdings_table, f"portfolio_{account_type.lower().replace(' ', '_')}",
         key=f"portfolio_{account_type}_csv",
+        scope_note="Exports the rows shown above (all columns, current filters).",
     )
 
     # Today's movement for this account group (JSE-priced symbols only -
@@ -921,8 +992,17 @@ def _render_easyequities_debug(
             if st.button("Load raw EasyEquities data"):
                 with st.spinner("Fetching raw data..."):
                     raw = collector.get_all_holdings()
-                    st.session_state["ee_last_raw_holdings"] = raw or []
+                # {} on failure stored too - otherwise the button silently
+                # re-appears with no hint that the fetch itself failed.
+                if not raw:
+                    st.session_state["ee_raw_error"] = (
+                        collector.last_error or "EasyEquities returned no holdings."
+                    )
+                st.session_state["ee_last_raw_holdings"] = raw or []
                 st.rerun()
+            error = st.session_state.pop("ee_raw_error", None)
+            if error:
+                st.error(f"Could not load raw EasyEquities data: {error}")
             return
 
         rows = []

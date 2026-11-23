@@ -110,7 +110,7 @@ def main() -> int:
     if problems:
         print(f"\nRESTORE CHECK FAILED: {', '.join(problems)}")
         return 1
-    print(f"\nRestore verified: every table restored; core tables non-empty. "
+    print("\nRestore verified: every table restored; core tables non-empty. "
           "Row counts differ from live only by what changed since the backup.")
     return 0
 

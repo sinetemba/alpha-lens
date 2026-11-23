@@ -29,7 +29,14 @@ def show_company(db: Session):
     """Display the company view page."""
     st.header("🏢 Company View")
     st.markdown("View detailed information about a specific company.")
-    
+
+    # Deactivation feedback must render at page top: popped inside the
+    # collapsed manage-expander it's never seen.
+    flash = st.session_state.pop("company_flash", None)
+    if flash:
+        level, message = flash
+        getattr(st, level)(message)
+
     # Symbol selection
     all_stocks = _get_active_stocks()
     stock_symbols = [s[0] for s in all_stocks]
@@ -115,11 +122,6 @@ def _render_manage_stocks(db: Session):
     re-adding it on the Watchlist or Portfolio page.
     """
     with st.expander("🗑️ Manage tracked stocks"):
-        flash = st.session_state.pop("company_flash", None)
-        if flash:
-            level, message = flash
-            getattr(st, level)(message)
-
         active = _get_active_stocks()
         names = {s[0]: s[1] for s in active}
         to_deactivate = st.multiselect(

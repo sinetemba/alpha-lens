@@ -108,6 +108,13 @@ def _notify_unit_conflicts(db: Session, holdings) -> None:
             logger.warning(f"Could not record unit-conflict notification for {symbol}: {e}")
 
 
+def _convert_usd_holding(ee_holding: dict, usd_zar: float) -> None:
+    """Scale a USD-account holding's dollar amounts to Rand, in place."""
+    for field in ("purchase_value", "current_value", "purchase_price", "current_price"):
+        if isinstance(ee_holding.get(field), (int, float)):
+            ee_holding[field] *= usd_zar
+
+
 def _sync_holding_from_easyequities(
     db: Session,
     portfolio_id: int,
@@ -336,8 +343,8 @@ def sync_portfolio_from_easyequities(
 
     # USD-account values arrive in dollars: convert to Rand once here so
     # portfolio totals, snapshots, net worth and transaction P&L never sum
-    # mixed currencies. Without a rate the holding is kept dollar-valued
-    # (still wrong-unit in totals, but visible and retried next sync).
+    # mixed currencies. Without a rate the holding keeps its last synced
+    # (already-converted) values - dollars must never land in Rand fields.
     usd_zar = None
     if any(
         not is_jse_tracked_account(h["account_name"])
@@ -351,13 +358,14 @@ def sync_portfolio_from_easyequities(
     for ee_holding in aggregated_holdings.values():
         if not is_jse_tracked_account(ee_holding["account_name"]):
             if usd_zar and (ee_holding.get("currency") or "USD") == "USD":
-                ee_holding["purchase_value"] *= usd_zar
-                ee_holding["current_value"] *= usd_zar
-            elif not usd_zar:
+                _convert_usd_holding(ee_holding, usd_zar)
+            else:
                 logger.warning(
-                    "USD/ZAR rate unavailable - USD-account holding "
-                    f"{ee_holding['symbol']} keeps dollar values this sync"
+                    "USD/ZAR rate unavailable - keeping last synced values for "
+                    f"USD-account holding {ee_holding['symbol']} rather than "
+                    "storing dollars as Rand"
                 )
+                continue
         ee_holding["purchase_price"] = ee_holding["purchase_value"] / ee_holding["shares"]
         ee_holding["current_price"] = ee_holding["current_value"] / ee_holding["shares"]
         _sync_holding_from_easyequities(
@@ -447,6 +455,62 @@ def sync_portfolio_from_easyequities(
                 logger.warning(f"Could not record holding-removal notification: {e}")
 
     return len(aggregated_holdings), ee_holdings
+
+
+def sync_account_holdings(
+    db: Session,
+    portfolio_id: int,
+    collector: EasyEquitiesCollector,
+    account_id: str,
+    account_name: str | None,
+) -> tuple[int | None, int]:
+    """Sync one EasyEquities account - the Portfolio page's per-account button.
+
+    `collector.get_holdings` returns positions with no `account_name`, so
+    they are tagged here with the selected account's real name (untagged
+    positions would normalise to "ZAR" and land USD holdings on a
+    JSE-tracked account), then the same USD->ZAR conversion as the full
+    sync applies - dollars must never reach the Rand-denominated fields.
+    Returns (synced_count, skipped_count); synced_count is None when the
+    upstream fetch failed.
+    """
+    from app.services.source_health import record_source
+    ee_holdings = collector.get_holdings(account_id)
+    record_source(db, "easyequities", ee_holdings is not None,
+                  None if ee_holdings is not None else (getattr(collector, "last_error", None) or "fetch failed"))
+    if ee_holdings is None:
+        return None, 0
+
+    account_type = _normalize_account_type(account_name)
+    jse_account = is_jse_tracked_account(account_type)
+    usd_zar = None
+    if not jse_account:
+        usd_zar = YFinanceCollector().get_usd_zar()
+        if usd_zar:
+            logger.info(f"Converting USD-account EasyEquities values at USD/ZAR {usd_zar:.4f}")
+
+    synced = skipped = 0
+    for ee_holding in ee_holdings:
+        ee_holding["account_name"] = account_name
+        if not jse_account:
+            if usd_zar and (ee_holding.get("currency") or "USD") == "USD":
+                _convert_usd_holding(ee_holding, usd_zar)
+            else:
+                logger.warning(
+                    "USD/ZAR rate unavailable - keeping last synced values for "
+                    f"USD-account holding {ee_holding.get('symbol')} rather "
+                    "than storing dollars as Rand"
+                )
+                skipped += 1
+                continue
+        _sync_holding_from_easyequities(db, portfolio_id, ee_holding)
+        synced += 1
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent sync wrote the same rows - keep theirs.
+        db.rollback()
+    return synced, skipped
 
 
 def _notify_silent_accounts(db: Session, portfolio_id: int, accounts: set) -> None:

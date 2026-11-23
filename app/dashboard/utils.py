@@ -141,11 +141,12 @@ def render_symbol_search(db: Session, key: str) -> str:
     )
 
 
-def render_csv_download(table: pd.DataFrame, name: str, key: str) -> None:
+def render_csv_download(table: pd.DataFrame, name: str, key: str, scope_note: Optional[str] = None) -> None:
     """'Download CSV' button for a table; `_`-prefixed helper columns are dropped.
 
     The file name carries today's date (display timezone) so repeated exports
-    don't overwrite each other.
+    don't overwrite each other. `scope_note` captions what the export covers
+    when it is only the currently filtered/shown rows.
     """
     export = table[[c for c in table.columns if not str(c).startswith("_")]]
     stamp = _to_display_tz(datetime.now(timezone.utc)).strftime("%Y-%m-%d")
@@ -156,6 +157,8 @@ def render_csv_download(table: pd.DataFrame, name: str, key: str) -> None:
         mime="text/csv",
         key=key,
     )
+    if scope_note:
+        st.caption(scope_note)
 
 
 def style_gain_loss_row(row: pd.Series, gain_loss=None) -> list[str]:
@@ -458,6 +461,31 @@ def render_last_fetch_caption(db: Session, symbols: Optional[Iterable[str]] = No
     st.caption(format_market_data_age(timestamp))
 
 
+def _clear_price_caches() -> None:
+    """Drop the ~60s cached price lookups after a manual refresh.
+
+    The post-refresh rerun would otherwise serve pre-refresh values under a
+    "prices updated" flash. Best-effort: a missing attribute must never
+    break the refresh itself.
+    """
+    try:
+        from app.dashboard import home, portfolio, company
+        for module, names in (
+            (home, (
+                "_get_latest_and_previous_prices", "_get_jse_index",
+                "_get_jse_change", "_get_daily_movers",
+            )),
+            (portfolio, ("_get_group_latest_and_previous_prices",)),
+            (company, ("_get_chart_prices",)),
+        ):
+            for name in names:
+                cached = getattr(module, name, None)
+                if cached is not None:
+                    cached.clear()
+    except Exception:
+        pass
+
+
 def render_market_data_refresh_control(
     db: Session,
     key: str,
@@ -520,10 +548,20 @@ def render_market_data_refresh_control(
                         f"{format_market_data_age(latest_timestamp)}"
                     )
                 if manual_refresh:
+                    # Clear the 60s price caches - without this the rerun
+                    # right under "prices updated" still serves the old
+                    # cached values.
+                    _clear_price_caches()
                     status = f"Updated prices for {updated_prices} symbol{'s' if updated_prices != 1 else ''}."
                     if include_news:
                         status += f" Collected {new_articles} new article{'s' if new_articles != 1 else ''}."
-                    st.session_state[f"{key}_flash"] = ("success", status)
+                    if data_service.quota_message:
+                        # The quota warning must ride the flash - a same-run
+                        # st.warning dies with the st.rerun().
+                        status += f" {data_service.quota_message} {format_market_data_age(latest_timestamp)}"
+                        st.session_state[f"{key}_flash"] = ("warning", status)
+                    else:
+                        st.session_state[f"{key}_flash"] = ("success", status)
                     st.rerun()
                 latest_timestamp = get_latest_market_data_timestamp(db, symbol_list)
         quota = format_twelve_data_quota()

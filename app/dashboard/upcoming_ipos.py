@@ -50,13 +50,22 @@ def show_upcoming_ipos(db: Session):
     listed = [r for r in rows if r.status == "listed"]
     other = [r for r in rows if r.status not in ("announced", "listed")]
 
+    link_config = {
+        "Link": st.column_config.LinkColumn("SENS announcement", display_text="Open")
+    }
     if announced:
         st.subheader("Announced / upcoming")
-        st.dataframe(_table(announced), width="stretch", hide_index=True)
+        st.dataframe(
+            _table(announced), width="stretch", hide_index=True,
+            column_config=link_config,
+        )
 
     if listed:
         st.subheader("Now trading")
-        st.dataframe(_table(listed), width="stretch", hide_index=True)
+        st.dataframe(
+            _table(listed), width="stretch", hide_index=True,
+            column_config=link_config,
+        )
 
     if other:
         with st.expander(f"Not new listings / expired ({len(other)})"):
@@ -65,7 +74,10 @@ def show_upcoming_ipos(db: Session):
                 "announcement (a listed company's capital raise). \"Expired\": "
                 "no trading within 180 days of the announcement."
             )
-            st.dataframe(_table(other, with_status=True), width="stretch", hide_index=True)
+            st.dataframe(
+                _table(other, with_status=True), width="stretch", hide_index=True,
+                column_config=link_config,
+            )
 
 
 _STATUS_LABELS = {"existing": "Already listed", "expired": "Expired"}

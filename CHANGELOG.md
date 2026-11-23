@@ -2,6 +2,98 @@
 
 Notable user-facing and architectural changes. Dates are Africa/Johannesburg.
 
+## 2026-11-23
+
+### Correctness fixes (review round two)
+
+- **Dividend income now uses the shares actually held on each ex-date**:
+  the transaction log (buys/sells/splits/transfers) reconstructs position
+  size before each ex-dividend. Top-ups no longer inflate income for
+  earlier dividends, partial sells no longer overcount, and a buy ON the
+  ex-date correctly earns nothing (was: current qty x all dividends
+  since purchase).
+- **Per-account "Sync Holdings" no longer writes USD values into Rand
+  fields**: the Portfolio page's per-account button now goes through the
+  shared sync service - the account type is preserved, USD rows convert
+  at USD/ZAR, and a missing rate skips the row instead of storing
+  dollars as Rand.
+- **Stock splits are applied to holdings**: `apply_recent_splits` in
+  `services/corporate_actions.py` resizes `quantity`/`purchase_price`
+  per Yahoo split events (idempotent via a logged `split` transaction),
+  runs inside Sunday's weekly cleanup over the last ~10 days, and via
+  `run_updater.py --splits` for a one-year catch-up.
+- **Cents-vs-Rand dividend guard gained a second signal**: an amount
+  ~100x the symbol's median stored dividend is rescaled even when it
+  passes the half-price check (a R2,500 share's 90c arrives as "90").
+  The manual Add Dividend and Add Holding forms apply the same guard
+  (purchase price >20x the near-date close -> cents) and say so in the
+  success flash.
+- An empty Yahoo response during the daily historical job now counts as
+  a failure - a total feed outage can no longer record a successful
+  `daily_historical` run and satisfy the catch-up gate.
+- The Add Holding form blocks duplicate Manual-account positions
+  instead of stacking phantom holdings.
+
+### Reliability
+
+- The cross-process job lock can no longer starve permanently: an
+  exception while acquiring/releasing the OS file lock always frees the
+  in-process gate (was: a single `mkdir`/`open` failure or a closed
+  handle could freeze every future job for the process's lifetime).
+- Startup schema migration is serialized under the job lock and each
+  `ALTER TABLE`/`CREATE INDEX` tolerates a concurrent process applying
+  it first (dashboard + daemon + one-shot used to race on startup).
+- Daily backups run on a worker thread inside the daemon (pg_dump used
+  to freeze the 60-second loop), filenames carry the PID (two concurrent
+  backups could target the same file), and the whole backup takes the
+  cross-process job lock.
+- Windows service stop uses `shutdown(wait=False)` - `wait=True` could
+  block minutes past the SCM timeout and get the service killed mid-job.
+- A news-scraper failure inside the daily price+news job no longer fails
+  the whole run (already-saved prices and the run record are kept);
+  per-symbol dividend failures surface in the `daily_historical` run
+  detail instead of being swallowed.
+- CI gained a ruff static-analysis step (E9/F rules).
+
+### Accuracy
+
+- Alpha Vantage commodity backfill converts each bar at that day's
+  USD/ZAR rate (was: a year of history converted at today's rate, which
+  embeds the year's FX move as price error).
+- `crypto_value` returns `None` when ANY held coin can't be priced -
+  a partial sum read as complete net worth (same rule bullion already
+  had). Metals.dev warns when `currency`/`unit` aren't ZAR/g.
+- Home/net-worth value an entirely unpriced holding at cost basis, not
+  zero - a just-added position no longer reports as a 100% loss.
+- ADX uses Wilder smoothing (like RSI/ATR) instead of a plain SMA;
+  VWAP's docstring now says it's cumulative-from-window-start, not a
+  session VWAP.
+
+### Pages
+
+- Watchlist/portfolio/company post-action messages now render at the
+  top of the page instead of inside collapsed expanders where users
+  never saw them.
+- Manual "Refresh Prices" clears the 60s price caches so the rerun
+  shows the fresh values it just claimed, and the Twelve Data quota
+  warning survives the rerun inside the flash message.
+- Portfolio page: the 52w/trend stats and SENS status queries run once
+  for all account groups (was once per group); Funds to Invest no
+  longer caches a failed fetch as empty for the whole session; the raw
+  EasyEquities debug button reports a failed fetch; CSV export captions
+  that it covers the currently filtered rows.
+- Commodity price charts load every series in one batched query cached
+  5 minutes (was one SELECT per selected commodity per render), and the
+  refresh flash says "refreshed N bars but X sources failed" instead of
+  reading like a total failure.
+- IPO table links are clickable `LinkColumn`s; the Daily Gain metric
+  shows an explicit `+`/`-` sign; Krugerrands errors say "gold/silver",
+  not `XAU`/`XAG`; Penny Stocks' Add-to-Watchlist reports the real
+  add/skip outcome.
+- Notification edge-trigger checks use one grouped query per run
+  instead of a full-table scan per watchlist item; SENS dedup prefetch
+  and `holding_statuses` are bounded to relevant windows.
+
 ## 2026-11-21
 
 ### Data integrity (deep review)

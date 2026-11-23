@@ -99,7 +99,15 @@ def refresh_holding_announcements(db: Session, collector=None, symbols=None,
     if not symbols:
         return 0
 
-    known_urls = {u for (u,) in db.query(SensAnnouncement.source_url).all()}
+    # Scope the dedup prefetch to the symbols being refreshed - an
+    # unbounded .all() loads every stored URL on every daily run as the
+    # table grows. The unique index on source_url is the backstop.
+    known_urls = {
+        u for (u,) in db.query(SensAnnouncement.source_url).filter(
+            SensAnnouncement.symbol.in_(symbols),
+            SensAnnouncement.published_at >= utcnow_naive() - timedelta(days=2 * 365),
+        ).all()
+    }
     has_history = {s for (s,) in db.query(SensAnnouncement.symbol).distinct().all()}
     now = utcnow_naive()
     notifier = NotificationService(db)
@@ -251,8 +259,11 @@ def holding_statuses(db: Session, symbols, now=None) -> dict[str, HoldingStatus]
     symbols = list(symbols)
     if not symbols:
         return {}
+    # Nothing older than the widest freshness window (365d corporate
+    # actions; suspensions expire at 200d) can change any status.
     rows = db.query(SensAnnouncement).filter(
-        SensAnnouncement.symbol.in_(symbols)
+        SensAnnouncement.symbol.in_(symbols),
+        SensAnnouncement.published_at >= now - timedelta(days=CORPORATE_ACTION_DAYS),
     ).order_by(SensAnnouncement.published_at.desc().nullslast()).all()
     out: dict[str, HoldingStatus] = {}
     concluded: dict[str, set] = {}   # symbol -> action phrases a later "results of ..." closed

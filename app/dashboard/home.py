@@ -197,7 +197,9 @@ def _render_home(db: Session):
         if holdings:
             st.metric(
                 label="Daily Gain",
-                value=f"R {_get_daily_gain(db, holdings):,.2f}",
+                # + sign - "R -1,234" vs "R 5,432" must read as loss/gain
+                # without the user inferring the sign from the delta colour.
+                value=f"R {_get_daily_gain(db, holdings):+,.2f}",
                 delta=_get_daily_gain_percentage(db, holdings)
             )
         else:
@@ -306,8 +308,12 @@ def _holdings_market_value(db: Session, holdings) -> float:
         latest, _ = prices.get(h.symbol, (None, None))
         if latest and latest.close_price is not None and h.quantity:
             total += latest.close_price * h.quantity
+        elif h.current_value is not None:
+            total += h.current_value
         else:
-            total += h.current_value or 0.0
+            # Entirely unpriced (e.g. just added, no bars yet): value at
+            # cost basis, not zero - a new position isn't a total loss.
+            total += (h.quantity or 0.0) * (h.purchase_price or 0.0)
     return total
 
 

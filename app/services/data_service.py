@@ -7,7 +7,6 @@ from app.config.settings import settings
 from app.models.base import utcnow_naive
 from app.models.dividend import Dividend
 from app.models.stock import Stock, StockPrice
-from app.models.news import NewsArticle
 from app.collectors.twelve_data import TwelveDataCollector
 from app.collectors.yfinance import YFinanceCollector
 from app.scrapers.news import NewsScraper
@@ -64,6 +63,9 @@ class DataService:
         self.yfinance = YFinanceCollector()
         self.quota_message: Optional[str] = None
         self.last_failed_symbols: List[str] = []
+        # Symbols whose dividend fetch raised this run - surfaced in the
+        # daily_historical run detail instead of being silently swallowed.
+        self.last_failed_dividend_symbols: List[str] = []
 
     def update_stock_prices(self, symbols: List[str]) -> int:
         """Update stock prices for the given symbols.
@@ -813,13 +815,21 @@ class DataService:
         return best[1] if best else None
 
     @staticmethod
-    def _dividend_amount_rand(symbol: str, amount: float, close: Optional[float]) -> float:
+    def _dividend_amount_rand(
+        symbol: str, amount: float, close: Optional[float],
+        history: Optional[list] = None,
+    ) -> float:
         """Return the dividend amount in Rand, rescaling obvious cents values.
 
         Yahoo reports .JO dividend amounts in cents for some tickers and Rand
-        for others, so a blanket conversion is wrong. A cash dividend larger
-        than half the contemporaneous share price is implausible and is
-        treated as cents.
+        for others, so a blanket conversion is wrong. Two signals:
+        - amount > 50% of the contemporaneous share price -> cents;
+        - amount ~100x the median of the symbol's own stored dividends ->
+          cents. The 50%-of-price check alone misses an expensive share's
+        small cent dividend (a R2,500 stock paying 90c arrives as "90",
+        under half the price); the ~100x-median check catches it. The /100
+        result must land within 10x of the median so a genuine special
+        dividend isn't rescaled.
         """
         if close and amount > close * 0.5:
             logger.info(
@@ -827,6 +837,19 @@ class DataService:
                 f"amount > 50% of share price {close:.2f}, assumed cents"
             )
             return amount / 100
+        if history:
+            import statistics
+            amounts = sorted(a for a in history if a and a > 0)
+            if len(amounts) >= 3:
+                median = statistics.median(amounts)
+                scaled = amount / 100
+                if amount >= 50 * median and median / 10 <= scaled <= median * 10:
+                    logger.info(
+                        f"Rescaling {symbol} dividend {amount} -> {scaled}: "
+                        f"~{amount / median:.0f}x the median stored dividend "
+                        f"({median:.4f}), assumed cents"
+                    )
+                    return scaled
         return amount
 
     def update_dividends(self, symbols: List[str], freshness_days: int = 7) -> int:
@@ -848,6 +871,7 @@ class DataService:
             }
 
         saved = 0
+        self.last_failed_dividend_symbols = []
         for symbol in symbols:
             if symbol in fresh:
                 continue
@@ -868,6 +892,7 @@ class DataService:
                     self.db.add(stock)
                 stock.last_dividend_fetch = utcnow_naive()
             except Exception as e:
+                self.last_failed_dividend_symbols.append(symbol)
                 logger.error(f"Error updating dividends for {symbol}: {e}")
                 self.db.rollback()
 
@@ -924,7 +949,8 @@ class DataService:
                 # Twelve Data can report ZAc where Rand was expected -
                 # same rescale rule as the Yahoo path.
                 amount_rand = self._dividend_amount_rand(
-                    symbol, float(amount), self._close_near(closes, ex_date)
+                    symbol, float(amount), self._close_near(closes, ex_date),
+                    [amt for _, amt in existing_by_key],
                 )
                 key = (ex_date.date(), round(amount_rand, 6))
 
@@ -995,7 +1021,8 @@ class DataService:
             # ex-date as naive midnight so dedup matches the Twelve Data path.
             ex_date = datetime(ex_date.year, ex_date.month, ex_date.day)
             amount_rand = self._dividend_amount_rand(
-                symbol, float(amount), self._close_near(closes, ex_date)
+                symbol, float(amount), self._close_near(closes, ex_date),
+                [amt for _, amt in existing_by_key],
             )
             key = (ex_date.date(), round(amount_rand, 6))
             if key in existing_by_key:
@@ -1213,11 +1240,24 @@ class DataService:
                 start_date=min_start.strftime("%Y-%m-%d"),
                 end_date=end_date.strftime("%Y-%m-%d"),
             )
+            # A total feed outage returns nothing for EVERY symbol - count
+            # those as failures so the run is recorded failed and the catch-up
+            # retries, instead of a "successful" run that fetched zero bars.
+            # When only some symbols are empty the feed is alive: the symbol
+            # itself is dead/delisted and stays a 0-result for the caller's
+            # dead-symbol check (it must not be marked failed, which would
+            # skip that check and leave dead tickers tracked forever).
+            batch_dead = all(
+                frame is None or frame.empty for frame in (frames or {}).values()
+            )
             for symbol, (start, backfill) in yahoo_needed.items():
                 try:
-                    frame = frames.get(symbol)
+                    frame = (frames or {}).get(symbol)
                     if frame is None or frame.empty:
-                        results[symbol] = 0
+                        if batch_dead:
+                            failed.append(symbol)
+                        else:
+                            results[symbol] = 0
                         logger.error(f"Failed to get historical data for {symbol}")
                         continue
                     records = []

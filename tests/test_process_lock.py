@@ -1,6 +1,8 @@
 """Tests for the cross-process job lock's in-process thread behaviour."""
 import threading
 
+import pytest
+
 from app.services.process_lock import InterProcessJobLock
 
 
@@ -49,3 +51,39 @@ def test_release_only_counts_owner_calls(tmp_path):
     assert lock.held
     lock.release()
     assert not lock.held
+
+
+def test_acquire_failure_does_not_strand_the_gate(tmp_path, monkeypatch):
+    """An exception inside acquire_instance_lock (mkdir/open raise outside
+    its own try) must free the gate - otherwise every later job times out."""
+    from app.services import process_lock
+
+    lock = InterProcessJobLock(tmp_path / "leak.lock", poll_seconds=0.05)
+    monkeypatch.setattr(
+        process_lock, "acquire_instance_lock",
+        lambda path: (_ for _ in ()).throw(PermissionError("disk gone")),
+    )
+    with pytest.raises(PermissionError):
+        lock.acquire(timeout=1.0)
+
+    monkeypatch.undo()
+    # Gate freed: a fresh acquire can still take the lock.
+    assert lock.acquire(timeout=1.0)
+    lock.release()
+
+
+def test_release_error_still_frees_the_gate(tmp_path, monkeypatch):
+    from app.services import process_lock
+
+    lock = InterProcessJobLock(tmp_path / "leak2.lock", poll_seconds=0.05)
+    assert lock.acquire()
+    monkeypatch.setattr(
+        process_lock, "release_instance_lock",
+        lambda fh: (_ for _ in ()).throw(ValueError("closed handle")),
+    )
+    lock.release()
+
+    assert not lock.held
+    monkeypatch.undo()
+    assert lock.acquire(timeout=1.0)
+    lock.release()

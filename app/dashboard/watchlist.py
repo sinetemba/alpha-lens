@@ -28,7 +28,14 @@ def show_watchlist(db: Session):
         item.symbol for item in db.query(WatchlistItem).filter(WatchlistItem.is_active == True).all()
     ]
     render_market_data_refresh_control(db, key="watchlist_market_data_refresh", symbols=active_symbols)
-    
+
+    # Post-action feedback must render at page top: popped inside the
+    # collapsed add-expander it's never seen.
+    flash = st.session_state.pop("watchlist_add_flash", None)
+    if flash:
+        level, message = flash
+        getattr(st, level)(message)
+
     # Add new stock to watchlist
     with st.expander("➕ Add Stock to Watchlist"):
         col1, col2 = st.columns(2)
@@ -46,11 +53,6 @@ def show_watchlist(db: Session):
             "Move threshold %", min_value=0.5, max_value=50.0, value=5.0, step=0.5
         ) if alert_move else 5.0
         notes = st.text_area("Notes")
-        
-        flash = st.session_state.pop("watchlist_add_flash", None)
-        if flash:
-            level, message = flash
-            getattr(st, level)(message)
 
         if st.button("Add to Watchlist"):
             if symbol:

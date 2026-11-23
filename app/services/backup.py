@@ -161,7 +161,9 @@ def backup_database() -> Path:
     newest backup.
     """
     url = make_url(settings.database_url)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Second-resolution + PID: two concurrent backups (daemon catch-up vs a
+    # manual --backup) used to target the same file and interleave output.
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{os.getpid()}"
     if url.get_backend_name() == "postgresql":
         target = _backup_dir() / f"{BACKUP_PREFIX}{stamp}.dump"
         backup_fn = _backup_postgres

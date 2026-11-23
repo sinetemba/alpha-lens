@@ -133,7 +133,9 @@ def test_suspension_lifted_or_stale_is_not_suspended(db_session):
     _store(db_session, "BBB", "Quarterly suspension update", 400, "u/b1")
     statuses = holding_statuses(db_session, ["AAA", "BBB", "CCC"])
     assert not statuses["AAA"].suspended
-    assert not statuses["BBB"].suspended
+    # A 400d-old suspension is outside the bounded query window - the symbol
+    # is simply absent, which callers treat as "not suspended" anyway.
+    assert statuses.get("BBB") is None or not statuses["BBB"].suspended
     assert "CCC" not in statuses
 
 

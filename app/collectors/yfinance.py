@@ -1,4 +1,5 @@
 import time
+import pandas as pd
 import yfinance as yf
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
@@ -170,7 +171,9 @@ class YFinanceCollector:
         a DataFrame (date index, one column per ticker incl. "ZAR=X") or
         None on failure.
         """
-        if not self.enabled or not tickers:
+        # An empty ticker list fetches just "ZAR=X" (FX-only callers like the
+        # Alpha Vantage backfill's per-day conversion).
+        if not self.enabled:
             return None
         try:
             closes = self._call_with_retry(
@@ -186,6 +189,23 @@ class YFinanceCollector:
         if closes is None or closes.empty or "ZAR=X" not in closes.columns:
             return None
         return closes
+
+    def get_usd_zar_daily(self, period: str = "1y") -> Dict:
+        """{naive day-midnight datetime: USD/ZAR close} for the period.
+
+        Forward- and back-filled over FX-holiday gaps so every market day
+        maps to a rate - per-day conversion for USD-sourced history (the AV
+        commodity backfill), not a single current rate across a year.
+        """
+        closes = self.get_futures_closes([], period=period)
+        if closes is None:
+            return {}
+        series = closes["ZAR=X"].ffill().bfill()
+        return {
+            pd.Timestamp(ts).tz_localize(None).normalize().to_pydatetime(): float(v)
+            for ts, v in series.items()
+            if not pd.isna(v) and float(v) > 0
+        }
 
     def search_jse(self, query: str, limit: int = 8) -> Optional[List[Dict]]:
         """Search Yahoo for JSE listings by company name or ticker.

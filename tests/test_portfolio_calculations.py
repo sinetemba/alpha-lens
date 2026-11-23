@@ -229,6 +229,96 @@ def test_sync_holding_from_easyequities_skips_excluded_entries(db_session, ee_ho
     assert db_session.query(PortfolioHolding).count() == 0
 
 
+# --- per-account sync (dashboard "Sync Holdings" button) --------------------
+
+def _fake_collector(holdings):
+    return SimpleNamespace(
+        get_holdings=lambda account_id: holdings,
+        last_error=None,
+    )
+
+
+def _usd_position():
+    """get_holdings returns no account_name - the service must tag it."""
+    return {
+        "symbol": "AAPL", "name": "Apple",
+        "shares": 2.0,
+        "purchase_value": 200.0, "purchase_price": 100.0,
+        "current_price": 110.0, "current_value": 220.0,
+        "currency": "USD",
+    }
+
+
+def test_sync_account_holdings_tags_account_and_converts_usd(db_session, monkeypatch):
+    """A USD account synced via the button used to write dollars into the
+    Rand fields under account_type "ZAR" - it must tag the real account and
+    convert at USD/ZAR like the full sync."""
+    from app.services import easyequities_sync
+
+    portfolio = _add_portfolio(db_session)
+    monkeypatch.setattr(
+        easyequities_sync.YFinanceCollector, "get_usd_zar",
+        lambda self: 18.0,
+    )
+
+    synced, skipped = easyequities_sync.sync_account_holdings(
+        db_session, portfolio.id,
+        _fake_collector([_usd_position()]),
+        "acct-1", "EasyEquities USD",
+    )
+
+    assert synced == 1 and skipped == 0
+    holding = db_session.query(PortfolioHolding).one()
+    assert holding.account_type == "USD"
+    assert holding.purchase_price == pytest.approx(1800.0)
+    assert holding.current_price == pytest.approx(1980.0)
+    assert holding.current_value == pytest.approx(3960.0)
+
+
+def test_sync_account_holdings_without_rate_writes_nothing(db_session, monkeypatch):
+    """No USD/ZAR rate -> keep last synced values, never store dollars."""
+    from app.services import easyequities_sync
+
+    portfolio = _add_portfolio(db_session)
+    monkeypatch.setattr(
+        easyequities_sync.YFinanceCollector, "get_usd_zar",
+        lambda self: None,
+    )
+
+    synced, skipped = easyequities_sync.sync_account_holdings(
+        db_session, portfolio.id,
+        _fake_collector([_usd_position()]),
+        "acct-1", "EasyEquities USD",
+    )
+
+    assert synced == 0 and skipped == 1
+    assert db_session.query(PortfolioHolding).count() == 0
+
+
+def test_sync_account_holdings_jse_account_passthrough(db_session, monkeypatch):
+    from app.services import easyequities_sync
+
+    portfolio = _add_portfolio(db_session)
+    zar_calls = []
+    monkeypatch.setattr(
+        easyequities_sync.YFinanceCollector, "get_usd_zar",
+        lambda self: zar_calls.append(1) or 18.0,
+    )
+    position = _usd_position()
+    position["currency"] = "ZAR"
+
+    synced, skipped = easyequities_sync.sync_account_holdings(
+        db_session, portfolio.id,
+        _fake_collector([position]),
+        "acct-1", "EasyEquities ZAR",
+    )
+
+    assert synced == 1 and skipped == 0 and not zar_calls
+    holding = db_session.query(PortfolioHolding).one()
+    assert holding.account_type == "ZAR"
+    assert holding.purchase_price == pytest.approx(100.0)
+
+
 # --- Action column ---------------------------------------------------------
 
 def _stats(**kw):
@@ -295,3 +385,88 @@ def test_holding_price_stats_computes_series_stats(db_session):
     assert s["sma20"] == pytest.approx(169.5)  # mean of closes 160..179
     assert s["mom_3m"] > 0
     assert "MISSING" not in stats
+
+# --- Dividend income attribution (per ex-date quantity) --------------------
+
+def test_dividend_income_uses_quantity_held_before_each_ex_date(db_session):
+    """Top-ups after the first ex-date must not be credited with income they
+    never earned (the old code used current quantity x all dividends)."""
+    from app.models.dividend import Dividend
+    from app.models.transaction import PortfolioTransaction
+    from app.services.portfolio_valuation import dividend_income_by_holding
+
+    stock = Stock(symbol="SBK", name="SBK")
+    db_session.add(stock)
+    db_session.flush()
+    portfolio = _add_portfolio(db_session)
+    holding = _add_holding(db_session, portfolio, stock, quantity=12, purchase_price=40.0)
+    db_session.add_all([
+        Dividend(stock_id=stock.id, symbol="SBK", amount=1.0,
+                 ex_dividend_date=datetime(2023, 3, 1)),
+        Dividend(stock_id=stock.id, symbol="SBK", amount=1.0,
+                 ex_dividend_date=datetime(2023, 6, 1)),
+    ])
+    db_session.add_all([
+        PortfolioTransaction(
+            portfolio_id=portfolio.id, stock_id=stock.id, symbol="SBK",
+            account_type="ZAR", transaction_type="buy", quantity=10, price=40,
+            value=400.0, transacted_at=datetime(2023, 1, 1)),
+        PortfolioTransaction(
+            portfolio_id=portfolio.id, stock_id=stock.id, symbol="SBK",
+            account_type="ZAR", transaction_type="buy", quantity=5, price=40,
+            value=200.0, transacted_at=datetime(2023, 4, 1)),
+        PortfolioTransaction(
+            portfolio_id=portfolio.id, stock_id=stock.id, symbol="SBK",
+            account_type="ZAR", transaction_type="sell", quantity=3, price=50,
+            value=150.0, transacted_at=datetime(2023, 9, 1)),
+    ])
+    db_session.commit()
+
+    income, per_share = dividend_income_by_holding(db_session, [holding])[holding.id]
+    # 10 held before the March ex-date, 15 before the June one.
+    assert income == pytest.approx(25.0)
+    assert per_share == pytest.approx(2.0)
+
+
+def test_dividend_income_excludes_ex_date_on_purchase_day(db_session):
+    """Buying on the ex-date earns nothing - requires strictly-before."""
+    from app.models.dividend import Dividend
+    from app.models.transaction import PortfolioTransaction
+    from app.services.portfolio_valuation import dividend_income_by_holding
+
+    stock = Stock(symbol="SBK", name="SBK")
+    db_session.add(stock)
+    db_session.flush()
+    portfolio = _add_portfolio(db_session)
+    holding = _add_holding(db_session, portfolio, stock, quantity=10, purchase_price=40.0)
+    db_session.add(Dividend(
+        stock_id=stock.id, symbol="SBK", amount=1.0,
+        ex_dividend_date=datetime(2023, 1, 1),  # == purchase_date
+    ))
+    db_session.add(PortfolioTransaction(
+        portfolio_id=portfolio.id, stock_id=stock.id, symbol="SBK",
+        account_type="ZAR", transaction_type="buy", quantity=10, price=40,
+        value=400.0, transacted_at=datetime(2023, 1, 1),
+    ))
+    db_session.commit()
+
+    assert dividend_income_by_holding(db_session, [holding]) == {}
+
+
+def test_dividend_income_without_log_falls_back_to_current_quantity(db_session):
+    from app.models.dividend import Dividend
+    from app.services.portfolio_valuation import dividend_income_by_holding
+
+    stock = Stock(symbol="SBK", name="SBK")
+    db_session.add(stock)
+    db_session.flush()
+    portfolio = _add_portfolio(db_session)
+    holding = _add_holding(db_session, portfolio, stock, quantity=10, purchase_price=40.0)
+    db_session.add(Dividend(
+        stock_id=stock.id, symbol="SBK", amount=1.0,
+        ex_dividend_date=datetime(2023, 3, 1),
+    ))
+    db_session.commit()
+
+    income, _per_share = dividend_income_by_holding(db_session, [holding])[holding.id]
+    assert income == pytest.approx(10.0)

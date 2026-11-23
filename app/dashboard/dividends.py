@@ -38,27 +38,11 @@ def show_dividends(db: Session):
         if is_jse_tracked_account(h.account_type)
     ]
 
-    # Only dividends with ex-date on/after the holding's purchase date were
-    # actually received - earlier ones overstate income. One query fetches the
-    # per-symbol rows, then ex-dates are filtered per holding (account-type
-    # purchase dates differ).
-    dividends_by_symbol: dict[str, list] = {}
-    if holdings:
-        for sym, amount, ex_date in db.query(
-            Dividend.symbol, Dividend.amount, Dividend.ex_dividend_date
-        ).filter(Dividend.symbol.in_({h.symbol for h in holdings})).all():
-            dividends_by_symbol.setdefault(sym, []).append((ex_date, amount or 0.0))
-
-    def _holding_dividends_per_share(h) -> float:
-        return sum(
-            amount
-            for ex_date, amount in dividends_by_symbol.get(h.symbol, [])
-            if h.purchase_date is None or (ex_date is not None and ex_date >= h.purchase_date)
-        )
-
-    total_income = sum(
-        (h.quantity or 0.0) * _holding_dividends_per_share(h) for h in holdings
-    )
+    # Income is shares-held-before-each-ex-date x amount (transaction log),
+    # not current quantity x every dividend - top-ups/sells would misstate it.
+    from app.services.portfolio_valuation import dividend_income_by_holding
+    income_by_holding = dividend_income_by_holding(db, holdings)
+    total_income = sum(income for income, _per_share in income_by_holding.values())
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -203,8 +187,7 @@ def show_dividends(db: Session):
         st.subheader("All Holdings")
         holdings_data = []
         for h in holdings:
-            per_share = _holding_dividends_per_share(h)
-            income = (h.quantity or 0.0) * per_share
+            income, per_share = income_by_holding.get(h.id, (0.0, 0.0))
             holdings_data.append({
                 "Symbol": format_stock_label(h.symbol, h.stock.name if h.stock else None),
                 "Account": h.account_type or "ZAR",
@@ -268,9 +251,9 @@ def show_dividends(db: Session):
                 if any(abs((d.amount or 0.0) - amount) < 1e-6 for d in same_day):
                     st.warning(f"A dividend for {symbol} on {ex_date} already exists.")
                 else:
-                    # Same cents-vs-Rand guard as the provider paths: a cash
-                    # dividend above half the share price is almost certainly
-                    # entered in cents.
+                    # Same cents-vs-Rand guards as the provider paths: the
+                    # half-price check plus a ~100x-median check for small
+                    # cent amounts on expensive shares.
                     stored_amount = amount
                     if (currency or "ZAR") == "ZAR":
                         closes = db.query(
@@ -282,13 +265,11 @@ def show_dividends(db: Session):
                             StockPrice.timestamp <= ex_dt + timedelta(days=730),
                         ).all()
                         stored_amount = DataService._dividend_amount_rand(
-                            symbol, amount, DataService._close_near(closes, ex_dt)
+                            symbol, amount, DataService._close_near(closes, ex_dt),
+                            [d.amount for d in db.query(Dividend.amount).filter(
+                                Dividend.symbol == symbol,
+                            ).all()],
                         )
-                        if stored_amount != amount:
-                            st.info(
-                                f"Amount {amount} exceeds half the share price - "
-                                f"stored as R {stored_amount:.4f} (assumed cents)."
-                            )
                     dividend = Dividend(
                         stock_id=stock.id,
                         symbol=symbol,
@@ -307,8 +288,13 @@ def show_dividends(db: Session):
                         db.rollback()
                         st.warning(f"A dividend for {symbol} on {ex_date} already exists.")
                     else:
-                        st.session_state["dividends_fetch_flash"] = (
-                            "success",
-                            f"Added {symbol} dividend of R {stored_amount:.4f} per share.",
-                        )
+                        # The cents->Rand conversion note must ride the flash -
+                        # a same-run st.info dies with the st.rerun().
+                        message = f"Added {symbol} dividend of R {stored_amount:.4f} per share."
+                        if stored_amount != amount:
+                            message += (
+                                f" Entered {amount} looked like cents, so it "
+                                "was converted."
+                            )
+                        st.session_state["dividends_fetch_flash"] = ("success", message)
                         st.rerun()

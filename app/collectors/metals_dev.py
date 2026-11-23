@@ -14,6 +14,14 @@ class MetalsDevCollector:
 
         if not self.enabled:
             logger.warning("Metals.dev API key not configured. Set METALS_DEV_API_KEY to enable.")
+        elif self.currency != "ZAR" or self.unit != "g":
+            # The stored commodity series is ZAR/gram (base metals x1e6);
+            # a different request unit silently mis-scales every bar.
+            logger.warning(
+                f"Metals.dev configured for {self.currency}/{self.unit} - the "
+                "stored commodity series assumes METALS_DEV_CURRENCY=ZAR and "
+                "METALS_DEV_UNIT=g; anything else mis-scales saved prices."
+            )
 
     def get_latest_rates(self) -> Optional[Dict[str, float]]:
         if not self.enabled:

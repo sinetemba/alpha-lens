@@ -64,7 +64,9 @@ def zar_closes(closes: pd.DataFrame) -> dict[str, dict]:
     Each day's close is converted at that day's USD/ZAR (forward-filled over
     FX gaps - US and FX holidays differ); days with no close are skipped.
     """
-    zar = closes["ZAR=X"].ffill()
+    # bfill too: on a backfill the FX series can start later than the
+    # commodity's, and a pure ffill silently drops those early bars.
+    zar = closes["ZAR=X"].ffill().bfill()
     result: dict[str, dict] = {}
     for _key, (_name, db_symbol, ticker, _cat, _unit, scale) in FUTURES.items():
         if ticker not in closes.columns:
