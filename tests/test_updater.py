@@ -355,3 +355,21 @@ def test_price_job_with_zero_updates_fails_and_records_heartbeat(session_factory
     run = db.query(UpdaterRun).filter_by(job_name="price_news_update").one()
     assert run.success is False
     assert run.detail == "0 symbols updated"
+
+
+def test_price_run_also_refreshes_safex_and_futures(monkeypatch):
+    """SAFEX publishes ~12:45; refreshing it only in the 18:00 job lagged a
+    day whenever the PC slept through 18:00."""
+    calls = []
+    monkeypatch.setattr("app.services.safex_prices.refresh_safex", lambda db: calls.append("safex") or 3)
+    monkeypatch.setattr("app.services.commodity_futures.refresh_futures", lambda db: calls.append("futures") or 14)
+    updater._refresh_daytime_commodities(MagicMock())
+    assert calls == ["safex", "futures"]
+
+
+def test_a_failing_commodity_refresh_never_raises(monkeypatch):
+    def boom(db):
+        raise RuntimeError("Grain SA down")
+    monkeypatch.setattr("app.services.safex_prices.refresh_safex", boom)
+    monkeypatch.setattr("app.services.commodity_futures.refresh_futures", lambda db: None)
+    updater._refresh_daytime_commodities(MagicMock())   # logs, doesn't raise

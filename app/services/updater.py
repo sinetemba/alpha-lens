@@ -239,6 +239,19 @@ def _get_tracked_symbols(db: Session) -> list:
 STALE_SYMBOL_MAX_AGE = timedelta(days=45)
 
 
+def _refresh_daytime_commodities(db: Session) -> None:
+    """SAFEX + Yahoo futures refresh - failures only log (never fail the run)."""
+    from app.services.commodity_futures import refresh_futures
+    from app.services.safex_prices import refresh_safex
+    for label, refresh in (("SAFEX grains", refresh_safex), ("Commodity futures", refresh_futures)):
+        try:
+            if refresh(db) is None:
+                logger.warning(f"{label} refresh failed")
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"{label} refresh failed: {e}")
+
+
 def _record_run(db: Session, job_name: str, success: bool, detail: str = None) -> None:
     """Write a heartbeat row for the dashboard's stale-run banner.
 
@@ -499,6 +512,12 @@ class UpdaterService:
 
             _run_notification_checks(db)
             _snapshot_portfolio(db)
+            # SAFEX grains (published ~12:45 SAST) and Yahoo futures: one
+            # request each, so they ride on every price run too. When they
+            # only ran in the 18:00 job, a PC asleep at 18:00 caught up the
+            # next MORNING - before that day's SAFEX prices existed - and the
+            # series lagged a day (only one bar between 20 and 23 Nov).
+            _refresh_daytime_commodities(db)
             # Alert on sources that have failed for 2+ days (Settings lists all).
             try:
                 check_source_health(db)

@@ -246,6 +246,28 @@ is announced so they can subscribe during the offer window (before listing day).
   services/corporate_actions.py). `portfolios.initial_investment` is unused
   and never maintained - don't read it.
 
+## Review round 4 fixes (2026-11-23)
+
+- **Portfolio Action - "— not trading":** `_holding_price_stats` flags a
+  holding with >= 15 zero-volume days of its last 20 AND one unchanged price
+  (`NOT_TRADING_*`); its trend signal is replaced. EEL (20/20, R0.03) said
+  "Sell — still falling", SKA (19/20, R0.85) "Buy — recovering"; PMV (14
+  zero days, 5 prices) is thin but trades and keeps its signal.
+- **Suspensions persist until prices resume:** `holding_statuses` treats a
+  suspension notice with no stored price after it (+7d) as still in force,
+  however old - KBO's 2025-08-13 notice had aged out of SUSPENSION_FRESH.
+  Its query keeps the 365-day cutoff for everything EXCEPT suspension /
+  resumption headlines, which are fetched at any age.
+- **Company View refreshes untracked shares:** only watchlist/held symbols
+  are updated by the daemon, so Company View showed Naspers' 11 Sep price on
+  23 Nov. Opening an untracked share older than 2 days runs one incremental
+  `update_historical_data` (once per session per symbol); still >7 days old
+  -> a warning (possibly suspended/delisted).
+- **SAFEX + futures in every price run** (`updater._refresh_daytime_commodities`,
+  after the portfolio snapshot): one request each. Only in the 18:00 job,
+  a PC asleep at 18:00 caught up the next morning before that day's SAFEX
+  prices (published ~12:45) existed. They still also run in the 18:00 job.
+
 ## SENS for held shares (suspensions, corporate actions)
 
 Added 2026-11-22 after SGP (Sail Mining) showed as a R0 holding with no
