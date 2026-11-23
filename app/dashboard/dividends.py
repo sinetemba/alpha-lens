@@ -268,6 +268,8 @@ def show_dividends(db: Session):
                             symbol, amount, DataService._close_near(closes, ex_dt),
                             [d.amount for d in db.query(Dividend.amount).filter(
                                 Dividend.symbol == symbol,
+                                Dividend.ex_dividend_date >= datetime.now(timezone.utc).replace(tzinfo=None)
+                                - timedelta(days=365 * DataService.DIVIDEND_GUARD_YEARS),
                             ).all()],
                         )
                     dividend = Dividend(

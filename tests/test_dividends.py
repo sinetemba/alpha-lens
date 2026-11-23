@@ -165,3 +165,39 @@ def test_failure_on_one_symbol_keeps_earlier_symbols(service, db_session):
     service.update_dividends(["SBK", "NPN"])
 
     assert len(_amounts(db_session, "SBK")) == 1
+
+
+# --- the twin mechanism (537 100x copies by 2026-11-23) --------------------
+
+def test_refetching_a_raw_cents_value_does_not_reinsert_a_repaired_row(service, db_session):
+    """Each refresh walks Yahoo's whole history. SUR's 2000 dividend is
+    stored repaired as R0.085; Yahoo still serves it raw as 8.5, which the
+    guard can't recognise (no price that far back). It used to be stored
+    again as an "additional same-day dividend" - a 100x twin."""
+    stock = _stock_with_close(db_session, "SUR", 40.0, datetime(2026, 3, 1))
+    db_session.add(Dividend(stock_id=stock.id, symbol="SUR", amount=0.085, currency="ZAR",
+                            ex_dividend_date=datetime(2000, 4, 17)))
+    db_session.commit()
+    service.yfinance.get_dividends.return_value = _yahoo_series([("2000-04-17", 8.5)])
+
+    assert service.update_dividends(["SUR"], freshness_days=0) == 0
+    assert _amounts(db_session, "SUR") == [(datetime(2000, 4, 17), pytest.approx(0.085))]
+
+
+def test_a_genuine_second_payout_on_the_same_day_is_still_stored(service, db_session):
+    """A special sharing an ex-date with an interim is a different amount -
+    not 100x - and must still be kept."""
+    stock = _stock_with_close(db_session, "SBK", 40.0, datetime(2026, 3, 1))
+    db_session.add(Dividend(stock_id=stock.id, symbol="SBK", amount=1.20, currency="ZAR",
+                            ex_dividend_date=datetime(2026, 3, 10)))
+    db_session.commit()
+    service.yfinance.get_dividends.return_value = _yahoo_series([("2026-03-10", 1.20), ("2026-03-10", 3.50)])
+
+    service.update_dividends(["SBK"], freshness_days=0)
+    assert sorted(a for _, a in _amounts(db_session, "SBK")) == [pytest.approx(1.20), pytest.approx(3.50)]
+
+
+def test_the_guard_ignores_history_older_than_six_years():
+    today = datetime.now().date()
+    existing = {(today - timedelta(days=400), 0.6): None, (today - timedelta(days=365 * 20), 16.0): None}
+    assert DataService._recent_dividend_amounts(existing) == [0.6]

@@ -779,6 +779,36 @@ class DataService:
             for r in rows if r.ex_dividend_date
         }
 
+    # The median cents-guard compares against recent payouts only: pre-2005
+    # Yahoo history mixes units in whole clusters (SUR 8.5-16 in 2000-04
+    # vs 0.20-0.80 later), which would skew a whole-history median.
+    DIVIDEND_GUARD_YEARS = 6
+
+    @classmethod
+    def _recent_dividend_amounts(cls, existing_by_key: dict) -> list:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=365 * cls.DIVIDEND_GUARD_YEARS)).date()
+        return [amt for day, amt in existing_by_key if day >= cutoff]
+
+    @staticmethod
+    def _same_payout_other_unit(existing_by_key: dict, day, amount: float) -> bool:
+        """Whether a payout ~100x / ~1/100 of `amount` is already stored on
+        `day` - the same dividend in the other unit (cents vs Rand).
+
+        Every refresh walks the provider's WHOLE history; a raw cents value
+        the guard didn't rescale missed the stored (correct) key and was
+        inserted as an "additional same-day dividend". 537 such 100x twins
+        had accumulated by 2026-11-23 (scripts/fix_dividend_cents.py).
+        """
+        if not amount or amount <= 0:
+            return False
+        for stored_day, stored in existing_by_key:
+            if stored_day != day or not stored:
+                continue
+            for factor in (100.0, 0.01):
+                if abs(stored * factor - amount) <= 0.01 * amount:
+                    return True
+        return False
+
     def _price_closes(
         self, symbol: str, since: Optional[datetime] = None, until: Optional[datetime] = None
     ) -> list:
@@ -950,7 +980,7 @@ class DataService:
                 # same rescale rule as the Yahoo path.
                 amount_rand = self._dividend_amount_rand(
                     symbol, float(amount), self._close_near(closes, ex_date),
-                    [amt for _, amt in existing_by_key],
+                    self._recent_dividend_amounts(existing_by_key),
                 )
                 key = (ex_date.date(), round(amount_rand, 6))
 
@@ -963,6 +993,8 @@ class DataService:
                     if _parse_date("declaration_date") and not existing.declaration_date:
                         existing.declaration_date = _parse_date("declaration_date")
                     continue
+                if self._same_payout_other_unit(existing_by_key, ex_date.date(), amount_rand):
+                    continue  # stored already, in the other unit (cents vs Rand)
 
                 if any(day == ex_date.date() for day, _ in existing_by_key):
                     logger.info(
@@ -1022,10 +1054,12 @@ class DataService:
             ex_date = datetime(ex_date.year, ex_date.month, ex_date.day)
             amount_rand = self._dividend_amount_rand(
                 symbol, float(amount), self._close_near(closes, ex_date),
-                [amt for _, amt in existing_by_key],
+                self._recent_dividend_amounts(existing_by_key),
             )
             key = (ex_date.date(), round(amount_rand, 6))
-            if key in existing_by_key:
+            if key in existing_by_key or self._same_payout_other_unit(
+                existing_by_key, ex_date.date(), amount_rand
+            ):
                 continue
             if any(day == ex_date.date() for day, _ in existing_by_key):
                 logger.info(
