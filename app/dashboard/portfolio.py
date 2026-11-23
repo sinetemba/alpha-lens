@@ -49,10 +49,10 @@ def show_portfolio(db: Session):
     """Display the portfolio page."""
     st.header("💼 Portfolio")
     st.markdown("Track your investment portfolio and performance.")
-    
+
     # Get or create portfolio
     portfolio = db.query(Portfolio).first()
-    
+
     if not portfolio:
         portfolio = Portfolio(name="My Portfolio")
         db.add(portfolio)
@@ -179,23 +179,23 @@ def show_portfolio(db: Session):
 
     st.markdown("---")
     _render_instrument_type_counts(st.session_state.get("ee_last_raw_holdings"))
-    
+
     st.markdown("---")
-    
+
     # Add new holding
     with st.expander("➕ Add Holding"):
         col1, col2 = st.columns(2)
-        
+
         with col1:
             symbol = render_symbol_search(db, key="portfolio_add")
             quantity = st.number_input("Quantity", min_value=0.0, step=1.0)
-        
+
         with col2:
             purchase_price = st.number_input("Purchase Price", min_value=0.0, step=0.01)
             purchase_date = st.date_input(
                 "Purchase Date", value=_to_display_tz(datetime.now(timezone.utc)).date()
             )
-        
+
         if st.button("Add Holding"):
             if symbol and quantity > 0 and purchase_price > 0:
                 # Duplicate guard: a repeated add would stack a phantom
@@ -252,7 +252,7 @@ def show_portfolio(db: Session):
                         st.rerun()
             else:
                 st.error("Please fill in all required fields.")
-    
+
     st.markdown("---")
 
     # Sync holdings from EasyEquities
@@ -380,12 +380,12 @@ def show_portfolio(db: Session):
             db, account_type, group_holdings, account_funds.get(account_type),
             stats_map=stats_map, statuses=statuses,
         )
-    
+
     st.markdown("---")
     _render_easyequities_debug(collector, portfolio, holdings, account_funds)
-    
+
     st.markdown("---")
-    
+
     # Remove holding — scoped to (symbol, account_type), since the same symbol
     # can legitimately be held in e.g. both the ZAR and TFSA accounts.
     st.subheader("Remove Holding")
@@ -719,17 +719,21 @@ def _holding_price_stats(db: Session, symbols: list[str]) -> dict[str, dict]:
     if not symbols:
         return {}
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=370)
-    rows = db.query(StockPrice.symbol, StockPrice.close_price).filter(
+    rows = db.query(StockPrice.symbol, StockPrice.close_price, StockPrice.volume).filter(
         StockPrice.symbol.in_(symbols),
         StockPrice.timestamp >= cutoff,
         StockPrice.close_price > 0,
     ).order_by(StockPrice.symbol, StockPrice.timestamp).all()
     closes: dict[str, list[float]] = {}
-    for symbol, close in rows:
+    volumes: dict[str, list] = {}
+    for symbol, close, volume in rows:
         closes.setdefault(symbol, []).append(close)
+        volumes.setdefault(symbol, []).append(volume)
     stats = {}
     for symbol, series in closes.items():
         cur = series[-1]
+        recent_volumes = volumes[symbol][-NOT_TRADING_WINDOW:]
+        recent_closes = series[-NOT_TRADING_WINDOW:]
         stats[symbol] = {
             "price": cur,
             "low_52w": min(series),
@@ -737,8 +741,24 @@ def _holding_price_stats(db: Session, symbols: list[str]) -> dict[str, dict]:
             "sma50": sum(series[-50:]) / min(50, len(series)),
             "mom_3m": (cur - series[-63]) / series[-63] * 100
             if len(series) >= 63 and series[-63] else 0.0,
+            # No trades and an unchanged price across the window: the trend
+            # numbers describe nothing (EEL: 20/20 zero-volume days at R0.03
+            # was labelled "Sell - still falling"; SKA, 19/20 at R0.85,
+            # "Buy - recovering" from weeks-old moves).
+            "not_trading": (
+                len(recent_volumes) >= NOT_TRADING_WINDOW
+                and sum(1 for v in recent_volumes if not v) >= NOT_TRADING_MIN_ZERO_DAYS
+                and len({round(c, 6) for c in recent_closes}) == 1
+            ),
         }
     return stats
+
+
+# A holding is "not trading" when >= NOT_TRADING_MIN_ZERO_DAYS of its last
+# NOT_TRADING_WINDOW sessions had zero volume AND the price never moved.
+# Thin-but-alive shares (PMV: 14 zero days, 5 different prices) keep signals.
+NOT_TRADING_WINDOW = 20
+NOT_TRADING_MIN_ZERO_DAYS = 15
 
 
 def _holding_action(gain_loss_pct, stats: dict, watch: Optional[WatchlistItem] = None) -> str:
@@ -835,6 +855,8 @@ def _render_holdings_table(
             # A suspended share can't be sold - "Sell — no prices" was
             # advice the user couldn't act on (SGP, suspended since 2022).
             action = "— suspended"
+        elif stats_map.get(holding.symbol, {}).get("not_trading"):
+            action = "— not trading"
         elif holding.symbol not in stats_map:
             action = "Sell — no prices"
         else:
@@ -910,7 +932,9 @@ def _render_holdings_table(
                         "no prices at all; Trim: watchlist target reached while in profit; "
                         "Buy: loser recovering above its 20-day average with positive momentum, "
                         "or a winner in an uptrend; Hold: everything else; — suspended: "
-                        "trading is suspended on the JSE (from SENS), so it can't be sold. "
+                        "trading is suspended on the JSE (from SENS), so it can't be sold; "
+                        "— not trading: no trades and an unchanged price for 15+ of the last "
+                        "20 sessions, so there is no trend to read and probably no buyer. "
                         "Not financial advice."
                     ),
                 ),
@@ -1115,7 +1139,7 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
 
     # Check if stock exists
     stock = db.query(Stock).filter(Stock.symbol == symbol).first()
-    
+
     if not stock:
         from app.services.data_service import get_company_name
         try:
@@ -1129,7 +1153,7 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
             stock = db.query(Stock).filter(Stock.symbol == symbol).first()
             if not stock:
                 raise
-    
+
     # Create holding. account_type="Manual" deliberately: EasyEquities
     # reconciliation deletes every holding under an account type it synced
     # that EE no longer reports - a manual holding under the default "ZAR"
@@ -1145,7 +1169,7 @@ def _add_holding(db: Session, portfolio_id: int, symbol: str, quantity: float, p
         purchase_price=purchase_price,
         purchase_date=purchase_date
     )
-    
+
     db.add(holding)
     from app.services.transactions import record_transaction
     record_transaction(

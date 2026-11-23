@@ -259,11 +259,15 @@ def holding_statuses(db: Session, symbols, now=None) -> dict[str, HoldingStatus]
     symbols = list(symbols)
     if not symbols:
         return {}
-    # Nothing older than the widest freshness window (365d corporate
-    # actions; suspensions expire at 200d) can change any status.
+    # Only the last CORPORATE_ACTION_DAYS matter for actions - EXCEPT
+    # suspension / resumption notices, which matter at any age: a suspension
+    # with no price since it is still in force (KBO, notice 2025-08-13).
+    from sqlalchemy import or_
+    phrase_match = [SensAnnouncement.headline.ilike(f"%{p}%")
+                    for p in SUSPENSION_PHRASES + RESUMPTION_PHRASES]
     rows = db.query(SensAnnouncement).filter(
         SensAnnouncement.symbol.in_(symbols),
-        SensAnnouncement.published_at >= now - timedelta(days=CORPORATE_ACTION_DAYS),
+        or_(SensAnnouncement.published_at >= now - timedelta(days=CORPORATE_ACTION_DAYS), *phrase_match),
     ).order_by(SensAnnouncement.published_at.desc().nullslast()).all()
     out: dict[str, HoldingStatus] = {}
     concluded: dict[str, set] = {}   # symbol -> action phrases a later "results of ..." closed
@@ -289,11 +293,20 @@ def holding_statuses(db: Session, symbols, now=None) -> dict[str, HoldingStatus]
         if st.suspension is None and not _has(ann.headline, RESUMPTION_PHRASES) \
                 and _has(ann.headline, SUSPENSION_PHRASES):
             st.suspension = ann
+    # A suspension with NO price since its notice is still in force, however
+    # old the notice: KBO's "Suspension of listing" (2025-08-13, last price
+    # 2025-08-08) aged out of SUSPENSION_FRESH and showed "Sell - no prices"
+    # for a share that cannot be sold.
+    from sqlalchemy import func
+    from app.models.stock import StockPrice
+    last_bar = dict(db.query(StockPrice.symbol, func.max(StockPrice.timestamp))
+                    .filter(StockPrice.symbol.in_(list(out))).group_by(StockPrice.symbol).all())
     for st in out.values():
         resumed = next((a for a in st.recent if _has(a.headline, RESUMPTION_PHRASES)), None)
         s = st.suspension
-        st.suspended = bool(
-            s and s.published_at and now - s.published_at <= SUSPENSION_FRESH
-            and (resumed is None or (resumed.published_at or now) < s.published_at)
-        )
+        not_resumed = s is not None and (resumed is None or (resumed.published_at or now) < (s.published_at or now))
+        fresh = bool(s and s.published_at and now - s.published_at <= SUSPENSION_FRESH)
+        bar = last_bar.get(st.symbol)
+        unpriced_since = bool(s and s.published_at and (bar is None or bar <= s.published_at + timedelta(days=7)))
+        st.suspended = bool(not_resumed and (fresh or unpriced_since))
     return out

@@ -127,15 +127,16 @@ def test_a_later_results_announcement_concludes_the_action(db_session):
     assert statuses["APF"].corporate_action.headline.startswith("Distribution of circular")
 
 
-def test_suspension_lifted_or_stale_is_not_suspended(db_session):
+def test_a_lifted_suspension_ends_and_an_unpriced_old_one_persists(db_session):
     _store(db_session, "AAA", "Quarterly suspension update", 90, "u/a1")
     _store(db_session, "AAA", "Lifting of suspension of trading", 10, "u/a2")
     _store(db_session, "BBB", "Quarterly suspension update", 400, "u/b1")
     statuses = holding_statuses(db_session, ["AAA", "BBB", "CCC"])
     assert not statuses["AAA"].suspended
-    # A 400d-old suspension is outside the bounded query window - the symbol
-    # is simply absent, which callers treat as "not suspended" anyway.
-    assert statuses.get("BBB") is None or not statuses["BBB"].suspended
+    # A 400d-old suspension with NO price since is still in force (the KBO
+    # case) - see test_an_old_suspension_followed_by_prices_has_ended for
+    # the resumed variant.
+    assert statuses["BBB"].suspended
     assert "CCC" not in statuses
 
 
@@ -210,3 +211,35 @@ def test_a_figureless_update_borrows_only_prices_from_the_launch(db_session):
     facts = ensure_facts(db_session, collector, status.corporate_action, status)
     assert facts.startswith("Offer price 7.2c per share (per ")
     assert "Last day to trade" not in facts
+
+
+# --- a suspension stays in force until prices resume -----------------------
+
+def _bar(db, symbol, days_ago):
+    from app.models.stock import Stock, StockPrice
+    stock = db.query(Stock).filter_by(symbol=symbol).first()
+    if stock is None:
+        stock = Stock(symbol=symbol, name=symbol)
+        db.add(stock)
+        db.flush()
+    db.add(StockPrice(stock_id=stock.id, symbol=symbol, close_price=1.0,
+                      timestamp=utcnow_naive() - timedelta(days=days_ago)))
+    db.commit()
+
+
+def test_an_old_suspension_with_no_price_since_is_still_in_force(db_session):
+    """KBO: 'Suspension of listing' 2025-08-13, last price 2025-08-08 - it
+    aged past SUSPENSION_FRESH and showed 'Sell - no prices'."""
+    _bar(db_session, "KBO", 470)
+    _store(db_session, "KBO", "General – Suspension of listing", 465, "u/k1")
+    _store(db_session, "KBO", "Shareholder Update and Resignation of Director", 10, "u/k2")
+    assert holding_statuses(db_session, ["KBO"])["KBO"].suspended
+
+
+def test_an_old_suspension_followed_by_prices_has_ended(db_session):
+    """Trading resumed (prices after the notice) - no longer suspended,
+    even without a 'lifting of suspension' announcement."""
+    _store(db_session, "OLD", "Suspension of trading", 400, "u/o1")
+    _store(db_session, "OLD", "Trading statement", 30, "u/o2")
+    _bar(db_session, "OLD", 3)
+    assert not holding_statuses(db_session, ["OLD"])["OLD"].suspended
